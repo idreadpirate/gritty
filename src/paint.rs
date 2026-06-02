@@ -592,6 +592,22 @@ pub(crate) fn draw_pane_grid(
                 fg,
             );
         }
+
+        // CA-33: underline cells that carry an OSC-8 hyperlink (1px, like SGR underline).
+        if cell.hyperlink().is_some() {
+            let uy = py + ch.saturating_sub(2);
+            render::fill_rect(
+                buffer,
+                stride,
+                Rect {
+                    x: px,
+                    y: uy,
+                    w: cw,
+                    h: 1,
+                },
+                fg,
+            );
+        }
     }
 
     // CA-27: visual bell — brief amber flash over the pane for this frame only.

@@ -564,6 +564,38 @@ impl Gritty {
         window.set_cursor(cursor);
     }
 
+    /// CA-33: Return the hyperlink URI of the cell at pixel (x, y), if any.
+    ///
+    /// Maps pixel → pane → grid cell, then reads `cell.hyperlink().uri()`.
+    /// Returns `None` if there is no pane at (x, y) or the cell has no hyperlink.
+    pub(crate) fn hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
+        let (w, h) = self.win_size();
+        let tab = self.tabs.get(self.active)?;
+        let rects = self.pane_rects(w, h);
+        // Find the pane under the cursor.
+        let (pane_id, rect) = rects
+            .iter()
+            .find(|(_, r)| r.contains(x as usize, y as usize))?;
+        let grid = self.grid_rect(*rect);
+        let pane = tab.panes.get(pane_id)?;
+        let (cw, ch) = (self.font.cell_w, self.font.cell_h);
+        // Compute grid-relative pixel offset.
+        let gx = (x as usize).saturating_sub(grid.x);
+        let gy = (y as usize).saturating_sub(grid.y);
+        let col = gx / cw.max(1);
+        let row = gy / ch.max(1);
+        let display_offset = pane.term.display_offset();
+        // `renderable_content` uses Line where negative = scrollback.
+        // Visible rows start at 0 in the viewport; display_offset shifts them.
+        use alacritty_terminal::index::{Column, Line, Point};
+        let line = Line(row as i32 - display_offset as i32);
+        let point = Point::new(line, Column(col));
+        // Look up the cell directly from the grid.
+        let cell = pane.term.term.grid()[point].clone();
+        let hyperlink = cell.hyperlink()?;
+        Some(hyperlink.uri().to_owned())
+    }
+
     /// CA-18: classify click count based on timing, updating `click_count`.
     /// Returns the count (1 = single, 2 = double, 3+ = triple).
     pub(crate) fn classify_click(&mut self) -> u32 {
@@ -804,6 +836,14 @@ impl ApplicationHandler<Wake> for Gritty {
 impl Gritty {
     pub(crate) fn begin_selection(&mut self, event_loop: &ActiveEventLoop) {
         let (x, y) = self.mouse_pos;
+
+        // CA-33: Ctrl+Click on a hyperlink cell — open it in the OS browser/handler.
+        if self.mods.control_key() {
+            if let Some(uri) = self.hyperlink_at_pixel(x, y) {
+                open_hyperlink(&uri);
+                return;
+            }
+        }
 
         // Click on the tab bar switches tabs instead of selecting.
         if (y as usize) < self.bar_h() {
@@ -1064,6 +1104,61 @@ pub(crate) fn is_broadcast_signal_byte(b: u8) -> bool {
     matches!(b, 0x03 | 0x04 | 0x1a)
 }
 
+/// CA-33: Return `true` iff `uri` has a scheme that is safe to hand to the OS opener.
+///
+/// Only http, https, and file URIs are allowed.  Any other scheme (e.g. `javascript:`,
+/// `data:`, custom protocol handlers) is rejected to prevent arbitrary command injection
+/// via a crafted OSC-8 sequence.
+pub(crate) fn is_safe_hyperlink_scheme(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
+}
+
+/// CA-33: Open `uri` with the OS default handler via `ShellExecuteW`, detached.
+///
+/// Only called after `is_safe_hyperlink_scheme` has already validated the scheme.
+/// Declares `ShellExecuteW` from shell32.dll inline — always available on Windows,
+/// no new Cargo feature or dependency required.
+fn open_hyperlink(uri: &str) {
+    if !is_safe_hyperlink_scheme(uri) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // Declare ShellExecuteW inline; shell32.dll is always present on Windows.
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut core::ffi::c_void,
+                lpoperation: *const u16,
+                lpfile: *const u16,
+                lpparameters: *const u16,
+                lpdirectory: *const u16,
+                nshowcmd: i32,
+            ) -> isize;
+        }
+        const SW_SHOWNORMAL: i32 = 1;
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let uri_w: Vec<u16> = uri.encode_utf16().chain(std::iter::once(0u16)).collect();
+        // SAFETY: all pointers are valid null-terminated UTF-16; hwnd=null is
+        // valid for a shell open that needs no parent window.
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                uri_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = uri;
+    }
+}
+
 /// CA-7: Encode an SGR mouse sequence.
 ///
 /// `btn`:   button index (0=left, 1=middle, 2=right; +32=motion, +64=wheel).
@@ -1216,6 +1311,35 @@ mod tests {
         let w = 5; // narrower than one tab slot
         assert_eq!(tab_button_at(lens, cw, 0, w), None);
         assert_eq!(tab_button_at(lens, cw, 4, w), None);
+    }
+
+    // --- CA-33 hyperlink scheme sanitizer ------------------------------------
+
+    #[test]
+    fn hyperlink_scheme_allows_http_https_file() {
+        assert!(is_safe_hyperlink_scheme("http://example.com"));
+        assert!(is_safe_hyperlink_scheme("https://example.com/path?q=1"));
+        assert!(is_safe_hyperlink_scheme("file:///C:/Users/foo/bar.txt"));
+        assert!(is_safe_hyperlink_scheme("file:///tmp/report.html"));
+    }
+
+    #[test]
+    fn hyperlink_scheme_rejects_other_schemes() {
+        assert!(!is_safe_hyperlink_scheme("javascript:alert(1)"));
+        assert!(!is_safe_hyperlink_scheme("data:text/html,<h1>hi</h1>"));
+        assert!(!is_safe_hyperlink_scheme("ftp://example.com/file"));
+        assert!(!is_safe_hyperlink_scheme("mailto:user@example.com"));
+        assert!(!is_safe_hyperlink_scheme("ssh://host/path"));
+        assert!(!is_safe_hyperlink_scheme(""));
+        assert!(!is_safe_hyperlink_scheme("noscheme"));
+    }
+
+    #[test]
+    fn hyperlink_scheme_case_insensitive() {
+        assert!(is_safe_hyperlink_scheme("HTTP://example.com"));
+        assert!(is_safe_hyperlink_scheme("HTTPS://example.com"));
+        assert!(is_safe_hyperlink_scheme("FILE:///tmp/foo"));
+        assert!(!is_safe_hyperlink_scheme("FTP://example.com"));
     }
 
     // --- RT-8 control-byte predicate -----------------------------------------
