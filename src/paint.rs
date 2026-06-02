@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
@@ -52,7 +53,12 @@ impl Gritty {
         );
         let mut tx = 0usize;
         for (i, tab) in self.tabs.iter().enumerate() {
-            let label = format!(" {} ", tab.name);
+            // CA-25: prefix active tab with a glyph marker (not color alone).
+            let label = if i == active {
+                format!(" ▸{} ", tab.name)
+            } else {
+                format!(" {} ", tab.name)
+            };
             let tw = label.chars().count() * cw;
             let (fg, bg) = if i == active {
                 (BG, tab.color)
@@ -159,7 +165,7 @@ impl Gritty {
                     .and_then(|t| t.panes.get(&id))
                     .map(|p| {
                         let proc = p.proc_name.as_str();
-                        if proc.is_empty()
+                        let base = if proc.is_empty()
                             || proc == "pwsh"
                             || proc == "cmd"
                             || proc == "powershell"
@@ -167,6 +173,12 @@ impl Gritty {
                             p.name.clone()
                         } else {
                             format!("{}: {}", p.name, proc)
+                        };
+                        // CA-25: add a non-color marker for the focused pane title.
+                        if is_focus {
+                            format!("▸ {base}")
+                        } else {
+                            base
                         }
                     })
                     .unwrap_or_default();
@@ -401,6 +413,39 @@ pub(crate) fn draw_pane_grid(
         }
     }
 
+    // CA-22: scrollback position indicator — thin thumb on the right edge.
+    let display_offset = pane.term.display_offset();
+    if display_offset > 0 && grid.h > 0 && grid.w > 0 {
+        let history = pane.term.term.grid().history_size();
+        let rows = pane.term.size.rows;
+        let (thumb_top, thumb_h) = scrollbar_thumb(grid.h, rows, history, display_offset);
+        // 2px wide thumb drawn at the pane's right edge, using PANE_SEP as track
+        // and a dimmed accent as thumb — visible without clashing.
+        let thumb_x = grid.x + grid.w.saturating_sub(2);
+        fill_rect(
+            buffer,
+            stride,
+            Rect {
+                x: thumb_x,
+                y: grid.y,
+                w: 2,
+                h: grid.h,
+            },
+            PANE_SEP,
+        );
+        fill_rect(
+            buffer,
+            stride,
+            Rect {
+                x: thumb_x,
+                y: grid.y + thumb_top,
+                w: 2,
+                h: thumb_h.max(2),
+            },
+            UI_DIM,
+        );
+    }
+
     // Post-grid cursor overlays (CA-17).
     if cursor_active && cur_row >= 0 && cur_col >= 0 {
         let cur_px = grid.x + cur_col as usize * cw;
@@ -450,6 +495,87 @@ pub(crate) fn draw_pane_grid(
                     h: ch,
                 },
                 UI_DIM,
+            );
+        }
+    }
+}
+
+/// Compute the scrollbar thumb position within a `track_len`-pixel track.
+///
+/// Returns `(thumb_top, thumb_height)` in pixels.
+///
+/// * `track_len`      — height of the scrollable area in pixels
+/// * `viewport_lines` — number of visible terminal rows
+/// * `history_size`   — total scrollback lines available
+/// * `display_offset` — lines currently scrolled above the bottom (0 = live)
+///
+/// The thumb is sized proportionally to the viewport vs total content and
+/// positioned so that offset 0 (bottom) places the thumb at the bottom of the
+/// track and the maximum offset places it at the top (CA-22).
+pub(crate) fn scrollbar_thumb(
+    track_len: usize,
+    viewport_lines: usize,
+    history_size: usize,
+    display_offset: usize,
+) -> (usize, usize) {
+    // Total content is viewport + history.  Guard against zero total.
+    let total = (viewport_lines + history_size).max(1);
+    // Thumb height: proportion of content that is visible (at least 4px).
+    let thumb_h = ((track_len * viewport_lines) / total).max(4).min(track_len);
+    // Scrollable track length (pixels the thumb can travel within).
+    let travel = track_len.saturating_sub(thumb_h);
+    // display_offset == history_size → top; 0 → bottom.
+    let offset_clamped = display_offset.min(history_size);
+    let thumb_top = if history_size == 0 {
+        travel
+    } else {
+        travel - (travel * offset_clamped) / history_size
+    };
+    (thumb_top, thumb_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumb_at_bottom_when_offset_zero() {
+        // offset=0 means we're at the live bottom; thumb should be at bottom of track.
+        let (top, h) = scrollbar_thumb(100, 24, 100, 0);
+        assert_eq!(top + h, 100, "thumb bottom should touch track end");
+    }
+
+    #[test]
+    fn thumb_at_top_when_fully_scrolled() {
+        // offset == history → scrolled to the very top; thumb top should be 0.
+        let (top, _h) = scrollbar_thumb(100, 24, 100, 100);
+        assert_eq!(
+            top, 0,
+            "thumb top should be at track start when fully scrolled"
+        );
+    }
+
+    #[test]
+    fn thumb_height_proportional_to_viewport() {
+        // viewport == total → full-height thumb.
+        let (_, h) = scrollbar_thumb(100, 50, 0, 0);
+        assert_eq!(h, 100, "full viewport = full thumb");
+    }
+
+    #[test]
+    fn thumb_minimum_height_enforced() {
+        // Very long history → tiny ratio, but thumb must be at least 4px.
+        let (_, h) = scrollbar_thumb(100, 1, 10_000, 500);
+        assert!(h >= 4, "thumb height must be at least 4px, got {h}");
+    }
+
+    #[test]
+    fn thumb_stays_within_track() {
+        for offset in [0, 50, 100] {
+            let (top, h) = scrollbar_thumb(100, 24, 100, offset);
+            assert!(
+                top + h <= 100,
+                "thumb must not exceed track: top={top} h={h}"
             );
         }
     }
