@@ -619,6 +619,98 @@ mod tests {
         assert_eq!(tab_at(lens, cw, 1000), None); // past the last tab
     }
 
+    /// A three-level tree: root LeftRight( Split(0,1) , Leaf(2) ).
+    fn nested() -> Node {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 2, Axis::LeftRight); // 0 | 2
+        n.split_leaf(0, 1, Axis::TopBottom); // left half becomes 0 over 1
+        n
+    }
+
+    #[test]
+    fn without_keeps_both_branches_when_sibling_survives() {
+        // Remove a deeply-nested leaf so the top-level split still has two sides.
+        let n = nested().without(1).expect("tree not empty");
+        let mut leaves = Vec::new();
+        n.leaves(&mut leaves);
+        leaves.sort();
+        assert_eq!(leaves, vec![0, 2]); // 1 gone, both top children remain
+        // still a split (Some, Some) — not collapsed to a single leaf
+        assert!(matches!(n, Node::Split { .. }));
+    }
+
+    #[test]
+    fn contains_walks_into_split_children() {
+        let n = nested();
+        assert!(n.contains(1)); // buried in the left subtree's split arm
+        assert!(n.contains(2));
+        assert!(!n.contains(99));
+    }
+
+    #[test]
+    fn split_area_descends_first_child_path() {
+        let n = nested();
+        // path [0] selects the left subtree, which is itself a top/bottom split.
+        let (axis, area) = n.split_area(&[0], AREA).expect("left inner split");
+        assert_eq!(axis, Axis::TopBottom);
+        assert_eq!(area.x, 0); // left half starts at x=0
+    }
+
+    #[test]
+    fn set_ratio_follows_second_child_path() {
+        // root LeftRight( Leaf(0) , Split(1,2) ) — adjust the right subtree via [1].
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        n.split_leaf(1, 2, Axis::TopBottom);
+        n.set_ratio(&[1], 0.25);
+        let r = rects(&n);
+        // right column top pane (id 1) should be 0.25 * 60 = 15 tall
+        let top_right = r.iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert_eq!(top_right.h, 15);
+    }
+
+    #[test]
+    fn resize_absent_target_is_noop() {
+        let mut n = nested();
+        assert!(!n.resize(99, Axis::LeftRight, true, 0.1)); // target not in tree
+    }
+
+    #[test]
+    fn resize_finds_matching_axis_ancestor_through_nested_split() {
+        // Growing pane 1 (in the inner top/bottom split) along LeftRight must
+        // walk up past the non-matching inner split to the matching root split.
+        let mut n = nested();
+        assert!(n.resize(1, Axis::LeftRight, true, 0.1));
+    }
+
+    #[test]
+    fn resize_stops_at_innermost_matching_axis() {
+        // Two nested LeftRight splits: resizing pane 0 must be handled by the
+        // inner split and the outer split must propagate the "done" (2) result
+        // upward without adjusting itself again.
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 2, Axis::LeftRight); // outer: (0) | 2
+        n.split_leaf(0, 1, Axis::LeftRight); // inner: (0 | 1) | 2
+        let before = rects(&n);
+        assert!(n.resize(0, Axis::LeftRight, true, 0.1));
+        let after = rects(&n);
+        // pane 0 grew; pane 2 (under the outer split) is unchanged.
+        let w0 = |rs: &[(usize, Rect)]| rs.iter().find(|(id, _)| *id == 0).unwrap().1.w;
+        let w2 = |rs: &[(usize, Rect)]| rs.iter().find(|(id, _)| *id == 2).unwrap().1.w;
+        assert!(w0(&after) > w0(&before), "inner pane should have grown");
+        assert_eq!(w2(&before), w2(&after), "outer split must not move");
+    }
+
+    #[test]
+    fn set_ratio_on_a_leaf_is_a_noop() {
+        // set_ratio targets splits; a leaf has no ratio, so it must do nothing
+        // (and not panic) when handed any path.
+        let mut leaf = Node::Leaf(0);
+        leaf.set_ratio(&[], 0.5);
+        leaf.set_ratio(&[0, 1], 0.5);
+        assert_eq!(leaf, Node::Leaf(0));
+    }
+
     #[test]
     fn grid_cell_maps_pixel_to_column_row_side() {
         let grid = Rect {

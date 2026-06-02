@@ -103,4 +103,27 @@ mod tests {
             "center {center:#x} not brighter than edge {edge:#x}"
         );
     }
+
+    #[test]
+    fn resize_to_same_size_is_cached_noop() {
+        let mut bg = Background::new();
+        bg.resize(40, 30);
+        let snapshot = bg.px.clone();
+        // Re-resizing to the identical dimensions hits the early return and must
+        // not reallocate or alter the cached pixels.
+        bg.resize(40, 30);
+        assert_eq!(bg.px, snapshot);
+        // A genuine size change does recompute.
+        bg.resize(20, 20);
+        assert_eq!(bg.px.len(), 20 * 20);
+    }
+
+    #[test]
+    fn rgb_and_lerp_clamp_and_interpolate() {
+        assert_eq!(lerp(0, 100, 0.0), 0);
+        assert_eq!(lerp(0, 100, 1.0), 100);
+        assert_eq!(lerp(0, 100, 0.5), 50);
+        // rgb clamps out-of-range channels into 0..=255.
+        assert_eq!(rgb(-5, 300, 128), (0 << 16) | (255 << 8) | 128);
+    }
 }

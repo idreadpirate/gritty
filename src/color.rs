@@ -120,9 +120,10 @@ mod tests {
         assert_eq!(to_rgb(Color::Indexed(16), FG), 0x0000_0000);
         // index 231 is the cube max: all channels 55 + 5*40 = 255.
         assert_eq!(to_rgb(Color::Indexed(231), FG), 0x00ff_ffff);
-        // a mid cube value exercises the non-zero conversion on each channel.
-        assert_eq!(to_rgb(Color::Indexed(16 + 43), FG), {
-            let v = 55 + 40; // step 1 on r and b
+        // index 53 = cube offset 37 -> (r=1, g=0, b=1): exercises the non-zero
+        // conversion on the r/b channels and the zero branch on g.
+        assert_eq!(to_rgb(Color::Indexed(16 + 37), FG), {
+            let v = 55 + 40; // conv(1) = 95
             rgb(v, 0, v)
         });
     }
@@ -214,7 +215,7 @@ pub fn style_flags(mut fg: u32, mut bg: u32, flags: Flags) -> (u32, u32, bool) {
 }
 
 #[cfg(test)]
-mod tests {
+mod style_flags_tests {
     use super::*;
 
     #[test]

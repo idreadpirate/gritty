@@ -91,9 +91,9 @@ mod tests {
     fn selected_returns_command_at_index() {
         let mut p = Palette::new();
         // empty query: selection 0 is the first command in declaration order.
-        assert_eq!(p.selected(), Some(Cmd::SplitRight));
+        assert!(p.selected() == Some(Cmd::SplitRight));
         p.sel = 2;
-        assert_eq!(p.selected(), p.matches().get(2).map(|(_, c)| *c));
+        assert!(p.selected() == p.matches().get(2).map(|(_, c)| *c));
     }
 
     #[test]
@@ -101,7 +101,7 @@ mod tests {
         let mut p = Palette::new();
         p.query = "zzzzz-no-such-command".into();
         assert!(p.matches().is_empty());
-        assert_eq!(p.selected(), None);
+        assert!(p.selected().is_none());
     }
 
     #[test]

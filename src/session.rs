@@ -249,4 +249,37 @@ mod tests {
         let (_, focus, _) = plan_from_saved(&saved);
         assert_eq!(focus, 0);
     }
+
+    #[test]
+    fn shell_candidates_are_absolute_trusted_paths() {
+        let cands = shell_candidates();
+        // pwsh 7, Windows PowerShell, then cmd — in that fallback order.
+        assert_eq!(cands.len(), 3);
+        assert!(cands[0].0.ends_with(r"\PowerShell\7\pwsh.exe"));
+        assert!(cands[1].0.to_lowercase().ends_with("powershell.exe"));
+        assert!(cands[2].0.to_lowercase().ends_with(r"\system32\cmd.exe"));
+
+        // RT-2: every path must be drive-absolute, never a bare name a malicious
+        // exe earlier in PATH could hijack.
+        for (path, _) in &cands {
+            assert!(
+                path.len() > 3 && path.as_bytes()[1] == b':',
+                "shell path not absolute: {path}"
+            );
+            assert!(!path.contains('/'), "expected Windows separators: {path}");
+        }
+
+        // PowerShell variants launch with -NoLogo; cmd takes no args.
+        assert_eq!(cands[0].1, vec!["-NoLogo"]);
+        assert_eq!(cands[1].1, vec!["-NoLogo"]);
+        assert!(cands[2].1.is_empty());
+    }
+
+    #[test]
+    fn shell_candidates_honor_env_roots() {
+        // Paths must sit under the SystemRoot the function reads from the env.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let cands = shell_candidates();
+        assert!(cands[2].0.starts_with(&sysroot));
+    }
 }

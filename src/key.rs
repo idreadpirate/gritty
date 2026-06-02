@@ -329,4 +329,11 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn unprintable_key_variant_is_none() {
+        // A dead key (e.g. accent composition) is neither Named nor Character
+        // and must produce no PTY bytes.
+        assert_eq!(encode(&Key::Dead(None), ModifiersState::empty()), None);
+    }
 }

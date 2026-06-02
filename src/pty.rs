@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn live_pty_exposes_pid_alive_write_and_resize() {
+        // A long-lived interactive shell so the process stays alive while we poke it.
+        let mut pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}).expect("spawn cmd.exe");
+        assert!(pty.is_alive(), "freshly spawned shell should be alive");
+        assert!(pty.pid().is_some(), "a spawned child has a pid");
+
+        // write + resize must not panic and must leave the child alive.
+        pty.resize(40, 120);
+        pty.write(b"echo hi\r\n");
+        // give it a moment; it should still be running (we never sent `exit`).
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pty.is_alive(), "shell should still be alive after I/O");
+    }
+
+    #[test]
     fn high_volume_no_loss_or_deadlock() {
         // 2000 numbered lines: exercises sustained draining without loss/hang.
         let pty = Pty::spawn(

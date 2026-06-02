@@ -420,6 +420,89 @@ mod tests {
     }
 
     #[test]
+    fn glyph_clipped_top_left_skips_outside_rows_and_cols() {
+        // Draw 'M' at (0,0) but clip away the top-left quadrant: glyph rows above
+        // the clip and columns left of it must be skipped (the continue guards),
+        // while pixels inside the clip are still painted.
+        let mut font = FontAtlas::new(18.0);
+        let stride = font.cell_w * 2;
+        let height = font.cell_h * 2;
+        let mut buf = vec![0u32; stride * height];
+        let clip = Rect {
+            x: font.cell_w / 2,
+            y: font.cell_h / 2,
+            w: stride,
+            h: height,
+        };
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: 'M',
+                fg: 0x00ff_ffff,
+                bg: 0x0000_0000,
+            },
+            false, // no bg fill: only the glyph (and its clipping) is exercised
+            clip,
+        );
+        // Nothing was drawn above the clip's top edge...
+        for y in 0..clip.y {
+            for x in 0..stride {
+                assert_eq!(buf[y * stride + x], 0, "pixel above clip painted");
+            }
+        }
+        // ...nor left of the clip's left edge.
+        for y in 0..height {
+            for x in 0..clip.x {
+                assert_eq!(buf[y * stride + x], 0, "pixel left of clip painted");
+            }
+        }
+        // But some glyph coverage landed inside the clipped region.
+        let inside: usize = (clip.y..height)
+            .flat_map(|y| (clip.x..stride).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[y * stride + x] != 0)
+            .count();
+        assert!(inside > 0, "glyph fully clipped away — test is vacuous");
+    }
+
+    #[test]
+    fn fill_bg_clipped_vertically_skips_outside_rows() {
+        // A cell whose top sits above the clip: the fill_bg loop must `continue`
+        // past rows < clip.y instead of writing them.
+        let mut font = FontAtlas::new(18.0);
+        let stride = font.cell_w;
+        let height = font.cell_h * 2;
+        let mut buf = vec![0u32; stride * height];
+        let clip = Rect {
+            x: 0,
+            y: font.cell_h, // clip starts halfway down
+            w: stride,
+            h: height,
+        };
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: ' ',
+                fg: 0,
+                bg: 0x0000_00ff,
+            },
+            true,
+            clip,
+        );
+        // rows above the clip are untouched
+        for y in 0..clip.y {
+            assert_eq!(buf[y * stride], 0, "row {y} above clip got filled");
+        }
+    }
+
+    #[test]
     fn clip_blocks_out_of_bounds_fill() {
         let mut font = FontAtlas::new(18.0);
         let stride = font.cell_w * 2;

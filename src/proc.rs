@@ -131,4 +131,31 @@ mod tests {
         let procs = vec![p(100, 1, "pwsh.exe"), p(200, 100, "docker.exe")];
         assert_eq!(foreground_name(&procs, 100), Some("docker".to_string()));
     }
+
+    #[test]
+    fn strip_exe_handles_both_cases_and_no_suffix() {
+        assert_eq!(strip_exe("nvim.exe"), "nvim");
+        assert_eq!(strip_exe("NVIM.EXE"), "NVIM");
+        assert_eq!(strip_exe("python"), "python");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_includes_this_process() {
+        let procs = snapshot();
+        assert!(!procs.is_empty(), "toolhelp snapshot returned nothing");
+        let me = std::process::id();
+        let mine = procs
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("our own pid must appear in the snapshot");
+        // the running test harness is a gritty*.exe binary
+        assert!(
+            mine.name.to_ascii_lowercase().contains("gritty"),
+            "unexpected self name: {:?}",
+            mine.name
+        );
+        // and our parent process is also present (pid != ppid, ppid resolvable)
+        assert!(name_of(&procs, mine.ppid).is_some());
+    }
 }
