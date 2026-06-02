@@ -476,7 +476,8 @@ impl Gritty {
 
         // Rename overlay.
         if let Some(buf_str) = self.rename.clone() {
-            let line = format!(" rename pane: {buf_str}_ ");
+            let what = if self.rename_is_tab { "tab" } else { "pane" };
+            let line = format!(" rename {what}: {buf_str}_ ");
             let r = Rect {
                 x: 0,
                 y: height.saturating_sub(ch),

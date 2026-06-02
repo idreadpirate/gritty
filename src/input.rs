@@ -34,8 +34,13 @@ impl Gritty {
                 Key::Named(NamedKey::Enter) => {
                     let name = std::mem::take(buf);
                     self.rename = None;
+                    let is_tab = self.rename_is_tab;
                     if let Some(tab) = self.tabs.get_mut(self.active) {
-                        tab.rename_focus(name);
+                        if is_tab {
+                            tab.name = name;
+                        } else {
+                            tab.rename_focus(name);
+                        }
                     }
                 }
                 Key::Named(NamedKey::Escape) => self.rename = None,
@@ -84,6 +89,7 @@ impl Gritty {
                             .map(|p| p.name.clone())
                             .unwrap_or_default();
                         self.rename = Some(cur);
+                        self.rename_is_tab = false;
                         self.request_redraw();
                         return;
                     }
@@ -277,6 +283,16 @@ impl Gritty {
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
                 self.rename = Some(cur);
+                self.rename_is_tab = false;
+            }
+            Cmd::RenameTab => {
+                let cur = self
+                    .tabs
+                    .get(self.active)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                self.rename = Some(cur);
+                self.rename_is_tab = true;
             }
             Cmd::ToggleBroadcast => self.broadcast = !self.broadcast,
             Cmd::ToggleSeamless => {

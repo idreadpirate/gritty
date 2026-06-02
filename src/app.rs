@@ -46,6 +46,8 @@ pub(crate) struct Gritty {
     pub(crate) selecting: bool,
     pub(crate) dragging: Option<Vec<u8>>,
     pub(crate) rename: Option<String>,
+    /// While a rename prompt is open: true = renaming the active tab, false = pane.
+    pub(crate) rename_is_tab: bool,
     pub(crate) palette: Option<Palette>,
     pub(crate) broadcast: bool,
     /// RT-8: pending signal-byte (ETX/EOT/SUB) awaiting second-press confirmation.
@@ -80,6 +82,7 @@ impl Gritty {
             selecting: false,
             dragging: None,
             rename: None,
+            rename_is_tab: false,
             palette: None,
             broadcast: false,
             broadcast_pending_signal: None,
