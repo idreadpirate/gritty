@@ -215,13 +215,22 @@ mod tests {
     #[test]
     fn plain_tab_and_other_control_named_keys() {
         let none = ModifiersState::empty();
-        assert_eq!(encode(&Key::Named(NamedKey::Tab), none), Some(b"\t".to_vec()));
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Tab), none),
+            Some(b"\t".to_vec())
+        );
         assert_eq!(
             encode(&Key::Named(NamedKey::Backspace), none),
             Some(vec![0x7f])
         );
-        assert_eq!(encode(&Key::Named(NamedKey::Escape), none), Some(vec![0x1b]));
-        assert_eq!(encode(&Key::Named(NamedKey::Space), none), Some(b" ".to_vec()));
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Escape), none),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Space), none),
+            Some(b" ".to_vec())
+        );
     }
 
     #[test]
@@ -291,7 +300,10 @@ mod tests {
     fn ctrl_alt_letter_is_esc_then_control_byte() {
         // Alt+Ctrl+c => ESC, then ETX
         let key = Key::Character("c".into());
-        assert_eq!(encode(&key, mods(false, true, true)), Some(vec![0x1b, 0x03]));
+        assert_eq!(
+            encode(&key, mods(false, true, true)),
+            Some(vec![0x1b, 0x03])
+        );
     }
 
     #[test]
@@ -307,7 +319,11 @@ mod tests {
             ("?", 0x7f),
         ];
         for (s, b) in cases {
-            assert_eq!(encode(&Key::Character(s.into()), ctrl), Some(vec![b]), "{s:?}");
+            assert_eq!(
+                encode(&Key::Character(s.into()), ctrl),
+                Some(vec![b]),
+                "{s:?}"
+            );
         }
         // uppercase letters map like their lowercase counterpart
         assert_eq!(encode(&Key::Character("A".into()), ctrl), Some(vec![0x01]));

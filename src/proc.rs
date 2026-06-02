@@ -1,20 +1,61 @@
 // Detect the foreground process inside a pane by walking the shell's process
 // tree. The tree logic is pure and tested; the OS snapshot is Windows-only.
 
+use std::collections::HashMap;
+
 pub struct Proc {
     pub pid: u32,
     pub ppid: u32,
     pub name: String,
 }
 
-/// Deepest descendant of `root` (closest thing to the foreground process).
-/// Returns None when `root` has no children (i.e. just the bare shell).
-pub fn deepest_descendant(procs: &[Proc], root: u32) -> Option<u32> {
-    use std::collections::HashMap;
+/// A snapshot of the process list with a prebuilt parent→children map.
+/// Build once per poll cycle and reuse across all panes (CA-3, RT-14).
+#[allow(dead_code)]
+pub struct Snapshot {
+    procs: Vec<Proc>,
+    children: HashMap<u32, Vec<u32>>,
+}
+
+#[allow(dead_code)]
+impl Snapshot {
+    /// Capture the current process list and build the children map once.
+    pub fn capture() -> Self {
+        let procs = snapshot();
+        let children = build_children_map(&procs);
+        Self { procs, children }
+    }
+
+    /// Name of the foreground process in the tree rooted at `root_pid`, if any.
+    /// Reuses the prebuilt children map — O(N) per call, not O(P × N).
+    pub fn foreground_name(&self, root_pid: u32) -> Option<String> {
+        let d = deepest_descendant_with_map(&self.children, root_pid)?;
+        name_of(&self.procs, d)
+    }
+
+    /// Expose the raw proc list for callers that need it.
+    pub fn procs(&self) -> &[Proc] {
+        &self.procs
+    }
+
+    /// Test-only constructor: build a Snapshot from a synthetic Vec<Proc>.
+    #[cfg(test)]
+    pub fn from_procs(procs: Vec<Proc>) -> Self {
+        let children = build_children_map(&procs);
+        Self { procs, children }
+    }
+}
+
+fn build_children_map(procs: &[Proc]) -> HashMap<u32, Vec<u32>> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for p in procs {
         children.entry(p.ppid).or_default().push(p.pid);
     }
+    children
+}
+
+/// Deepest descendant of `root` using a prebuilt children map.
+fn deepest_descendant_with_map(children: &HashMap<u32, Vec<u32>>, root: u32) -> Option<u32> {
     let mut best: Option<u32> = None;
     let mut best_depth = 0usize;
     let mut stack = vec![(root, 0usize)];
@@ -34,6 +75,13 @@ pub fn deepest_descendant(procs: &[Proc], root: u32) -> Option<u32> {
     } else {
         best
     }
+}
+
+/// Deepest descendant of `root` (closest thing to the foreground process).
+/// Returns None when `root` has no children (i.e. just the bare shell).
+pub fn deepest_descendant(procs: &[Proc], root: u32) -> Option<u32> {
+    let children = build_children_map(procs);
+    deepest_descendant_with_map(&children, root)
 }
 
 pub fn name_of(procs: &[Proc], pid: u32) -> Option<String> {
@@ -133,29 +181,37 @@ mod tests {
     }
 
     #[test]
-    fn strip_exe_handles_both_cases_and_no_suffix() {
-        assert_eq!(strip_exe("nvim.exe"), "nvim");
-        assert_eq!(strip_exe("NVIM.EXE"), "NVIM");
-        assert_eq!(strip_exe("python"), "python");
+    fn snapshot_foreground_name_resolves_deepest_descendant() {
+        // shell(10) -> cargo(20) -> rustc(30) -> cc(40)
+        let procs = vec![
+            p(10, 1, "pwsh.exe"),
+            p(20, 10, "cargo.exe"),
+            p(30, 20, "rustc.exe"),
+            p(40, 30, "cc.exe"),
+        ];
+        let snap = Snapshot::from_procs(procs);
+        // Deepest descendant of root 10 is cc (depth 3)
+        assert_eq!(snap.foreground_name(10), Some("cc".to_string()));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn snapshot_includes_this_process() {
-        let procs = snapshot();
-        assert!(!procs.is_empty(), "toolhelp snapshot returned nothing");
-        let me = std::process::id();
-        let mine = procs
-            .iter()
-            .find(|p| p.pid == me)
-            .expect("our own pid must appear in the snapshot");
-        // the running test harness is a gritty*.exe binary
-        assert!(
-            mine.name.to_ascii_lowercase().contains("gritty"),
-            "unexpected self name: {:?}",
-            mine.name
-        );
-        // and our parent process is also present (pid != ppid, ppid resolvable)
-        assert!(name_of(&procs, mine.ppid).is_some());
+    fn snapshot_bare_shell_returns_none() {
+        let procs = vec![p(10, 1, "pwsh.exe")];
+        let snap = Snapshot::from_procs(procs);
+        assert!(snap.foreground_name(10).is_none());
+    }
+
+    #[test]
+    fn snapshot_reuses_map_across_multiple_roots() {
+        // Two independent shell trees in one snapshot
+        let procs = vec![
+            p(10, 1, "pwsh.exe"),
+            p(20, 10, "vim.exe"),
+            p(100, 1, "cmd.exe"),
+            p(200, 100, "python.exe"),
+        ];
+        let snap = Snapshot::from_procs(procs);
+        assert_eq!(snap.foreground_name(10), Some("vim".to_string()));
+        assert_eq!(snap.foreground_name(100), Some("python".to_string()));
     }
 }

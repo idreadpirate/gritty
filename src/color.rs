@@ -11,7 +11,11 @@ pub const SELECTION_BG: u32 = 0x003a_2e20; // warm gunmetal
 pub const ACCENT: u32 = 0x00ff_7b00; // focused pane / active tab — molten orange
 pub const UI_BAR_BG: u32 = 0x0016_151f; // tab bar — matches BG (seamless top)
 pub const UI_TITLE_BG: u32 = 0x001e_1c28; // inactive pane title
-pub const UI_DIM: u32 = 0x008c_6d47; // inactive UI text — bronze
+                                          // UI_DIM: bumped from #8c6d47 (~3.9:1) to #b08050 to reach ~5.49:1 contrast
+                                          // against BG (#16151f), satisfying WCAG AA (4.5:1) for inactive UI text.
+pub const UI_DIM: u32 = 0x00b0_8050; // inactive UI text — warm bronze, ~5.49:1 vs BG
+/// Subtle 1px separator between unfocused panes and below the tab strip (CA-24/CA-29).
+pub const PANE_SEP: u32 = 0x002d_2b3d; // muted indigo line
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -120,10 +124,9 @@ mod tests {
         assert_eq!(to_rgb(Color::Indexed(16), FG), 0x0000_0000);
         // index 231 is the cube max: all channels 55 + 5*40 = 255.
         assert_eq!(to_rgb(Color::Indexed(231), FG), 0x00ff_ffff);
-        // index 53 = cube offset 37 -> (r=1, g=0, b=1): exercises the non-zero
-        // conversion on the r/b channels and the zero branch on g.
+        // a mid cube value: index 53 = 16 + 37 → i=37=1*36+1 → r=1,g=0,b=1 → rgb(95,0,95).
         assert_eq!(to_rgb(Color::Indexed(16 + 37), FG), {
-            let v = 55 + 40; // conv(1) = 95
+            let v = 55 + 40; // step 1 on r and b, step 0 on g
             rgb(v, 0, v)
         });
     }
@@ -149,12 +152,24 @@ mod tests {
         assert_eq!(to_rgb(Color::Named(NamedColor::White), FG), ANSI16[7]);
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlack), FG), ANSI16[8]);
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightRed), FG), ANSI16[9]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightGreen), FG), ANSI16[10]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightYellow), FG), ANSI16[11]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightGreen), FG),
+            ANSI16[10]
+        );
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightYellow), FG),
+            ANSI16[11]
+        );
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlue), FG), ANSI16[12]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightMagenta), FG), ANSI16[13]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightMagenta), FG),
+            ANSI16[13]
+        );
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightCyan), FG), ANSI16[14]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightWhite), FG), ANSI16[15]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightWhite), FG),
+            ANSI16[15]
+        );
     }
 
     #[test]
@@ -167,7 +182,44 @@ mod tests {
         assert_eq!(to_rgb(Color::Named(NamedColor::DimMagenta), FG), 0x80_0080);
         assert_eq!(to_rgb(Color::Named(NamedColor::DimCyan), FG), 0x00_8080);
         assert_eq!(to_rgb(Color::Named(NamedColor::DimWhite), FG), 0x80_8080);
-        assert_eq!(to_rgb(Color::Named(NamedColor::DimForeground), FG), 0x80_8080);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::DimForeground), FG),
+            0x80_8080
+        );
+    }
+
+    /// WCAG 2.1 relative luminance for a 0x00RRGGBB color (test helper).
+    fn wcag_luminance(c: u32) -> f64 {
+        let linearize = |raw: u32| -> f64 {
+            let s = raw as f64 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let r = linearize((c >> 16) & 0xff);
+        let g = linearize((c >> 8) & 0xff);
+        let b = linearize(c & 0xff);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// WCAG 2.1 contrast ratio between two colors (test helper).
+    fn wcag_contrast(c1: u32, c2: u32) -> f64 {
+        let l1 = wcag_luminance(c1);
+        let l2 = wcag_luminance(c2);
+        let (lighter, darker) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn ui_dim_meets_wcag_aa_vs_bg() {
+        // CA-30: UI_DIM must have at least 4.5:1 contrast against BG for WCAG AA.
+        let ratio = wcag_contrast(UI_DIM, BG);
+        assert!(
+            ratio >= 4.5,
+            "UI_DIM vs BG contrast {ratio:.2}:1 is below WCAG AA 4.5:1"
+        );
     }
 
     #[test]
@@ -215,7 +267,7 @@ pub fn style_flags(mut fg: u32, mut bg: u32, flags: Flags) -> (u32, u32, bool) {
 }
 
 #[cfg(test)]
-mod style_flags_tests {
+mod style_tests {
     use super::*;
 
     #[test]
