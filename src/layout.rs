@@ -26,6 +26,26 @@ impl Rect {
     }
 }
 
+/// Split `area` into the two child rectangles for a given axis and ratio.
+pub fn child_areas(axis: Axis, ratio: f32, area: Rect) -> (Rect, Rect) {
+    match axis {
+        Axis::LeftRight => {
+            let wa = ((area.w as f32) * ratio).round() as usize;
+            (
+                Rect { x: area.x, y: area.y, w: wa, h: area.h },
+                Rect { x: area.x + wa, y: area.y, w: area.w.saturating_sub(wa), h: area.h },
+            )
+        }
+        Axis::TopBottom => {
+            let ha = ((area.h as f32) * ratio).round() as usize;
+            (
+                Rect { x: area.x, y: area.y, w: area.w, h: ha },
+                Rect { x: area.x, y: area.y + ha, w: area.w, h: area.h.saturating_sub(ha) },
+            )
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Node {
     Leaf(usize),
@@ -42,24 +62,11 @@ impl Node {
     pub fn layout(&self, area: Rect, out: &mut Vec<(usize, Rect)>) {
         match self {
             Node::Leaf(id) => out.push((*id, area)),
-            Node::Split { axis, ratio, a, b } => match axis {
-                Axis::LeftRight => {
-                    let wa = ((area.w as f32) * ratio).round() as usize;
-                    a.layout(Rect { x: area.x, y: area.y, w: wa, h: area.h }, out);
-                    b.layout(
-                        Rect { x: area.x + wa, y: area.y, w: area.w.saturating_sub(wa), h: area.h },
-                        out,
-                    );
-                }
-                Axis::TopBottom => {
-                    let ha = ((area.h as f32) * ratio).round() as usize;
-                    a.layout(Rect { x: area.x, y: area.y, w: area.w, h: ha }, out);
-                    b.layout(
-                        Rect { x: area.x, y: area.y + ha, w: area.w, h: area.h.saturating_sub(ha) },
-                        out,
-                    );
-                }
-            },
+            Node::Split { axis, ratio, a, b } => {
+                let (ra, rb) = child_areas(*axis, *ratio, area);
+                a.layout(ra, out);
+                b.layout(rb, out);
+            }
         }
     }
 
@@ -118,6 +125,66 @@ impl Node {
             Node::Split { a, b, .. } => {
                 a.leaves(out);
                 b.leaves(out);
+            }
+        }
+    }
+
+    /// Path (0 = first child, 1 = second) to the split whose divider is within
+    /// `tol` pixels of (x, y). Used for mouse drag-to-resize.
+    pub fn divider_at(&self, area: Rect, x: usize, y: usize, tol: usize) -> Option<Vec<u8>> {
+        if let Node::Split { axis, ratio, a, b } = self {
+            let (ra, rb) = child_areas(*axis, *ratio, area);
+            if let Some(mut p) = a.divider_at(ra, x, y, tol) {
+                p.insert(0, 0);
+                return Some(p);
+            }
+            if let Some(mut p) = b.divider_at(rb, x, y, tol) {
+                p.insert(0, 1);
+                return Some(p);
+            }
+            let hit = match axis {
+                Axis::LeftRight => {
+                    let dx = ra.x + ra.w;
+                    x.abs_diff(dx) <= tol && y >= area.y && y < area.y + area.h
+                }
+                Axis::TopBottom => {
+                    let dy = ra.y + ra.h;
+                    y.abs_diff(dy) <= tol && x >= area.x && x < area.x + area.w
+                }
+            };
+            if hit {
+                return Some(Vec::new());
+            }
+        }
+        None
+    }
+
+    /// Axis + pixel area of the split at `path` (for translating a drag to a ratio).
+    pub fn split_area(&self, path: &[u8], area: Rect) -> Option<(Axis, Rect)> {
+        match self {
+            Node::Split { axis, ratio, a, b } => {
+                if path.is_empty() {
+                    return Some((*axis, area));
+                }
+                let (ra, rb) = child_areas(*axis, *ratio, area);
+                match path[0] {
+                    0 => a.split_area(&path[1..], ra),
+                    _ => b.split_area(&path[1..], rb),
+                }
+            }
+            Node::Leaf(_) => None,
+        }
+    }
+
+    /// Set the ratio of the split at `path`.
+    pub fn set_ratio(&mut self, path: &[u8], value: f32) {
+        if let Node::Split { ratio, a, b, .. } = self {
+            if path.is_empty() {
+                *ratio = value.clamp(0.05, 0.95);
+            } else if path[0] == 0 {
+                a.set_ratio(&path[1..], value);
+            } else {
+                b.set_ratio(&path[1..], value);
             }
         }
     }
@@ -261,5 +328,24 @@ mod tests {
         let mut n = Node::Leaf(0);
         n.split_leaf(0, 1, Axis::LeftRight);
         assert!(!n.resize(0, Axis::TopBottom, true, 0.1));
+    }
+
+    #[test]
+    fn divider_found_near_boundary() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight); // boundary at x=50
+        assert_eq!(n.divider_at(AREA, 51, 30, 4), Some(vec![]));
+        assert!(n.divider_at(AREA, 10, 30, 4).is_none());
+    }
+
+    #[test]
+    fn set_ratio_then_layout_reflects_drag() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        let path = n.divider_at(AREA, 50, 30, 4).unwrap();
+        n.set_ratio(&path, 0.25);
+        let r = rects(&n);
+        assert_eq!(r[0].1.w, 25);
+        assert_eq!(r[1].1.w, 75);
     }
 }

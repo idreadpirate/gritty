@@ -6,8 +6,10 @@ mod background;
 mod clipboard;
 mod color;
 mod font;
+mod fuzzy;
 mod key;
 mod layout;
+mod palette;
 mod pty;
 mod render;
 mod session;
@@ -30,6 +32,7 @@ use clipboard::Clip;
 use color::{ACCENT, BG, FG, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
 use font::FontAtlas;
 use layout::{Axis, Node, Rect};
+use palette::{Cmd, Palette};
 use render::{draw_cell, draw_text, fill_rect, stroke_rect, Cell};
 use session::Tab;
 
@@ -66,7 +69,11 @@ struct Gritty {
     mods: ModifiersState,
     mouse_pos: (f64, f64),
     selecting: bool,
+    dragging: Option<Vec<u8>>,
     rename: Option<String>,
+    palette: Option<Palette>,
+    broadcast: bool,
+    seamless: bool,
     proxy: EventLoopProxy<Wake>,
 }
 
@@ -84,13 +91,26 @@ impl Gritty {
             mods: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             selecting: false,
+            dragging: None,
             rename: None,
+            palette: None,
+            broadcast: false,
+            seamless: false,
             proxy,
         }
     }
 
     fn bar_h(&self) -> usize {
         self.font.cell_h
+    }
+
+    /// Height of a pane's title bar (0 in seamless mode).
+    fn title_h(&self) -> usize {
+        if self.seamless {
+            0
+        } else {
+            self.font.cell_h
+        }
     }
 
     fn win_size(&self) -> (usize, usize) {
@@ -118,9 +138,9 @@ impl Gritty {
         v
     }
 
-    /// Grid area of a pane = its rect minus the one-row title bar.
+    /// Grid area of a pane = its rect minus the title bar.
     fn grid_rect(&self, rect: Rect) -> Rect {
-        let t = self.font.cell_h;
+        let t = self.title_h();
         Rect { x: rect.x, y: rect.y + t, w: rect.w, h: rect.h.saturating_sub(t) }
     }
 
@@ -129,10 +149,11 @@ impl Gritty {
         let (w, h) = self.win_size();
         let rects = self.pane_rects(w, h);
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
+        let th = self.title_h();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             for (id, rect) in rects {
                 if let Some(pane) = tab.panes.get_mut(&id) {
-                    let grid = Rect { x: rect.x, y: rect.y + ch, w: rect.w, h: rect.h.saturating_sub(ch) };
+                    let grid = Rect { x: rect.x, y: rect.y + th, w: rect.w, h: rect.h.saturating_sub(th) };
                     pane.resize(grid.w / cw, grid.h / ch);
                 }
             }
@@ -143,8 +164,9 @@ impl Gritty {
         let (w, h) = self.win_size();
         let area = self.content_rect(w, h);
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
+        let th = self.title_h();
         let cols = area.w / cw;
-        let rows = area.h.saturating_sub(ch) / ch;
+        let rows = area.h.saturating_sub(th) / ch;
         let n = self.tabs.len() + 1;
         let color = TAB_PALETTE[self.tabs.len() % TAB_PALETTE.len()];
         self.tabs
@@ -318,6 +340,12 @@ impl Gritty {
     // --- input -------------------------------------------------------------
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        // Command palette swallows input while open.
+        if self.palette.is_some() {
+            self.handle_palette_key(event_loop, key);
+            return;
+        }
+
         // Rename prompt swallows all input while open.
         if let Some(buf) = self.rename.as_mut() {
             match key {
@@ -352,6 +380,11 @@ impl Gritty {
                     "e" => return self.split_focus(Axis::TopBottom),
                     "w" => return self.close_focus(event_loop),
                     "t" => return self.new_tab(),
+                    "p" => {
+                        self.palette = Some(Palette::new());
+                        self.request_redraw();
+                        return;
+                    }
                     "r" => {
                         let cur = self
                             .tabs
@@ -410,16 +443,94 @@ impl Gritty {
             }
         }
 
-        // Default: send to the focused pane.
+        // Default: send to the focused pane (or every pane when broadcasting).
         if let Some(bytes) = key::encode(key, self.mods) {
             if let Some(tab) = self.tabs.get_mut(self.active) {
-                let f = tab.focus;
-                if let Some(pane) = tab.panes.get_mut(&f) {
-                    pane.term.scroll_to_bottom();
-                    pane.pty.write(&bytes);
+                if self.broadcast {
+                    for pane in tab.panes.values_mut() {
+                        pane.term.scroll_to_bottom();
+                        pane.pty.write(&bytes);
+                    }
+                } else {
+                    let f = tab.focus;
+                    if let Some(pane) = tab.panes.get_mut(&f) {
+                        pane.term.scroll_to_bottom();
+                        pane.pty.write(&bytes);
+                    }
                 }
             }
         }
+    }
+
+    fn handle_palette_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        let Some(p) = self.palette.as_mut() else { return };
+        match key {
+            Key::Named(NamedKey::Escape) => self.palette = None,
+            Key::Named(NamedKey::Enter) => {
+                let cmd = p.selected();
+                self.palette = None;
+                if let Some(cmd) = cmd {
+                    self.run_cmd(cmd, event_loop);
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                p.sel += 1;
+                p.clamp_selection();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                p.sel = p.sel.saturating_sub(1);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            Key::Named(NamedKey::Space) => {
+                p.query.push(' ');
+                p.sel = 0;
+            }
+            Key::Character(s) => {
+                p.query.push_str(s);
+                p.sel = 0;
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    fn run_cmd(&mut self, cmd: Cmd, event_loop: &ActiveEventLoop) {
+        match cmd {
+            Cmd::SplitRight => self.split_focus(Axis::LeftRight),
+            Cmd::SplitDown => self.split_focus(Axis::TopBottom),
+            Cmd::ClosePane => self.close_focus(event_loop),
+            Cmd::NewTab => self.new_tab(),
+            Cmd::NextTab => {
+                if !self.tabs.is_empty() {
+                    self.active = (self.active + 1) % self.tabs.len();
+                    self.relayout();
+                }
+            }
+            Cmd::PrevTab => {
+                if !self.tabs.is_empty() {
+                    self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                    self.relayout();
+                }
+            }
+            Cmd::RenamePane => {
+                let cur = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.panes.get(&t.focus))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                self.rename = Some(cur);
+            }
+            Cmd::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Cmd::ToggleSeamless => {
+                self.seamless = !self.seamless;
+                self.relayout();
+            }
+        }
+        self.request_redraw();
     }
 
     fn focus_and_redraw(&mut self, dir: Dir4) {
@@ -489,6 +600,8 @@ impl Gritty {
 
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
         let active = self.active;
+        let seamless = self.seamless;
+        let th = if seamless { 0 } else { ch };
 
         // Tab bar.
         fill_rect(&mut buffer, stride, Rect { x: 0, y: 0, w: stride, h: ch }, UI_BAR_BG);
@@ -505,6 +618,15 @@ impl Gritty {
 
         let accent = self.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
 
+        // Broadcast indicator at the right of the tab bar.
+        if self.broadcast {
+            let label = " BROADCAST ";
+            let lw = label.chars().count() * cw;
+            let r = Rect { x: stride.saturating_sub(lw), y: 0, w: lw, h: ch };
+            fill_rect(&mut buffer, stride, r, accent);
+            draw_text(&mut buffer, stride, &mut self.font, r.x, 0, label, BG, accent, true, r);
+        }
+
         // Panes.
         let area = Rect { x: 0, y: ch, w: stride, h: height.saturating_sub(ch) };
         let mut rects = Vec::new();
@@ -518,26 +640,62 @@ impl Gritty {
             let rect = *rect;
             let is_focus = id == focus;
 
-            // Pane title bar.
-            let title_rect = Rect { x: rect.x, y: rect.y, w: rect.w, h: ch };
-            let (tfg, tbg) = if is_focus { (BG, accent) } else { (UI_DIM, UI_TITLE_BG) };
-            fill_rect(&mut buffer, stride, title_rect, tbg);
-            let name = self
-                .tabs
-                .get(active)
-                .and_then(|t| t.panes.get(&id))
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
-            draw_text(&mut buffer, stride, &mut self.font, rect.x + cw / 2, rect.y, &name, tfg, tbg, true, title_rect);
+            // Pane title bar (hidden in seamless mode).
+            if !seamless {
+                let title_rect = Rect { x: rect.x, y: rect.y, w: rect.w, h: ch };
+                let (tfg, tbg) = if is_focus { (BG, accent) } else { (UI_DIM, UI_TITLE_BG) };
+                fill_rect(&mut buffer, stride, title_rect, tbg);
+                let name = self
+                    .tabs
+                    .get(active)
+                    .and_then(|t| t.panes.get(&id))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                draw_text(&mut buffer, stride, &mut self.font, rect.x + cw / 2, rect.y, &name, tfg, tbg, true, title_rect);
+            }
 
             // Grid.
-            let grid = Rect { x: rect.x, y: rect.y + ch, w: rect.w, h: rect.h.saturating_sub(ch) };
+            let grid = Rect { x: rect.x, y: rect.y + th, w: rect.w, h: rect.h.saturating_sub(th) };
             if let Some(pane) = self.tabs.get(active).and_then(|t| t.panes.get(&id)) {
                 draw_pane_grid(&mut buffer, stride, &mut self.font, pane, grid, is_focus, accent);
             }
 
+            // Focused pane always gets the accent glow border.
             if is_focus {
                 stroke_rect(&mut buffer, stride, rect, accent);
+            }
+        }
+
+        // Command palette overlay.
+        if self.palette.is_some() {
+            let (query, sel, matches) = {
+                let p = self.palette.as_ref().unwrap();
+                (p.query.clone(), p.sel, p.matches())
+            };
+            let shown = matches.len().min(8);
+            let box_w = (stride * 2 / 3).max(40 * cw.max(1)).min(stride.saturating_sub(cw));
+            let box_h = (shown + 1) * ch + ch / 2;
+            let bx = (stride.saturating_sub(box_w)) / 2;
+            let by = ch * 2;
+            let panel = 0x0020_2030u32;
+            let rbox = Rect { x: bx, y: by, w: box_w, h: box_h };
+            fill_rect(&mut buffer, stride, rbox, panel);
+            stroke_rect(&mut buffer, stride, rbox, accent);
+
+            let qline = format!("> {query}_");
+            let qrect = Rect { x: bx, y: by, w: box_w, h: ch };
+            draw_text(&mut buffer, stride, &mut self.font, bx + cw, by + ch / 4, &qline, accent, panel, false, qrect);
+
+            for (i, (label, _)) in matches.iter().take(shown).enumerate() {
+                let iy = by + ch + ch / 2 + i * ch;
+                let irow = Rect { x: bx, y: iy, w: box_w, h: ch };
+                let (fg, bg) = if i == sel {
+                    fill_rect(&mut buffer, stride, irow, accent);
+                    (BG, accent)
+                } else {
+                    (FG, panel)
+                };
+                draw_text(&mut buffer, stride, &mut self.font, bx + cw, iy, label, fg, bg, false, irow);
             }
         }
 
@@ -642,7 +800,9 @@ impl ApplicationHandler<Wake> for Gritty {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
-                if self.selecting {
+                if let Some(path) = self.dragging.clone() {
+                    self.drag_divider(&path, position.x, position.y);
+                } else if self.selecting {
                     self.update_selection(position.x, position.y);
                 }
             }
@@ -650,8 +810,10 @@ impl ApplicationHandler<Wake> for Gritty {
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
                 (ElementState::Pressed, MouseButton::Left) => self.begin_selection(),
                 (ElementState::Released, MouseButton::Left) => {
+                    if self.dragging.take().is_none() && self.selecting {
+                        self.copy_selection();
+                    }
                     self.selecting = false;
-                    self.copy_selection();
                 }
                 (ElementState::Pressed, MouseButton::Right) => self.paste(),
                 _ => {}
@@ -699,6 +861,18 @@ impl Gritty {
             return;
         }
 
+        // Grab a divider to drag-resize.
+        let (w, h) = self.win_size();
+        let area = self.content_rect(w, h);
+        if let Some(path) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.tree.divider_at(area, x as usize, y as usize, 5))
+        {
+            self.dragging = Some(path);
+            return;
+        }
+
         let Some((id, grid)) = self.pane_at(x, y) else { return };
         // Focus the clicked pane.
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -719,6 +893,27 @@ impl Gritty {
             }
         }
         self.selecting = true;
+        self.request_redraw();
+    }
+
+    fn drag_divider(&mut self, path: &[u8], x: f64, y: f64) {
+        let (w, h) = self.win_size();
+        let area = self.content_rect(w, h);
+        let Some((axis, srect)) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.tree.split_area(path, area))
+        else {
+            return;
+        };
+        let ratio = match axis {
+            Axis::LeftRight => (x - srect.x as f64) / (srect.w.max(1) as f64),
+            Axis::TopBottom => (y - srect.y as f64) / (srect.h.max(1) as f64),
+        } as f32;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.tree.set_ratio(path, ratio);
+        }
+        self.relayout();
         self.request_redraw();
     }
 

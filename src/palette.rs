@@ -1,0 +1,80 @@
+// Command palette: a fuzzy-searchable list of actions (the "Control Center").
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    RenamePane,
+    NewTab,
+    NextTab,
+    PrevTab,
+    ToggleBroadcast,
+    ToggleSeamless,
+}
+
+pub const COMMANDS: &[(&str, Cmd)] = &[
+    ("split right", Cmd::SplitRight),
+    ("split down", Cmd::SplitDown),
+    ("close pane", Cmd::ClosePane),
+    ("rename pane", Cmd::RenamePane),
+    ("new tab", Cmd::NewTab),
+    ("next tab", Cmd::NextTab),
+    ("previous tab", Cmd::PrevTab),
+    ("toggle broadcast input", Cmd::ToggleBroadcast),
+    ("toggle seamless mode", Cmd::ToggleSeamless),
+];
+
+pub struct Palette {
+    pub query: String,
+    pub sel: usize,
+}
+
+impl Palette {
+    pub fn new() -> Self {
+        Self { query: String::new(), sel: 0 }
+    }
+
+    /// Commands matching the query, best score first.
+    pub fn matches(&self) -> Vec<(&'static str, Cmd)> {
+        let mut scored: Vec<(i32, &'static str, Cmd)> = COMMANDS
+            .iter()
+            .filter_map(|(label, cmd)| crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *cmd)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, l, c)| (l, c)).collect()
+    }
+
+    pub fn selected(&self) -> Option<Cmd> {
+        self.matches().get(self.sel).map(|(_, c)| *c)
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let n = self.matches().len();
+        if n == 0 {
+            self.sel = 0;
+        } else if self.sel >= n {
+            self.sel = n - 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_to_matching_commands() {
+        let mut p = Palette::new();
+        p.query = "broad".into();
+        let m = p.matches();
+        assert!(m.iter().any(|(_, c)| *c == Cmd::ToggleBroadcast));
+        assert!(!m.iter().any(|(_, c)| *c == Cmd::NewTab));
+    }
+
+    #[test]
+    fn empty_query_lists_all() {
+        let p = Palette::new();
+        assert_eq!(p.matches().len(), COMMANDS.len());
+    }
+}
