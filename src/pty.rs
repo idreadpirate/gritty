@@ -18,7 +18,11 @@ pub struct Pty {
 
 impl Pty {
     /// Spawn `program args...` on a fresh PTY of the given size.
-    pub fn spawn(program: &str, args: &[&str], rows: u16, cols: u16) -> Result<Self> {
+    /// `waker` is called whenever new output arrives, so the UI loop can wake.
+    pub fn spawn<W>(program: &str, args: &[&str], rows: u16, cols: u16, waker: W) -> Result<Self>
+    where
+        W: Fn() + Send + 'static,
+    {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -50,6 +54,7 @@ impl Pty {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
+                        waker();
                     }
                 }
             }
@@ -93,7 +98,7 @@ mod tests {
 
     #[test]
     fn conpty_echo_roundtrips() {
-        let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80)
+        let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {})
             .expect("spawn cmd.exe over ConPTY");
 
         let mut out = Vec::new();

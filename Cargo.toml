@@ -10,6 +10,7 @@ softbuffer = "0.4"
 fontdue = "0.9"
 portable-pty = "0.8"
 anyhow = "1"
+alacritty_terminal = "0.25"
 
 [profile.release]
 opt-level = 3
