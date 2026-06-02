@@ -1,5 +1,6 @@
 // Wraps alacritty_terminal's VT engine: parse PTY bytes into a grid we can read.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -103,19 +104,21 @@ impl Dimensions for TermSize {
     }
 }
 
-/// Captures OSC 0/2 window title events emitted by the VT parser.
+/// Captures OSC 0/2 window title events and BEL events emitted by the VT parser.
 ///
-/// `EventListener::send_event` takes `&self`, so interior mutability
-/// (Arc<Mutex>) is required to update the title without `&mut self`.
-/// The same `Arc` is held by `Terminal` so callers can read the current title.
+/// `EventListener::send_event` takes `&self`, so interior mutability is
+/// required to update state without `&mut self`.  Title uses `Arc<Mutex>`;
+/// the bell flag uses `Arc<AtomicBool>` for lock-free set/clear.
+/// Both `Arc`s are also held by `Terminal` so callers can read the state.
 #[derive(Clone)]
 pub(crate) struct TitleListener {
     title: Arc<Mutex<String>>,
+    bell: Arc<AtomicBool>,
 }
 
 impl TitleListener {
-    fn new(title: Arc<Mutex<String>>) -> Self {
-        Self { title }
+    fn new(title: Arc<Mutex<String>>, bell: Arc<AtomicBool>) -> Self {
+        Self { title, bell }
     }
 }
 
@@ -131,6 +134,9 @@ impl EventListener for TitleListener {
                 if let Ok(mut guard) = self.title.lock() {
                     guard.clear();
                 }
+            }
+            Event::Bell => {
+                self.bell.store(true, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -149,6 +155,9 @@ pub struct Terminal {
     /// Latest working-directory path announced via OSC 7, or `None` if none
     /// has been received yet.
     cwd: Option<String>,
+    /// Set to `true` by `TitleListener` when a BEL (`\x07`) is received.
+    /// Consumed (cleared) by `take_bell()`.
+    bell: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -159,7 +168,8 @@ impl Terminal {
             ..Config::default()
         };
         let title = Arc::new(Mutex::new(String::new()));
-        let listener = TitleListener::new(Arc::clone(&title));
+        let bell = Arc::new(AtomicBool::new(false));
+        let listener = TitleListener::new(Arc::clone(&title), Arc::clone(&bell));
         let term = Term::new(config, &size, listener);
         Self {
             term,
@@ -167,6 +177,7 @@ impl Terminal {
             size,
             title,
             cwd: None,
+            bell,
         }
     }
 
@@ -274,6 +285,13 @@ impl Terminal {
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Returns `true` once (and clears the flag) if a BEL (`\x07`) was
+    /// received since the last call.  Subsequent calls return `false` until
+    /// the next bell.  Safe to call from `&self` (interior-mutable).
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -477,6 +495,24 @@ mod tests {
         // Space encoded as %20.
         t.feed(b"\x1b]7;file:///my%20dir\x07");
         assert_eq!(t.cwd().as_deref(), Some("/my dir"));
+    }
+
+    // --- BEL / visual bell tests ---
+
+    #[test]
+    fn bel_byte_registers_bell() {
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.take_bell(), "no bell before BEL byte");
+        t.feed(b"\x07");
+        assert!(t.take_bell(), "bell should be registered after \\x07");
+    }
+
+    #[test]
+    fn take_bell_clears_flag() {
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x07");
+        assert!(t.take_bell(), "first take returns true");
+        assert!(!t.take_bell(), "second take returns false (consumed)");
     }
 
     // --- percent_decode unit tests ---

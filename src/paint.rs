@@ -594,6 +594,33 @@ pub(crate) fn draw_pane_grid(
         }
     }
 
+    // CA-27: visual bell — brief amber flash over the pane for this frame only.
+    if pane.term.take_bell() {
+        // Blend a translucent amber overlay (≈25% opacity) across the pane grid.
+        // Alpha-blend: out = src * alpha + dst * (1 - alpha), alpha = 64/255 ≈ 0.25.
+        const BELL_COLOR: u32 = 0x00ff_7b00; // molten orange (matches ACCENT)
+        const ALPHA: u32 = 64; // ~25% opacity
+        let sr = (BELL_COLOR >> 16) & 0xff;
+        let sg = (BELL_COLOR >> 8) & 0xff;
+        let sb = BELL_COLOR & 0xff;
+        let h = buf_height(buffer, stride);
+        let x1 = (grid.x + grid.w).min(stride);
+        let y1 = (grid.y + grid.h).min(h);
+        for y in grid.y..y1 {
+            let base = y * stride;
+            for x in grid.x..x1 {
+                let dst = buffer[base + x];
+                let dr = (dst >> 16) & 0xff;
+                let dg = (dst >> 8) & 0xff;
+                let db = dst & 0xff;
+                let r = (sr * ALPHA + dr * (255 - ALPHA)) / 255;
+                let g = (sg * ALPHA + dg * (255 - ALPHA)) / 255;
+                let b = (sb * ALPHA + db * (255 - ALPHA)) / 255;
+                buffer[base + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     // CA-22: scrollback position indicator — thin thumb on the right edge.
     let display_offset = pane.term.display_offset();
     if display_offset > 0 && grid.h > 0 && grid.w > 0 {
@@ -678,6 +705,15 @@ pub(crate) fn draw_pane_grid(
                 UI_DIM,
             );
         }
+    }
+}
+
+/// Buffer height in pixels (stride must be > 0).
+fn buf_height(buf: &[u32], stride: usize) -> usize {
+    if stride == 0 {
+        0
+    } else {
+        buf.len() / stride
     }
 }
 
