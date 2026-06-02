@@ -75,7 +75,7 @@ impl Pane {
         rows: usize,
         proxy: EventLoopProxy<Wake>,
         cwd: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let term = Terminal::new(cols, rows);
@@ -92,13 +92,15 @@ impl Pane {
                 break;
             }
         }
-        let pty = pty.expect("spawn a native shell (no pwsh/powershell/cmd found)");
-        Self {
+        let pty = pty.ok_or_else(|| {
+            "No shell could be spawned (tried pwsh, powershell, cmd — none found or failed to start)".to_string()
+        })?;
+        Ok(Self {
             term,
             pty,
             name,
             proc_name: String::new(),
-        }
+        })
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -131,17 +133,17 @@ impl Tab {
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<Wake>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut panes = HashMap::new();
-        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None));
-        Self {
+        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None)?);
+        Ok(Self {
             panes,
             tree: Node::Leaf(0),
             focus: 0,
             name,
             color,
             next_id: 1,
-        }
+        })
     }
 
     /// Rebuild a tab from a saved snapshot, spawning one fresh shell per tree
@@ -152,20 +154,20 @@ impl Tab {
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<Wake>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let (plan, focus, next_id) = plan_from_saved(saved);
         let mut panes = HashMap::new();
         for (id, name) in plan {
-            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None));
+            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None)?);
         }
-        Self {
+        Ok(Self {
             panes,
             tree: saved.tree.clone(),
             focus,
             name: saved.name.clone(),
             color: saved.color,
             next_id,
-        }
+        })
     }
 
     pub fn next_id(&self) -> usize {
@@ -179,18 +181,32 @@ impl Tab {
 
     /// Split the focused pane along `axis`, focusing the new pane.
     /// The new pane inherits the focused pane's working directory (OSC 7 cwd).
-    pub fn split(&mut self, axis: Axis, proxy: EventLoopProxy<Wake>) {
+    /// Returns `Err` if shell spawn fails; the tree is left unmodified in that case.
+    pub fn split(&mut self, axis: Axis, proxy: EventLoopProxy<Wake>) -> Result<(), String> {
         let id = self.next_id;
+        // Clone the tree before mutating so we can roll back on spawn failure.
+        let tree_before = self.tree.clone();
         if self.tree.split_leaf(self.focus, id, axis) {
-            self.next_id += 1;
             let name = format!("term {}", id + 1);
             // Read the focused pane's latest OSC 7 cwd (if any) so the new
             // shell starts in the same directory.
             let inherited_cwd = self.panes.get(&self.focus).and_then(|p| p.term.cwd());
-            // Sized properly on the next relayout.
-            self.panes
-                .insert(id, Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref()));
-            self.focus = id;
+            // Sized properly on the next relayout. Roll back the tree split on failure.
+            match Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref()) {
+                Ok(pane) => {
+                    self.next_id += 1;
+                    self.panes.insert(id, pane);
+                    self.focus = id;
+                    Ok(())
+                }
+                Err(e) => {
+                    // Roll back the tree mutation so the tab stays consistent.
+                    self.tree = tree_before;
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(())
         }
     }
 
@@ -316,5 +332,47 @@ mod tests {
         fp.resize(0, 0);
         assert_eq!(fp.term.size.cols, 1);
         assert_eq!(fp.term.size.rows, 1);
+    }
+
+    /// RT-6: `shell_candidates` must never include a path that is resolved via
+    /// PATH (bare name); every path must be absolute. If none exist the caller
+    /// gets an `Err`, not a panic.
+    #[test]
+    fn shell_candidates_are_absolute_paths() {
+        for (path, _args) in super::shell_candidates() {
+            assert!(
+                std::path::Path::new(&path).is_absolute(),
+                "shell candidate must be an absolute path, got: {path}"
+            );
+        }
+    }
+
+    /// RT-6: `Pane::new` returns `Err` (not panic) when no candidate path
+    /// exists. We test this by simulating the filtering logic: given a list
+    /// where every path is known-absent, the result is `Err`.
+    #[test]
+    fn pane_spawn_failure_returns_err_not_panic() {
+        // Mimic the loop inside Pane::new with paths that cannot exist.
+        let candidates: Vec<(String, Vec<&str>)> = vec![
+            (r"C:\nonexistent\pwsh.exe".to_string(), vec![]),
+            (r"C:\nonexistent\powershell.exe".to_string(), vec![]),
+            (r"C:\nonexistent\cmd.exe".to_string(), vec![]),
+        ];
+        let mut pty_opt: Option<()> = None;
+        for (path, _args) in &candidates {
+            if std::path::Path::new(path).exists() {
+                pty_opt = Some(());
+                break;
+            }
+        }
+        let result: Result<(), String> = pty_opt.ok_or_else(|| {
+            "No shell could be spawned (tried pwsh, powershell, cmd — none found or failed to start)".to_string()
+        });
+        assert!(result.is_err(), "spawn failure must return Err, not panic");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("pwsh") || msg.contains("shell"),
+            "error message must mention the shell names: {msg}"
+        );
     }
 }

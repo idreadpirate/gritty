@@ -74,18 +74,19 @@ impl FontAtlas {
     /// entry so the caller can decide how to render it (typically: skip the
     /// blit, advance by `cell_w`).  The method never panics.
     pub fn glyph(&mut self, ch: char) -> &(Metrics, Vec<u8>) {
-        if !self.cache.contains_key(&ch) {
-            // Bound the cache so hostile/long output emitting many distinct
-            // codepoints can't grow it without limit (RT-12). ASCII fits easily;
-            // when the dynamic tail overflows, drop it wholesale (cheap, rare).
-            if self.cache.len() >= GLYPH_CACHE_CAP {
-                self.cache.clear();
-            }
-            let g = self.font.rasterize(ch, self.px);
-            self.cache.insert(ch, g);
+        // Bound the cache so hostile/long output emitting many distinct
+        // codepoints can't grow it without limit (RT-12). ASCII fits easily;
+        // when the dynamic tail overflows, drop it wholesale (cheap, rare).
+        if self.cache.contains_key(&ch) {
+            return &self.cache[&ch];
         }
-        // SAFETY: inserted above if absent; cannot be missing.
-        self.cache.get(&ch).expect("just inserted")
+        if self.cache.len() >= GLYPH_CACHE_CAP {
+            self.cache.clear();
+        }
+        let g = self.font.rasterize(ch, self.px);
+        self.cache.insert(ch, g);
+        // Key is now present — indexing cannot panic here.
+        &self.cache[&ch]
     }
 }
 

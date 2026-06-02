@@ -193,21 +193,30 @@ impl Gritty {
         let rows = area.h.saturating_sub(th) / ch;
         let n = self.tabs.len() + 1;
         let color = TAB_PALETTE[self.tabs.len() % TAB_PALETTE.len()];
-        self.tabs.push(Tab::new(
-            format!("tab {n}"),
-            color,
-            cols,
-            rows,
-            self.proxy.clone(),
-        ));
-        self.active = self.tabs.len() - 1;
-        self.relayout();
+        match Tab::new(format!("tab {n}"), color, cols, rows, self.proxy.clone()) {
+            Ok(tab) => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.relayout();
+            }
+            Err(e) => {
+                // No shell is available — show a native error dialog, then exit.
+                // We use std::process::exit because we may not hold an event_loop
+                // reference at every call site (e.g. key-handler in input.rs).
+                show_error_dialog(&format!(
+                    "Gritty could not start a shell.\n\n{e}\n\nThe application will now exit."
+                ));
+                std::process::exit(1);
+            }
+        }
     }
 
     pub(crate) fn split_focus(&mut self, axis: Axis) {
         let proxy = self.proxy.clone();
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.split(axis, proxy);
+            // On split failure (shell could not spawn) we silently skip the split
+            // rather than crash — the existing pane continues unaffected.
+            let _ = tab.split(axis, proxy);
         }
         self.relayout();
     }
@@ -441,13 +450,20 @@ impl Gritty {
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
         let cols = (area.w / cw).max(1);
         let rows = (area.h.saturating_sub(self.title_h()) / ch).max(1);
-        self.tabs = saved
+        // Collect only tabs whose shells could be spawned; skip failures so a
+        // bad saved session doesn't prevent startup entirely.
+        let tabs: Vec<Tab> = saved
             .tabs
             .iter()
-            .map(|st| Tab::from_saved(st, cols, rows, self.proxy.clone()))
+            .filter_map(|st| Tab::from_saved(st, cols, rows, self.proxy.clone()).ok())
             .collect();
-        self.active = saved.active.min(self.tabs.len() - 1);
-        self.relayout();
+        self.tabs = tabs;
+        if !self.tabs.is_empty() {
+            self.active = saved.active.min(self.tabs.len() - 1);
+            self.relayout();
+        }
+        // If every tab failed to restore, self.tabs stays empty; the caller
+        // (resumed) will fall through to new_tab() to show the error dialog.
     }
 
     pub(crate) fn focus_and_redraw(&mut self, dir: Dir4) {
@@ -649,7 +665,9 @@ impl ApplicationHandler<Wake> for Gritty {
         // Resume the previous workspace, or start fresh.
         if saved.is_some_and(|s| !s.tabs.is_empty()) {
             self.restore_session();
-        } else {
+        }
+        // If restore left us with no tabs (failed or no saved session), open one.
+        if self.tabs.is_empty() {
             self.new_tab();
         }
     }
@@ -940,6 +958,39 @@ impl Gritty {
         }
         self.request_redraw();
     }
+}
+
+// --- Error dialog ------------------------------------------------------------
+
+/// Show a native Windows MessageBox with an error icon, then return.
+/// Used to surface fatal errors (e.g. no shell found) before process::exit.
+/// On non-Windows builds this is a no-op (the subsystem flag makes it Windows-only).
+#[cfg(windows)]
+pub(crate) fn show_error_dialog(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    // Encode as UTF-16 with a null terminator.
+    let title: Vec<u16> = "Gritty — Fatal Error"
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let body: Vec<u16> = message
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn show_error_dialog(message: &str) {
+    eprintln!("Fatal error: {message}");
 }
 
 // --- Pure helper functions (unit-testable) ----------------------------------
