@@ -191,9 +191,12 @@ impl ApplicationHandler<Wake> for Gritty {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("gritty")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        if let Some(icon) = load_icon() {
+            attrs = attrs.with_window_icon(Some(icon));
+        }
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
 
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
@@ -307,6 +310,12 @@ impl ApplicationHandler<Wake> for Gritty {
             _ => {}
         }
     }
+}
+
+/// The window/taskbar icon, baked from grittyicon.png at build time (64x64 RGBA).
+fn load_icon() -> Option<winit::window::Icon> {
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/icon_rgba.bin"));
+    winit::window::Icon::from_rgba(bytes.to_vec(), 64, 64).ok()
 }
 
 fn main() {

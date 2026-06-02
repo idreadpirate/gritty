@@ -4,8 +4,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 pub const FG: u32 = 0x00d0_d0d0;
 pub const BG: u32 = 0x0018_1818;
-pub const CURSOR: u32 = 0x00d0_d0d0;
-pub const SELECTION_BG: u32 = 0x0044_4a66;
+pub const CURSOR: u32 = 0x00ff_3d9a; // gritty pink accent (from the logo)
+pub const SELECTION_BG: u32 = 0x0050_2a44;
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
