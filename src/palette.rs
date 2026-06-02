@@ -11,6 +11,8 @@ pub enum Cmd {
     PrevTab,
     ToggleBroadcast,
     ToggleSeamless,
+    SaveSession,
+    LoadSession,
 }
 
 pub const COMMANDS: &[(&str, Cmd)] = &[
@@ -23,6 +25,8 @@ pub const COMMANDS: &[(&str, Cmd)] = &[
     ("previous tab", Cmd::PrevTab),
     ("toggle broadcast input", Cmd::ToggleBroadcast),
     ("toggle seamless mode", Cmd::ToggleSeamless),
+    ("save session", Cmd::SaveSession),
+    ("load session", Cmd::LoadSession),
 ];
 
 pub struct Palette {

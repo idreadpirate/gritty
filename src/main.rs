@@ -10,6 +10,7 @@ mod fuzzy;
 mod key;
 mod layout;
 mod palette;
+mod persist;
 mod pty;
 mod render;
 mod session;
@@ -529,8 +530,62 @@ impl Gritty {
                 self.seamless = !self.seamless;
                 self.relayout();
             }
+            Cmd::SaveSession => {
+                let _ = persist::save(&self.snapshot());
+            }
+            Cmd::LoadSession => self.restore_session(),
         }
         self.request_redraw();
+    }
+
+    /// Capture the current workspace for persistence.
+    fn snapshot(&self) -> persist::SavedSession {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let mut ids = Vec::new();
+                t.tree.leaves(&mut ids);
+                let panes = ids
+                    .iter()
+                    .filter_map(|id| {
+                        t.panes.get(id).map(|p| persist::SavedPane {
+                            id: *id,
+                            name: p.name.clone(),
+                        })
+                    })
+                    .collect();
+                persist::SavedTab {
+                    name: t.name.clone(),
+                    color: t.color,
+                    focus: t.focus,
+                    next_id: t.next_id(),
+                    tree: t.tree.clone(),
+                    panes,
+                }
+            })
+            .collect();
+        persist::SavedSession { active: self.active, tabs }
+    }
+
+    /// Replace the current workspace with a saved one (if any).
+    fn restore_session(&mut self) {
+        let Some(saved) = persist::load() else { return };
+        if saved.tabs.is_empty() {
+            return;
+        }
+        let (w, h) = self.win_size();
+        let area = self.content_rect(w, h);
+        let (cw, ch) = (self.font.cell_w, self.font.cell_h);
+        let cols = (area.w / cw).max(1);
+        let rows = (area.h.saturating_sub(self.title_h()) / ch).max(1);
+        self.tabs = saved
+            .tabs
+            .iter()
+            .map(|st| Tab::from_saved(st, cols, rows, self.proxy.clone()))
+            .collect();
+        self.active = saved.active.min(self.tabs.len() - 1);
+        self.relayout();
     }
 
     fn focus_and_redraw(&mut self, dir: Dir4) {
@@ -778,7 +833,12 @@ impl ApplicationHandler<Wake> for Gritty {
         self.surface = Some(surface);
         self._context = Some(context);
 
-        self.new_tab();
+        // Resume the previous workspace, or start fresh.
+        if persist::load().map_or(false, |s| !s.tabs.is_empty()) {
+            self.restore_session();
+        } else {
+            self.new_tab();
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
@@ -788,7 +848,10 @@ impl ApplicationHandler<Wake> for Gritty {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                let _ = persist::save(&self.snapshot());
+                event_loop.exit();
+            }
 
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
 

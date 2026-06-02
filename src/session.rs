@@ -55,6 +55,31 @@ impl Tab {
         Self { panes, tree: Node::Leaf(0), focus: 0, name, color, next_id: 1 }
     }
 
+    /// Rebuild a tab from a saved snapshot, spawning a fresh shell per pane.
+    pub fn from_saved(
+        saved: &crate::persist::SavedTab,
+        cols: usize,
+        rows: usize,
+        proxy: EventLoopProxy<Wake>,
+    ) -> Self {
+        let mut panes = HashMap::new();
+        for sp in &saved.panes {
+            panes.insert(sp.id, Pane::new(sp.name.clone(), cols, rows, proxy.clone()));
+        }
+        Self {
+            panes,
+            tree: saved.tree.clone(),
+            focus: saved.focus,
+            name: saved.name.clone(),
+            color: saved.color,
+            next_id: saved.next_id,
+        }
+    }
+
+    pub fn next_id(&self) -> usize {
+        self.next_id
+    }
+
     /// Resize the focused pane along `axis` (grow or shrink).
     pub fn resize_focus(&mut self, axis: Axis, grow: bool) {
         self.tree.resize(self.focus, axis, grow, 0.04);

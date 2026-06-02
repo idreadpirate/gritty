@@ -1,7 +1,9 @@
 // A binary split-tree describing how panes tile a tab. Pure geometry — no
 // rendering, no terminal state — so it's exhaustively testable.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Axis {
     /// Children sit side by side (a = left, b = right); divider is vertical.
     LeftRight,
@@ -46,7 +48,7 @@ pub fn child_areas(axis: Axis, ratio: f32, area: Rect) -> (Rect, Rect) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     Leaf(usize),
     Split {
