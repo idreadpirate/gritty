@@ -144,14 +144,11 @@ mod tests {
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match pty.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(chunk) => {
-                    out.extend_from_slice(&chunk);
-                    if String::from_utf8_lossy(&out).contains("gritty_ok") {
-                        return; // success
-                    }
+            if let Ok(chunk) = pty.rx.recv_timeout(Duration::from_millis(200)) {
+                out.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&out).contains("gritty_ok") {
+                    return; // success
                 }
-                Err(_) => {}
             }
         }
         panic!(

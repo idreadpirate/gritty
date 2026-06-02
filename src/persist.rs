@@ -58,8 +58,20 @@ pub fn save(session: &SavedSession) -> std::io::Result<()> {
     std::fs::write(path, session.to_json())
 }
 
+/// Largest session file we will parse. Guards against a crafted/corrupt file
+/// causing a huge allocation or hang at startup (RT-1).
+const MAX_SESSION_BYTES: u64 = 1_000_000;
+
 pub fn load() -> Option<SavedSession> {
-    let text = std::fs::read_to_string(session_path()).ok()?;
+    load_from(&session_path())
+}
+
+pub fn load_from(path: &std::path::Path) -> Option<SavedSession> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_SESSION_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
     SavedSession::from_json(&text)
 }
 
@@ -120,6 +132,22 @@ mod tests {
     #[test]
     fn garbage_json_is_none() {
         assert!(SavedSession::from_json("not json").is_none());
+    }
+
+    #[test]
+    fn valid_file_loads_and_oversize_file_rejected() {
+        let dir = std::env::temp_dir();
+        // Valid small file round-trips through load_from.
+        let ok = dir.join(format!("gritty_test_ok_{}.json", std::process::id()));
+        std::fs::write(&ok, sample().to_json()).unwrap();
+        assert_eq!(load_from(&ok), Some(sample()));
+        std::fs::remove_file(&ok).ok();
+
+        // Oversize file is rejected before parsing.
+        let big = dir.join(format!("gritty_test_big_{}.json", std::process::id()));
+        std::fs::write(&big, vec![b'x'; (MAX_SESSION_BYTES + 1) as usize]).unwrap();
+        assert!(load_from(&big).is_none());
+        std::fs::remove_file(&big).ok();
     }
 
     #[test]
