@@ -121,6 +121,54 @@ impl Node {
             }
         }
     }
+
+    pub fn contains(&self, id: usize) -> bool {
+        match self {
+            Node::Leaf(i) => *i == id,
+            Node::Split { a, b, .. } => a.contains(id) || b.contains(id),
+        }
+    }
+
+    /// Grow (or shrink) the pane `target` along `axis` by adjusting the ratio of
+    /// the nearest enclosing split with that axis. Returns true if anything moved.
+    pub fn resize(&mut self, target: usize, axis: Axis, grow: bool, step: f32) -> bool {
+        self.resize_inner(target, axis, if grow { step } else { -step }) == 2
+    }
+
+    fn resize_inner(&mut self, target: usize, want_axis: Axis, delta_a: f32) -> u8 {
+        match self {
+            Node::Leaf(id) => {
+                if *id == target {
+                    1
+                } else {
+                    0
+                }
+            }
+            Node::Split { axis, ratio, a, b } => {
+                let in_a = a.contains(target);
+                let res = if in_a {
+                    a.resize_inner(target, want_axis, delta_a)
+                } else if b.contains(target) {
+                    b.resize_inner(target, want_axis, delta_a)
+                } else {
+                    return 0;
+                };
+                match res {
+                    0 => 0,
+                    2 => 2, // already handled deeper
+                    _ => {
+                        if *axis == want_axis {
+                            let d = if in_a { delta_a } else { -delta_a };
+                            *ratio = (*ratio + d).clamp(0.1, 0.9);
+                            2
+                        } else {
+                            1 // keep looking for a matching-axis ancestor
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +235,31 @@ mod tests {
     fn split_missing_target_is_noop() {
         let mut n = Node::Leaf(0);
         assert!(!n.split_leaf(99, 1, Axis::LeftRight));
+    }
+
+    #[test]
+    fn resize_grows_focused_pane() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight); // 0 = left, 1 = right
+        assert!(n.resize(0, Axis::LeftRight, true, 0.1)); // grow left pane
+        let r = rects(&n);
+        assert_eq!(r[0].1.w, 60); // 0.6 * 100
+        assert_eq!(r[1].1.w, 40);
+    }
+
+    #[test]
+    fn resize_right_pane_grows_left() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        assert!(n.resize(1, Axis::LeftRight, true, 0.1)); // grow right pane
+        let r = rects(&n);
+        assert_eq!(r[1].1.w, 60);
+    }
+
+    #[test]
+    fn resize_wrong_axis_does_nothing() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        assert!(!n.resize(0, Axis::TopBottom, true, 0.1));
     }
 }

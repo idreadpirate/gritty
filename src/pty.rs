@@ -3,7 +3,9 @@
 // directly. This keeps the UI thread free of blocking reads.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
@@ -13,6 +15,7 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    alive: Arc<AtomicBool>,
     pub rx: Receiver<Vec<u8>>,
 }
 
@@ -44,6 +47,9 @@ impl Pty {
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
 
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_reader = alive.clone();
+
         let (tx, rx) = channel::<Vec<u8>>();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -58,14 +64,22 @@ impl Pty {
                     }
                 }
             }
+            // Child exited / PTY closed: mark dead and wake so the UI reaps it.
+            alive_reader.store(false, Ordering::Relaxed);
+            waker();
         });
 
         Ok(Self {
             master: pair.master,
             writer,
             killer,
+            alive,
             rx,
         })
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Send bytes to the child's stdin.

@@ -27,14 +27,24 @@ use winit::window::{Window, WindowId};
 
 use background::Background;
 use clipboard::Clip;
-use color::{ACCENT, BG, CURSOR, FG, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
+use color::{ACCENT, BG, FG, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
 use font::FontAtlas;
-use layout::{Axis, Rect};
+use layout::{Axis, Node, Rect};
 use render::{draw_cell, draw_text, fill_rect, stroke_rect, Cell};
 use session::Tab;
 
 #[derive(Debug, Clone, Copy)]
 struct Wake;
+
+/// Edgy neon accents — each new tab takes the next one.
+const TAB_PALETTE: [u32; 6] = [
+    0x00ff_3d9a, // pink
+    0x003d_f0ff, // cyan
+    0x004d_ff88, // green
+    0x00ff_a23d, // orange
+    0x00b4_5cff, // purple
+    0x00ff_e04d, // yellow
+];
 
 #[derive(Clone, Copy)]
 enum Dir4 {
@@ -136,8 +146,9 @@ impl Gritty {
         let cols = area.w / cw;
         let rows = area.h.saturating_sub(ch) / ch;
         let n = self.tabs.len() + 1;
+        let color = TAB_PALETTE[self.tabs.len() % TAB_PALETTE.len()];
         self.tabs
-            .push(Tab::new(format!("tab {n}"), cols, rows, self.proxy.clone()));
+            .push(Tab::new(format!("tab {n}"), color, cols, rows, self.proxy.clone()));
         self.active = self.tabs.len() - 1;
         self.relayout();
     }
@@ -221,6 +232,54 @@ impl Gritty {
     fn request_redraw(&self) {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
+        }
+    }
+
+    /// Remove panes whose shell exited (e.g. `exit`), and tabs left empty.
+    fn reap_dead(&mut self, event_loop: &ActiveEventLoop) {
+        let mut changed = false;
+        let mut ti = 0;
+        while ti < self.tabs.len() {
+            let dead: Vec<usize> = self.tabs[ti]
+                .panes
+                .iter()
+                .filter(|(_, p)| !p.pty.is_alive())
+                .map(|(id, _)| *id)
+                .collect();
+            for id in dead {
+                changed = true;
+                let tab = &mut self.tabs[ti];
+                let tree = std::mem::replace(&mut tab.tree, Node::Leaf(id));
+                match tree.without(id) {
+                    Some(t) => {
+                        tab.tree = t;
+                        if tab.focus == id {
+                            let mut lv = Vec::new();
+                            tab.tree.leaves(&mut lv);
+                            tab.focus = *lv.first().unwrap_or(&id);
+                        }
+                    }
+                    None => {}
+                }
+                tab.panes.remove(&id);
+            }
+            if self.tabs[ti].panes.is_empty() {
+                self.tabs.remove(ti);
+                changed = true;
+            } else {
+                ti += 1;
+            }
+        }
+        if changed {
+            if self.tabs.is_empty() {
+                event_loop.exit();
+                return;
+            }
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
+            self.relayout();
+            self.request_redraw();
         }
     }
 
@@ -316,6 +375,17 @@ impl Gritty {
             }
         }
 
+        // Ctrl+Alt+Arrows: resize the focused pane (Right/Down grow, Left/Up shrink).
+        if ctrl && self.mods.alt_key() {
+            match key {
+                Key::Named(NamedKey::ArrowRight) => return self.resize_focus(Axis::LeftRight, true),
+                Key::Named(NamedKey::ArrowLeft) => return self.resize_focus(Axis::LeftRight, false),
+                Key::Named(NamedKey::ArrowDown) => return self.resize_focus(Axis::TopBottom, true),
+                Key::Named(NamedKey::ArrowUp) => return self.resize_focus(Axis::TopBottom, false),
+                _ => {}
+            }
+        }
+
         if ctrl && !shift {
             if let Key::Character(s) = key {
                 if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
@@ -355,6 +425,28 @@ impl Gritty {
     fn focus_and_redraw(&mut self, dir: Dir4) {
         self.move_focus(dir);
         self.request_redraw();
+    }
+
+    fn resize_focus(&mut self, axis: Axis, grow: bool) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.resize_focus(axis, grow);
+        }
+        self.relayout();
+        self.request_redraw();
+    }
+
+    /// Tab index under an x pixel on the tab bar, mirroring the render layout.
+    fn tab_at(&self, x: usize) -> Option<usize> {
+        let cw = self.font.cell_w;
+        let mut tx = 0usize;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let tw = (tab.name.chars().count() + 2) * cw;
+            if x >= tx && x < tx + tw {
+                return Some(i);
+            }
+            tx += tw + cw / 2;
+        }
+        None
     }
 
     /// Pane id under a pixel, plus its grid rect (for selection coordinates).
@@ -404,12 +496,14 @@ impl Gritty {
         for (i, tab) in self.tabs.iter().enumerate() {
             let label = format!(" {} ", tab.name);
             let tw = label.chars().count() * cw;
-            let (fg, bg) = if i == active { (BG, ACCENT) } else { (UI_DIM, UI_BAR_BG) };
+            let (fg, bg) = if i == active { (BG, tab.color) } else { (tab.color, UI_BAR_BG) };
             let r = Rect { x: tx, y: 0, w: tw, h: ch };
             fill_rect(&mut buffer, stride, r, bg);
             draw_text(&mut buffer, stride, &mut self.font, tx, 0, &label, fg, bg, true, r);
             tx += tw + cw / 2;
         }
+
+        let accent = self.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
 
         // Panes.
         let area = Rect { x: 0, y: ch, w: stride, h: height.saturating_sub(ch) };
@@ -426,7 +520,7 @@ impl Gritty {
 
             // Pane title bar.
             let title_rect = Rect { x: rect.x, y: rect.y, w: rect.w, h: ch };
-            let (tfg, tbg) = if is_focus { (BG, ACCENT) } else { (UI_DIM, UI_TITLE_BG) };
+            let (tfg, tbg) = if is_focus { (BG, accent) } else { (UI_DIM, UI_TITLE_BG) };
             fill_rect(&mut buffer, stride, title_rect, tbg);
             let name = self
                 .tabs
@@ -439,11 +533,11 @@ impl Gritty {
             // Grid.
             let grid = Rect { x: rect.x, y: rect.y + ch, w: rect.w, h: rect.h.saturating_sub(ch) };
             if let Some(pane) = self.tabs.get(active).and_then(|t| t.panes.get(&id)) {
-                draw_pane_grid(&mut buffer, stride, &mut self.font, pane, grid, is_focus);
+                draw_pane_grid(&mut buffer, stride, &mut self.font, pane, grid, is_focus, accent);
             }
 
             if is_focus {
-                stroke_rect(&mut buffer, stride, rect, ACCENT);
+                stroke_rect(&mut buffer, stride, rect, accent);
             }
         }
 
@@ -460,6 +554,7 @@ impl Gritty {
 
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pane_grid(
     buffer: &mut [u32],
     stride: usize,
@@ -467,6 +562,7 @@ fn draw_pane_grid(
     pane: &session::Pane,
     grid: Rect,
     is_focus: bool,
+    accent: u32,
 ) {
     let (cw, ch) = (font.cell_w, font.cell_h);
     let content = pane.term.term.renderable_content();
@@ -493,7 +589,7 @@ fn draw_pane_grid(
             bg = SELECTION_BG;
             fill_bg = true;
         } else if cursor_visible && line == cur_row && col as i32 == cur_col {
-            bg = CURSOR;
+            bg = accent;
             fg = BG;
             fill_bg = true;
         }
@@ -527,8 +623,9 @@ impl ApplicationHandler<Wake> for Gritty {
         self.new_tab();
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         self.drain_pty();
+        self.reap_dead(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -591,6 +688,17 @@ impl ApplicationHandler<Wake> for Gritty {
 impl Gritty {
     fn begin_selection(&mut self) {
         let (x, y) = self.mouse_pos;
+
+        // Click on the tab bar switches tabs instead of selecting.
+        if (y as usize) < self.bar_h() {
+            if let Some(i) = self.tab_at(x as usize) {
+                self.active = i;
+                self.relayout();
+                self.request_redraw();
+            }
+            return;
+        }
+
         let Some((id, grid)) = self.pane_at(x, y) else { return };
         // Focus the clicked pane.
         if let Some(tab) = self.tabs.get_mut(self.active) {

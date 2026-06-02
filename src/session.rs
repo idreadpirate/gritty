@@ -44,14 +44,20 @@ pub struct Tab {
     pub tree: Node,
     pub focus: usize,
     pub name: String,
+    pub color: u32,
     next_id: usize,
 }
 
 impl Tab {
-    pub fn new(name: String, cols: usize, rows: usize, proxy: EventLoopProxy<Wake>) -> Self {
+    pub fn new(name: String, color: u32, cols: usize, rows: usize, proxy: EventLoopProxy<Wake>) -> Self {
         let mut panes = HashMap::new();
         panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy));
-        Self { panes, tree: Node::Leaf(0), focus: 0, name, next_id: 1 }
+        Self { panes, tree: Node::Leaf(0), focus: 0, name, color, next_id: 1 }
+    }
+
+    /// Resize the focused pane along `axis` (grow or shrink).
+    pub fn resize_focus(&mut self, axis: Axis, grow: bool) {
+        self.tree.resize(self.focus, axis, grow, 0.04);
     }
 
     /// Split the focused pane along `axis`, focusing the new pane.
