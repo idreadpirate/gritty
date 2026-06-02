@@ -1068,6 +1068,7 @@ impl ApplicationHandler<Wake> for Gritty {
             attrs = attrs.with_window_icon(Some(icon));
         }
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        style_caption(&window);
 
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
@@ -1273,6 +1274,43 @@ impl Gritty {
         self.request_redraw();
     }
 }
+
+/// Paint the OS title bar (the caption that shows "gritty") solid white, with
+/// dark caption text so it stays readable. Windows 11 only; a no-op elsewhere.
+#[cfg(windows)]
+fn style_caption(window: &Window) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(w) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = w.hwnd.get() as *mut core::ffi::c_void;
+    let white: u32 = 0x00FF_FFFF; // COLORREF 0x00BBGGRR
+    let dark: u32 = 0x0020_2020;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR as u32,
+            &white as *const u32 as *const core::ffi::c_void,
+            4,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR as u32,
+            &dark as *const u32 as *const core::ffi::c_void,
+            4,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn style_caption(_window: &Window) {}
 
 /// Window/taskbar icon, baked from grittyicon.png at build time (64x64 RGBA).
 fn load_icon() -> Option<winit::window::Icon> {
