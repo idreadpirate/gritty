@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn live_pty_exposes_pid_alive_write_and_resize() {
         // A long-lived interactive shell so the process stays alive while we poke it.
-        let mut pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}).expect("spawn cmd.exe");
+        let mut pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}, None).expect("spawn cmd.exe");
         assert!(pty.is_alive(), "freshly spawned shell should be alive");
         assert!(pty.pid().is_some(), "a spawned child has a pid");
 

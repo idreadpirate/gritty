@@ -124,6 +124,6 @@ mod tests {
         assert_eq!(lerp(0, 100, 1.0), 100);
         assert_eq!(lerp(0, 100, 0.5), 50);
         // rgb clamps out-of-range channels into 0..=255.
-        assert_eq!(rgb(-5, 300, 128), (0 << 16) | (255 << 8) | 128);
+        assert_eq!(rgb(-5, 300, 128), (255 << 8) | 128);
     }
 }

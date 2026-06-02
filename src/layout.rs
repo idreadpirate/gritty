@@ -635,7 +635,7 @@ mod tests {
         n.leaves(&mut leaves);
         leaves.sort();
         assert_eq!(leaves, vec![0, 2]); // 1 gone, both top children remain
-        // still a split (Some, Some) — not collapsed to a single leaf
+                                        // still a split (Some, Some) — not collapsed to a single leaf
         assert!(matches!(n, Node::Split { .. }));
     }
 
