@@ -79,7 +79,8 @@ impl Pty {
                 }
             }
             // Child exited / PTY closed: mark dead and wake so the UI reaps it.
-            alive_reader.store(false, Ordering::Relaxed);
+            // Release/Acquire (see is_alive) so the store is visible before the wake.
+            alive_reader.store(false, Ordering::Release);
             waker();
         });
 
@@ -95,7 +96,7 @@ impl Pty {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Call before draining `rx`: re-arms the wake so output arriving during or

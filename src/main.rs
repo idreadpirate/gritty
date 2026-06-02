@@ -647,9 +647,20 @@ impl Gritty {
 
     /// Replace the current workspace with a saved one (if any).
     fn restore_session(&mut self) {
+        // Caps against a crafted session that would mass-spawn shells (RT-5).
+        const MAX_TABS: usize = 64;
+        const MAX_PANES_PER_TAB: usize = 64;
+
         let Some(saved) = persist::load() else { return };
-        if saved.tabs.is_empty() {
+        if saved.tabs.is_empty() || saved.tabs.len() > MAX_TABS {
             return;
+        }
+        for st in &saved.tabs {
+            let mut leaves = Vec::new();
+            st.tree.leaves(&mut leaves);
+            if leaves.len() > MAX_PANES_PER_TAB {
+                return; // reject the whole session rather than spawn thousands
+            }
         }
         let (w, h) = self.win_size();
         let area = self.content_rect(w, h);
@@ -728,12 +739,13 @@ impl Gritty {
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
-        surface
-            .resize(
-                NonZeroU32::new(w as u32).unwrap(),
-                NonZeroU32::new(h as u32).unwrap(),
-            )
-            .expect("resize");
+        // w/h are clamped to >=1 by win_size(), but construct defensively so a
+        // future refactor can't turn this into a panic (CA-14).
+        let nz_w = NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN);
+        let nz_h = NonZeroU32::new(h as u32).unwrap_or(NonZeroU32::MIN);
+        if surface.resize(nz_w, nz_h).is_err() {
+            return; // skip this frame instead of crashing
+        }
         let mut buffer = surface.buffer_mut().expect("buffer");
 
         self.background.resize(stride, height);
@@ -1143,18 +1155,32 @@ impl ApplicationHandler<Wake> for Gritty {
             },
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / self.font.cell_h as f64) as i32,
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / self.font.cell_h as f64) as f32,
                 };
-                if lines != 0 {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        let f = tab.focus;
-                        if let Some(pane) = tab.panes.get_mut(&f) {
-                            pane.term.scroll(lines);
+                if self.mods.control_key() {
+                    // Ctrl + wheel resizes the focused pane (up = bigger).
+                    if notches != 0.0 {
+                        let grow = notches > 0.0;
+                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                            tab.resize_focus(Axis::LeftRight, grow);
+                            tab.resize_focus(Axis::TopBottom, grow);
                         }
+                        self.relayout();
+                        self.request_redraw();
                     }
-                    self.request_redraw();
+                } else {
+                    let lines = (notches * 3.0) as i32;
+                    if lines != 0 {
+                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                            let f = tab.focus;
+                            if let Some(pane) = tab.panes.get_mut(&f) {
+                                pane.term.scroll(lines);
+                            }
+                        }
+                        self.request_redraw();
+                    }
                 }
             }
 

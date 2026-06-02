@@ -17,6 +17,57 @@ pub struct Pane {
     pub proc_name: String,
 }
 
+/// Reconcile a saved tab into a consistent 1:1 leaf↔pane plan: one pane per tree
+/// leaf (name from `saved.panes` or a default), a `focus` that is a real leaf,
+/// and a `next_id` past every id. Orphan panes (absent from the tree) are
+/// dropped so they don't leak hidden shells (RT-7/CA-15).
+pub fn plan_from_saved(saved: &crate::persist::SavedTab) -> (Vec<(usize, String)>, usize, usize) {
+    let mut leaves = Vec::new();
+    saved.tree.leaves(&mut leaves);
+    let names: HashMap<usize, &str> = saved
+        .panes
+        .iter()
+        .map(|p| (p.id, p.name.as_str()))
+        .collect();
+    let plan: Vec<(usize, String)> = leaves
+        .iter()
+        .map(|id| {
+            let name = names
+                .get(id)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("term {}", id + 1));
+            (*id, name)
+        })
+        .collect();
+    let focus = if leaves.contains(&saved.focus) {
+        saved.focus
+    } else {
+        *leaves.first().unwrap_or(&0)
+    };
+    let next_id = leaves
+        .iter()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(1)
+        .max(saved.next_id);
+    (plan, focus, next_id)
+}
+
+/// Absolute, trusted shell paths tried in order (RT-2: never resolve a shell by
+/// bare name, which a malicious `pwsh.exe`/`cmd.exe` earlier in PATH could hijack).
+fn shell_candidates() -> Vec<(String, Vec<&'static str>)> {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    vec![
+        (format!(r"{pf}\PowerShell\7\pwsh.exe"), vec!["-NoLogo"]),
+        (
+            format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            vec!["-NoLogo"],
+        ),
+        (format!(r"{sysroot}\System32\cmd.exe"), vec![]),
+    ]
+}
+
 impl Pane {
     pub fn new(name: String, cols: usize, rows: usize, proxy: EventLoopProxy<Wake>) -> Self {
         let cols = cols.max(1);
@@ -25,15 +76,17 @@ impl Pane {
         let waker = move || {
             let _ = proxy.send_event(Wake);
         };
-        let pty = Pty::spawn(
-            "pwsh.exe",
-            &["-NoLogo"],
-            rows as u16,
-            cols as u16,
-            waker.clone(),
-        )
-        .or_else(|_| Pty::spawn("cmd.exe", &[], rows as u16, cols as u16, waker))
-        .expect("spawn a native shell");
+        let mut pty = None;
+        for (path, args) in shell_candidates() {
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            if let Ok(p) = Pty::spawn(&path, &args, rows as u16, cols as u16, waker.clone()) {
+                pty = Some(p);
+                break;
+            }
+        }
+        let pty = pty.expect("spawn a native shell (no pwsh/powershell/cmd found)");
         Self {
             term,
             pty,
@@ -81,24 +134,27 @@ impl Tab {
         }
     }
 
-    /// Rebuild a tab from a saved snapshot, spawning a fresh shell per pane.
+    /// Rebuild a tab from a saved snapshot, spawning one fresh shell per tree
+    /// leaf. Uses `plan_from_saved` so the result is always consistent
+    /// (RT-7/CA-15): every leaf has a pane, focus is real, orphans are dropped.
     pub fn from_saved(
         saved: &crate::persist::SavedTab,
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<Wake>,
     ) -> Self {
+        let (plan, focus, next_id) = plan_from_saved(saved);
         let mut panes = HashMap::new();
-        for sp in &saved.panes {
-            panes.insert(sp.id, Pane::new(sp.name.clone(), cols, rows, proxy.clone()));
+        for (id, name) in plan {
+            panes.insert(id, Pane::new(name, cols, rows, proxy.clone()));
         }
         Self {
             panes,
             tree: saved.tree.clone(),
-            focus: saved.focus,
+            focus,
             name: saved.name.clone(),
             color: saved.color,
-            next_id: saved.next_id,
+            next_id,
         }
     }
 
@@ -147,5 +203,50 @@ impl Tab {
         if let Some(p) = self.panes.get_mut(&self.focus) {
             p.name = name;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Axis, Node};
+    use crate::persist::{SavedPane, SavedTab};
+
+    fn tab(tree: Node, panes: Vec<(usize, &str)>, focus: usize, next_id: usize) -> SavedTab {
+        SavedTab {
+            name: "t".into(),
+            color: 0,
+            focus,
+            next_id,
+            tree,
+            panes: panes
+                .into_iter()
+                .map(|(id, n)| SavedPane { id, name: n.into() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn plan_drops_orphans_and_fills_missing_names() {
+        let tree = Node::Split {
+            axis: Axis::LeftRight,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(0)),
+            b: Box::new(Node::Leaf(1)),
+        };
+        let saved = tab(tree, vec![(0, "editor"), (9, "orphan")], 0, 2);
+        let (plan, focus, next_id) = plan_from_saved(&saved);
+        assert_eq!(plan.len(), 2); // one pane per leaf; orphan 9 dropped
+        assert!(plan.iter().any(|(id, n)| *id == 0 && n == "editor"));
+        assert!(plan.iter().any(|(id, n)| *id == 1 && n == "term 2")); // synthesized
+        assert_eq!(focus, 0);
+        assert!(next_id >= 2);
+    }
+
+    #[test]
+    fn plan_repairs_invalid_focus() {
+        let saved = tab(Node::Leaf(0), vec![(0, "a")], 7, 1);
+        let (_, focus, _) = plan_from_saved(&saved);
+        assert_eq!(focus, 0);
     }
 }
