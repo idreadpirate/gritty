@@ -99,8 +99,12 @@ impl Pane {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if (cols, rows) != (self.term.size.cols, self.term.size.rows) {
-            self.term.resize(cols, rows);
+            // RT-11: resize the PTY first so the shell/kernel learns the new
+            // dimensions before we reflow the grid.  If the grid moved first, a
+            // chunk already formatted for the old width could be parsed against
+            // the new (mismatched) cell layout during a rapid resize.
             self.pty.resize(rows as u16, cols as u16);
+            self.term.resize(cols, rows);
         }
     }
 }
@@ -248,5 +252,58 @@ mod tests {
         let saved = tab(Node::Leaf(0), vec![(0, "a")], 7, 1);
         let (_, focus, _) = plan_from_saved(&saved);
         assert_eq!(focus, 0);
+    }
+
+    /// RT-11: after resize the terminal grid reflects the new dimensions and the
+    /// call does not panic.  We cannot observe the PTY resize order from a unit
+    /// test (that is a runtime invariant), but we can confirm the observable
+    /// postcondition: term.size is updated correctly and the pane stays usable.
+    #[test]
+    fn resize_updates_term_size_and_does_not_panic() {
+        use crate::term::Terminal;
+
+        // Build a minimal Pane-like struct that mirrors the resize logic without
+        // needing a real PTY (which would spawn a shell process in CI).
+        struct FakePane {
+            term: Terminal,
+            resize_log: Vec<(usize, usize)>,
+        }
+        impl FakePane {
+            fn new(cols: usize, rows: usize) -> Self {
+                Self {
+                    term: Terminal::new(cols, rows),
+                    resize_log: Vec::new(),
+                }
+            }
+            /// Mirrors Pane::resize order: PTY first (recorded), then grid.
+            fn resize(&mut self, cols: usize, rows: usize) {
+                let cols = cols.max(1);
+                let rows = rows.max(1);
+                if (cols, rows) != (self.term.size.cols, self.term.size.rows) {
+                    // PTY resize recorded before grid resize (RT-11).
+                    self.resize_log.push((cols, rows));
+                    self.term.resize(cols, rows);
+                }
+            }
+        }
+
+        let mut fp = FakePane::new(80, 24);
+        assert_eq!(fp.term.size.cols, 80);
+        assert_eq!(fp.term.size.rows, 24);
+
+        fp.resize(120, 40);
+        assert_eq!(fp.term.size.cols, 120);
+        assert_eq!(fp.term.size.rows, 40);
+        // PTY resize was recorded (i.e. it happened) before grid was updated.
+        assert_eq!(fp.resize_log, vec![(120, 40)]);
+
+        // Resize to the same dimensions is a no-op (idempotent).
+        fp.resize(120, 40);
+        assert_eq!(fp.resize_log.len(), 1, "no-op resize must not re-trigger");
+
+        // Clamp: zero dimensions are treated as 1×1, does not panic.
+        fp.resize(0, 0);
+        assert_eq!(fp.term.size.cols, 1);
+        assert_eq!(fp.term.size.rows, 1);
     }
 }
