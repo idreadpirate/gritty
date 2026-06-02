@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -164,13 +165,7 @@ impl Gritty {
     }
 
     fn content_rect(&self, w: usize, h: usize) -> Rect {
-        let bar = self.bar_h();
-        Rect {
-            x: 0,
-            y: bar,
-            w,
-            h: h.saturating_sub(bar),
-        }
+        layout::content_rect(w, h, self.bar_h())
     }
 
     /// Full rectangle (title bar + grid) for each pane in the active tab.
@@ -185,13 +180,7 @@ impl Gritty {
 
     /// Grid area of a pane = its rect minus the title bar.
     fn grid_rect(&self, rect: Rect) -> Rect {
-        let t = self.title_h();
-        Rect {
-            x: rect.x,
-            y: rect.y + t,
-            w: rect.w,
-            h: rect.h.saturating_sub(t),
-        }
+        layout::grid_rect(rect, self.title_h())
     }
 
     /// Resize every pane in the active tab to fit the current layout.
@@ -691,16 +680,11 @@ impl Gritty {
 
     /// Tab index under an x pixel on the tab bar, mirroring the render layout.
     fn tab_at(&self, x: usize) -> Option<usize> {
-        let cw = self.font.cell_w;
-        let mut tx = 0usize;
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let tw = (tab.name.chars().count() + 2) * cw;
-            if x >= tx && x < tx + tw {
-                return Some(i);
-            }
-            tx += tw + cw / 2;
-        }
-        None
+        layout::tab_at(
+            self.tabs.iter().map(|t| t.name.chars().count()),
+            self.font.cell_w,
+            x,
+        )
     }
 
     /// Pane id under a pixel, plus its grid rect (for selection coordinates).
@@ -715,18 +699,10 @@ impl Gritty {
     }
 
     fn point_in_grid(&self, grid: Rect, x: f64, y: f64, cols: usize, off: usize) -> (Point, Side) {
-        let cw = self.font.cell_w as f64;
-        let ch = self.font.cell_h as f64;
-        let rel_x = (x - grid.x as f64).max(0.0);
-        let rel_y = (y - grid.y as f64).max(0.0);
-        let col = ((rel_x / cw).floor() as usize).min(cols.saturating_sub(1));
-        let row = (rel_y / ch).floor() as i32;
-        let side = if (rel_x % cw) < cw / 2.0 {
-            Side::Left
-        } else {
-            Side::Right
-        };
-        (Point::new(Line(row - off as i32), Column(col)), side)
+        let (col, row, right) =
+            layout::grid_cell(grid, x, y, cols, off, self.font.cell_w, self.font.cell_h);
+        let side = if right { Side::Right } else { Side::Left };
+        (Point::new(Line(row), Column(col)), side)
     }
 
     // --- rendering ---------------------------------------------------------
@@ -1036,14 +1012,23 @@ fn draw_pane_grid(
         if line < 0 {
             continue;
         }
+        let cell = item.cell;
+        // The spacer after a wide glyph is painted by the wide cell itself (CA-5).
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         let row = line as usize;
         let col = item.point.column.0;
-        let cell = item.cell;
 
-        let mut fg = color::to_rgb(cell.fg, FG);
-        let mut bg = color::to_rgb(cell.bg, BG);
+        let base_fg = color::to_rgb(cell.fg, FG);
+        let base_bg = color::to_rgb(cell.bg, BG);
         let is_default_bg = matches!(cell.bg, Color::Named(NamedColor::Background));
-        let mut fill_bg = !is_default_bg;
+
+        // SGR flags (inverse/bold/dim/hidden/underline) — CA-4.
+        let (mut fg, mut bg, underline) = color::style_flags(base_fg, base_bg, cell.flags);
+        let inverted = cell.flags.contains(Flags::INVERSE);
+        let mut fill_bg = !is_default_bg || inverted;
+
         if selection.is_some_and(|r| r.contains(item.point)) {
             bg = SELECTION_BG;
             fill_bg = true;
@@ -1065,6 +1050,21 @@ fn draw_pane_grid(
             fill_bg,
             grid,
         );
+
+        if underline {
+            let uy = py + ch.saturating_sub(2);
+            render::fill_rect(
+                buffer,
+                stride,
+                Rect {
+                    x: px,
+                    y: uy,
+                    w: cw,
+                    h: 1,
+                },
+                fg,
+            );
+        }
     }
 }
 

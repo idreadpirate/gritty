@@ -86,4 +86,46 @@ mod tests {
         let p = Palette::new();
         assert_eq!(p.matches().len(), COMMANDS.len());
     }
+
+    #[test]
+    fn selected_returns_command_at_index() {
+        let mut p = Palette::new();
+        // empty query: selection 0 is the first command in declaration order.
+        assert_eq!(p.selected(), Some(Cmd::SplitRight));
+        p.sel = 2;
+        assert_eq!(p.selected(), p.matches().get(2).map(|(_, c)| *c));
+    }
+
+    #[test]
+    fn selected_is_none_when_no_matches() {
+        let mut p = Palette::new();
+        p.query = "zzzzz-no-such-command".into();
+        assert!(p.matches().is_empty());
+        assert_eq!(p.selected(), None);
+    }
+
+    #[test]
+    fn clamp_selection_pins_to_last_match() {
+        let mut p = Palette::new();
+        p.sel = 999;
+        p.clamp_selection();
+        assert_eq!(p.sel, COMMANDS.len() - 1);
+    }
+
+    #[test]
+    fn clamp_selection_resets_when_no_matches() {
+        let mut p = Palette::new();
+        p.query = "zzzzz".into();
+        p.sel = 5;
+        p.clamp_selection();
+        assert_eq!(p.sel, 0);
+    }
+
+    #[test]
+    fn clamp_selection_leaves_valid_index_untouched() {
+        let mut p = Palette::new();
+        p.sel = 1;
+        p.clamp_selection();
+        assert_eq!(p.sel, 1);
+    }
 }

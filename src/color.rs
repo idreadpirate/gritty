@@ -1,5 +1,6 @@
 // Map alacritty/vte colors to 0x00RRGGBB framebuffer pixels.
 
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 // gritty "gunmetal & amber" theme — pulled from the industrial skull icon.
@@ -84,5 +85,163 @@ fn indexed(i: u8) -> u32 {
             let v = 8 + (i - 232) * 10;
             rgb(v, v, v)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_packs_channels() {
+        assert_eq!(rgb(0x12, 0x34, 0x56), 0x0012_3456);
+    }
+
+    #[test]
+    fn spec_color_is_passed_through() {
+        let c = Color::Spec(Rgb {
+            r: 0xab,
+            g: 0xcd,
+            b: 0xef,
+        });
+        assert_eq!(to_rgb(c, FG), 0x00ab_cdef);
+    }
+
+    #[test]
+    fn indexed_low_16_use_ansi_table() {
+        for (i, &expected) in ANSI16.iter().enumerate() {
+            assert_eq!(to_rgb(Color::Indexed(i as u8), FG), expected);
+        }
+    }
+
+    #[test]
+    fn indexed_color_cube_endpoints() {
+        // index 16 is the cube origin: all channels zero (the v==0 branch).
+        assert_eq!(to_rgb(Color::Indexed(16), FG), 0x0000_0000);
+        // index 231 is the cube max: all channels 55 + 5*40 = 255.
+        assert_eq!(to_rgb(Color::Indexed(231), FG), 0x00ff_ffff);
+        // a mid cube value exercises the non-zero conversion on each channel.
+        assert_eq!(to_rgb(Color::Indexed(16 + 43), FG), {
+            let v = 55 + 40; // step 1 on r and b
+            rgb(v, 0, v)
+        });
+    }
+
+    #[test]
+    fn indexed_grayscale_ramp() {
+        assert_eq!(to_rgb(Color::Indexed(232), FG), rgb(8, 8, 8));
+        assert_eq!(to_rgb(Color::Indexed(255), FG), {
+            let v = 8 + 23 * 10;
+            rgb(v, v, v)
+        });
+    }
+
+    #[test]
+    fn named_standard_and_bright() {
+        assert_eq!(to_rgb(Color::Named(NamedColor::Black), FG), ANSI16[0]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Red), FG), ANSI16[1]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Green), FG), ANSI16[2]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Yellow), FG), ANSI16[3]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Blue), FG), ANSI16[4]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Magenta), FG), ANSI16[5]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Cyan), FG), ANSI16[6]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::White), FG), ANSI16[7]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlack), FG), ANSI16[8]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightRed), FG), ANSI16[9]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightGreen), FG), ANSI16[10]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightYellow), FG), ANSI16[11]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlue), FG), ANSI16[12]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightMagenta), FG), ANSI16[13]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightCyan), FG), ANSI16[14]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightWhite), FG), ANSI16[15]);
+    }
+
+    #[test]
+    fn named_dim_variants() {
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimBlack), FG), ANSI16[0]);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimRed), FG), 0x80_0000);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimGreen), FG), 0x00_8000);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimYellow), FG), 0x80_8000);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimBlue), FG), 0x00_0080);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimMagenta), FG), 0x80_0080);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimCyan), FG), 0x00_8080);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimWhite), FG), 0x80_8080);
+        assert_eq!(to_rgb(Color::Named(NamedColor::DimForeground), FG), 0x80_8080);
+    }
+
+    #[test]
+    fn named_theme_colors() {
+        assert_eq!(to_rgb(Color::Named(NamedColor::Foreground), 0), FG);
+        assert_eq!(to_rgb(Color::Named(NamedColor::BrightForeground), 0), FG);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Background), 0), BG);
+        assert_eq!(to_rgb(Color::Named(NamedColor::Cursor), 0), CURSOR);
+    }
+}
+
+fn chan(c: u32, sh: u32) -> u32 {
+    (c >> sh) & 0xff
+}
+
+/// Brighten toward white (for BOLD).
+fn brighten(c: u32) -> u32 {
+    let f = |sh| (chan(c, sh) * 5 / 4).min(255);
+    (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// Average two colors (for DIM — pull fg toward bg).
+fn mix(a: u32, b: u32) -> u32 {
+    let f = |sh| (chan(a, sh) + chan(b, sh)) / 2;
+    (f(16) << 16) | (f(8) << 8) | f(0)
+}
+
+/// Apply SGR cell flags to a (fg, bg) pair (CA-4). Returns the adjusted colors
+/// plus whether an underline should be drawn.
+pub fn style_flags(mut fg: u32, mut bg: u32, flags: Flags) -> (u32, u32, bool) {
+    if flags.contains(Flags::DIM) {
+        fg = mix(fg, bg);
+    }
+    if flags.contains(Flags::BOLD) {
+        fg = brighten(fg);
+    }
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    let underline = flags.intersects(Flags::UNDERLINE | Flags::DOUBLE_UNDERLINE | Flags::UNDERCURL);
+    (fg, bg, underline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inverse_swaps_fg_bg() {
+        let (fg, bg, _) = style_flags(0x111111, 0x222222, Flags::INVERSE);
+        assert_eq!((fg, bg), (0x222222, 0x111111));
+    }
+
+    #[test]
+    fn bold_brightens_dim_darkens() {
+        let (bold, _, _) = style_flags(0x808080, 0x000000, Flags::BOLD);
+        assert!(chan(bold, 0) > 0x80);
+        let (dim, _, _) = style_flags(0xffffff, 0x000000, Flags::DIM);
+        assert!(chan(dim, 0) < 0xff);
+    }
+
+    #[test]
+    fn hidden_makes_fg_match_bg() {
+        let (fg, bg, _) = style_flags(0xffffff, 0x123456, Flags::HIDDEN);
+        assert_eq!(fg, bg);
+    }
+
+    #[test]
+    fn underline_flag_reported() {
+        let (_, _, ul) = style_flags(0xfff, 0x000, Flags::UNDERLINE);
+        assert!(ul);
+        let (_, _, none) = style_flags(0xfff, 0x000, Flags::empty());
+        assert!(!none);
     }
 }

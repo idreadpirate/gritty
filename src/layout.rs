@@ -68,6 +68,65 @@ pub fn child_areas(axis: Axis, ratio: f32, area: Rect) -> (Rect, Rect) {
     }
 }
 
+/// Content area below the tab bar (height `bar`), spanning the full window.
+pub fn content_rect(w: usize, h: usize, bar: usize) -> Rect {
+    Rect {
+        x: 0,
+        y: bar,
+        w,
+        h: h.saturating_sub(bar),
+    }
+}
+
+/// A pane's grid area = its full rect minus a title bar of height `title`.
+pub fn grid_rect(rect: Rect, title: usize) -> Rect {
+    Rect {
+        x: rect.x,
+        y: rect.y + title,
+        w: rect.w,
+        h: rect.h.saturating_sub(title),
+    }
+}
+
+/// Index of the tab whose label sits under pixel `x` on the tab bar.
+/// `name_lens` yields each tab name's character count; a label is `(len + 2)`
+/// cells wide (one pad cell each side) followed by a half-cell gap. Mirrors the
+/// render layout so clicks land on the tab they appear over.
+pub fn tab_at(name_lens: impl IntoIterator<Item = usize>, cw: usize, x: usize) -> Option<usize> {
+    let mut tx = 0usize;
+    for (i, len) in name_lens.into_iter().enumerate() {
+        let tw = (len + 2) * cw;
+        if x >= tx && x < tx + tw {
+            return Some(i);
+        }
+        tx += tw + cw / 2;
+    }
+    None
+}
+
+/// Map a pixel inside a pane's `grid` to `(column, row, right_half)`. `off` is
+/// the scrollback display offset, so `row` can be negative when scrolled up.
+/// `right_half` is true when the pixel falls on the right side of the cell
+/// (selection caret placement).
+pub fn grid_cell(
+    grid: Rect,
+    x: f64,
+    y: f64,
+    cols: usize,
+    off: usize,
+    cw: usize,
+    ch: usize,
+) -> (usize, i32, bool) {
+    let cwf = cw as f64;
+    let chf = ch as f64;
+    let rel_x = (x - grid.x as f64).max(0.0);
+    let rel_y = (y - grid.y as f64).max(0.0);
+    let col = ((rel_x / cwf).floor() as usize).min(cols.saturating_sub(1));
+    let row = (rel_y / chf).floor() as i32 - off as i32;
+    let right_half = (rel_x % cwf) >= cwf / 2.0;
+    (col, row, right_half)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     Leaf(usize),
@@ -416,5 +475,172 @@ mod tests {
         let r = rects(&n);
         assert_eq!(r[0].1.w, 25);
         assert_eq!(r[1].1.w, 75);
+    }
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = Rect {
+            x: 10,
+            y: 10,
+            w: 20,
+            h: 20,
+        };
+        assert!(r.contains(10, 10)); // top-left inclusive
+        assert!(r.contains(29, 29)); // last interior pixel
+        assert!(!r.contains(30, 20)); // right edge exclusive
+        assert!(!r.contains(20, 30)); // bottom edge exclusive
+        assert!(!r.contains(9, 20)); // left of rect
+    }
+
+    #[test]
+    fn rect_center_is_midpoint() {
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 60,
+        };
+        assert_eq!(r.center(), (50, 30));
+    }
+
+    #[test]
+    fn divider_found_on_horizontal_split() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::TopBottom); // boundary at y=30
+        assert_eq!(n.divider_at(AREA, 50, 31, 4), Some(vec![]));
+        assert!(n.divider_at(AREA, 50, 10, 4).is_none());
+    }
+
+    #[test]
+    fn divider_descends_into_nested_split() {
+        // left pane is itself split top/bottom; the inner divider has path [0].
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight); // x boundary at 50
+        n.split_leaf(0, 2, Axis::TopBottom); // inside left half: y boundary at 30
+        let path = n.divider_at(AREA, 25, 31, 4).expect("hit inner divider");
+        assert_eq!(path, vec![0]);
+        // and the right subtree path begins with 1
+        let mut m = Node::Leaf(0);
+        m.split_leaf(0, 1, Axis::LeftRight);
+        m.split_leaf(1, 2, Axis::TopBottom); // inside right half
+        let p2 = m
+            .divider_at(AREA, 75, 31, 4)
+            .expect("hit right inner divider");
+        assert_eq!(p2, vec![1]);
+    }
+
+    #[test]
+    fn split_area_resolves_axis_and_rect() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        let (axis, area) = n.split_area(&[], AREA).expect("root split");
+        assert_eq!(axis, Axis::LeftRight);
+        assert_eq!(area, AREA);
+        // a leaf has no split area
+        assert!(Node::Leaf(0).split_area(&[], AREA).is_none());
+    }
+
+    #[test]
+    fn split_area_follows_path_into_children() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        n.split_leaf(1, 2, Axis::TopBottom); // right child becomes a split
+        let (axis, area) = n.split_area(&[1], AREA).expect("right child split");
+        assert_eq!(axis, Axis::TopBottom);
+        assert_eq!(area.x, 50); // right half starts at x=50
+    }
+
+    #[test]
+    fn set_ratio_on_nested_path() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        n.split_leaf(0, 2, Axis::TopBottom); // left child is now a top/bottom split
+        n.set_ratio(&[0], 0.25); // adjust the inner (left) split
+        let r = rects(&n);
+        // left column is 50 wide; its top pane should be 0.25 * 60 = 15 tall
+        let top_left = r.iter().find(|(id, _)| *id == 0).unwrap().1;
+        assert_eq!(top_left.h, 15);
+    }
+
+    #[test]
+    fn set_ratio_clamps_to_bounds() {
+        let mut n = Node::Leaf(0);
+        n.split_leaf(0, 1, Axis::LeftRight);
+        n.set_ratio(&[], 5.0); // absurd value clamps to 0.95
+        let r = rects(&n);
+        assert_eq!(r[0].1.w, 95);
+    }
+
+    #[test]
+    fn content_rect_subtracts_bar() {
+        assert_eq!(
+            content_rect(800, 600, 20),
+            Rect {
+                x: 0,
+                y: 20,
+                w: 800,
+                h: 580
+            }
+        );
+        // bar taller than window saturates to zero height, not underflow
+        assert_eq!(content_rect(800, 10, 20).h, 0);
+    }
+
+    #[test]
+    fn grid_rect_subtracts_title() {
+        let pane = Rect {
+            x: 5,
+            y: 10,
+            w: 100,
+            h: 50,
+        };
+        assert_eq!(
+            grid_rect(pane, 12),
+            Rect {
+                x: 5,
+                y: 22,
+                w: 100,
+                h: 38
+            }
+        );
+        assert_eq!(grid_rect(pane, 0), pane); // seamless: no title bar
+    }
+
+    #[test]
+    fn tab_at_maps_pixels_to_tabs() {
+        let cw = 10;
+        // "ab"(2) -> width (2+2)*10 = 40, gap 5; "cde"(3) -> width 50.
+        let lens = [2usize, 3];
+        assert_eq!(tab_at(lens, cw, 0), Some(0));
+        assert_eq!(tab_at(lens, cw, 39), Some(0));
+        assert_eq!(tab_at(lens, cw, 42), None); // in the gap between tabs
+        assert_eq!(tab_at(lens, cw, 45), Some(1)); // first tab 40 + gap 5
+        assert_eq!(tab_at(lens, cw, 94), Some(1)); // 45 + 50 - 1
+        assert_eq!(tab_at(lens, cw, 1000), None); // past the last tab
+    }
+
+    #[test]
+    fn grid_cell_maps_pixel_to_column_row_side() {
+        let grid = Rect {
+            x: 100,
+            y: 50,
+            w: 200,
+            h: 100,
+        };
+        // pixel 5px into first cell of a 10x20 grid: col 0, row 0, left half
+        let (col, row, right) = grid_cell(grid, 104.0, 52.0, 80, 0, 10, 20);
+        assert_eq!((col, row, right), (0, 0, false));
+        // 6px into the cell is the right half
+        let (_, _, right2) = grid_cell(grid, 106.0, 52.0, 80, 0, 10, 20);
+        assert!(right2);
+        // scrollback offset shifts the row up (can go negative)
+        let (_, row3, _) = grid_cell(grid, 104.0, 52.0, 80, 5, 10, 20);
+        assert_eq!(row3, -5);
+        // a pixel above/left of the grid clamps to col 0, not underflow
+        let (col4, _, _) = grid_cell(grid, 0.0, 0.0, 80, 0, 10, 20);
+        assert_eq!(col4, 0);
+        // column clamps to the last column
+        let (col5, _, _) = grid_cell(grid, 100_000.0, 52.0, 80, 0, 10, 20);
+        assert_eq!(col5, 79);
     }
 }

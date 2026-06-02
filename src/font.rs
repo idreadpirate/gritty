@@ -40,12 +40,22 @@ impl FontAtlas {
     /// Rasterized coverage bitmap for `ch`, cached.
     pub fn glyph(&mut self, ch: char) -> &(Metrics, Vec<u8>) {
         if !self.cache.contains_key(&ch) {
+            // Bound the cache so hostile/long output emitting many distinct
+            // codepoints can't grow it without limit (RT-12). ASCII fits easily;
+            // when the dynamic tail overflows, drop it wholesale (cheap, rare).
+            if self.cache.len() >= GLYPH_CACHE_CAP {
+                self.cache.clear();
+            }
             let g = self.font.rasterize(ch, self.px);
             self.cache.insert(ch, g);
         }
         self.cache.get(&ch).expect("just inserted")
     }
 }
+
+/// Max distinct glyphs kept rasterized. ~4k covers ASCII + a working set of
+/// CJK/symbols; beyond it we reset rather than grow toward all of Unicode.
+const GLYPH_CACHE_CAP: usize = 4096;
 
 fn load_font_bytes() -> Vec<u8> {
     const CANDIDATES: &[&str] = &[
@@ -61,4 +71,26 @@ fn load_font_bytes() -> Vec<u8> {
         }
     }
     panic!("no monospace font found under C:\\Windows\\Fonts");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_cache_is_bounded() {
+        let mut atlas = FontAtlas::new(18.0);
+        // Rasterize far more distinct codepoints than the cap.
+        for cp in 0x4E00u32..0x4E00 + (GLYPH_CACHE_CAP as u32 + 2000) {
+            if let Some(c) = char::from_u32(cp) {
+                let _ = atlas.glyph(c);
+            }
+        }
+        assert!(
+            atlas.cache.len() <= GLYPH_CACHE_CAP,
+            "cache {} exceeded cap {}",
+            atlas.cache.len(),
+            GLYPH_CACHE_CAP
+        );
+    }
 }

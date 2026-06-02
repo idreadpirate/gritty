@@ -40,11 +40,14 @@ impl SavedSession {
     }
 }
 
-/// `%APPDATA%\gritty\session.json` (falls back to the working dir).
+/// `%LOCALAPPDATA%\gritty\session.json` (then `%APPDATA%`, then the temp dir).
+/// Never the current working directory — that would auto-load a planted session
+/// when launched from an attacker-controlled folder (RT-13).
 pub fn session_path() -> PathBuf {
-    let mut dir = std::env::var_os("APPDATA")
+    let mut dir = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(std::env::temp_dir);
     dir.push("gritty");
     dir.push("session.json");
     dir

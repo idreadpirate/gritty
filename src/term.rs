@@ -188,4 +188,35 @@ mod tests {
         }
         assert!(line0.starts_with("hello"), "grid line 0 was: {:?}", line0);
     }
+
+    #[test]
+    fn resize_updates_dimensions() {
+        let mut t = Terminal::new(80, 24);
+        t.resize(120, 40);
+        assert_eq!(t.size.cols, 120);
+        assert_eq!(t.size.rows, 40);
+        // the underlying grid reports the new geometry too
+        assert_eq!(t.term.grid().columns(), 120);
+        assert_eq!(t.term.grid().screen_lines(), 40);
+    }
+
+    #[test]
+    fn bracketed_paste_reflects_terminal_mode() {
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.bracketed_paste(), "off by default");
+        // DECSET 2004 enables bracketed paste mode.
+        t.feed(b"\x1b[?2004h");
+        assert!(t.bracketed_paste(), "should be on after enabling");
+        // DECRST 2004 disables it again.
+        t.feed(b"\x1b[?2004l");
+        assert!(!t.bracketed_paste(), "should be off after disabling");
+    }
+
+    #[test]
+    fn term_size_reports_dimensions() {
+        let s = TermSize { cols: 7, rows: 3 };
+        assert_eq!(s.columns(), 7);
+        assert_eq!(s.screen_lines(), 3);
+        assert_eq!(s.total_lines(), 3);
+    }
 }

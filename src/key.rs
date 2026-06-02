@@ -211,4 +211,122 @@ mod tests {
             Some(b"\x1b[Z".to_vec())
         );
     }
+
+    #[test]
+    fn plain_tab_and_other_control_named_keys() {
+        let none = ModifiersState::empty();
+        assert_eq!(encode(&Key::Named(NamedKey::Tab), none), Some(b"\t".to_vec()));
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), none),
+            Some(vec![0x7f])
+        );
+        assert_eq!(encode(&Key::Named(NamedKey::Escape), none), Some(vec![0x1b]));
+        assert_eq!(encode(&Key::Named(NamedKey::Space), none), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn all_unmodified_arrows_and_motion_keys() {
+        let none = ModifiersState::empty();
+        let cases = [
+            (NamedKey::ArrowUp, &b"\x1b[A"[..]),
+            (NamedKey::ArrowDown, b"\x1b[B"),
+            (NamedKey::ArrowLeft, b"\x1b[D"),
+            (NamedKey::Home, b"\x1b[H"),
+            (NamedKey::End, b"\x1b[F"),
+            (NamedKey::PageUp, b"\x1b[5~"),
+            (NamedKey::PageDown, b"\x1b[6~"),
+            (NamedKey::Delete, b"\x1b[3~"),
+            (NamedKey::Insert, b"\x1b[2~"),
+        ];
+        for (k, expect) in cases {
+            assert_eq!(encode(&Key::Named(k), none), Some(expect.to_vec()), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn function_keys_f1_through_f12() {
+        let none = ModifiersState::empty();
+        let cases = [
+            (NamedKey::F1, &b"\x1bOP"[..]),
+            (NamedKey::F2, b"\x1bOQ"),
+            (NamedKey::F3, b"\x1bOR"),
+            (NamedKey::F4, b"\x1bOS"),
+            (NamedKey::F5, b"\x1b[15~"),
+            (NamedKey::F6, b"\x1b[17~"),
+            (NamedKey::F7, b"\x1b[18~"),
+            (NamedKey::F8, b"\x1b[19~"),
+            (NamedKey::F9, b"\x1b[20~"),
+            (NamedKey::F10, b"\x1b[21~"),
+            (NamedKey::F11, b"\x1b[23~"),
+            (NamedKey::F12, b"\x1b[24~"),
+        ];
+        for (k, expect) in cases {
+            assert_eq!(encode(&Key::Named(k), none), Some(expect.to_vec()), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn modified_editing_key_gets_modifier_param() {
+        // Shift+PageUp -> CSI 5 ; 2 ~  (shift => modifier code 2)
+        assert_eq!(
+            encode(&Key::Named(NamedKey::PageUp), mods(true, false, false)),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+        // Ctrl+F1 -> CSI 1 ; 5 P (modified F1 leaves SS3 for CSI)
+        assert_eq!(
+            encode(&Key::Named(NamedKey::F1), ModifiersState::CONTROL),
+            Some(b"\x1b[1;5P".to_vec())
+        );
+    }
+
+    #[test]
+    fn unhandled_named_key_is_none() {
+        assert_eq!(
+            encode(&Key::Named(NamedKey::F13), ModifiersState::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_letter_is_esc_then_control_byte() {
+        // Alt+Ctrl+c => ESC, then ETX
+        let key = Key::Character("c".into());
+        assert_eq!(encode(&key, mods(false, true, true)), Some(vec![0x1b, 0x03]));
+    }
+
+    #[test]
+    fn ctrl_punctuation_control_bytes() {
+        let ctrl = ModifiersState::CONTROL;
+        let cases = [
+            (" ", 0x00u8),
+            ("@", 0x00),
+            ("\\", 0x1c),
+            ("]", 0x1d),
+            ("^", 0x1e),
+            ("_", 0x1f),
+            ("?", 0x7f),
+        ];
+        for (s, b) in cases {
+            assert_eq!(encode(&Key::Character(s.into()), ctrl), Some(vec![b]), "{s:?}");
+        }
+        // uppercase letters map like their lowercase counterpart
+        assert_eq!(encode(&Key::Character("A".into()), ctrl), Some(vec![0x01]));
+    }
+
+    #[test]
+    fn ctrl_other_ascii_passes_through() {
+        // '1' is ASCII but not a control mapping -> the byte itself.
+        assert_eq!(
+            encode(&Key::Character("1".into()), ModifiersState::CONTROL),
+            Some(vec![b'1'])
+        );
+    }
+
+    #[test]
+    fn ctrl_non_ascii_char_is_none() {
+        assert_eq!(
+            encode(&Key::Character("é".into()), ModifiersState::CONTROL),
+            None
+        );
+    }
 }

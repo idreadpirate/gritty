@@ -296,6 +296,130 @@ mod tests {
     }
 
     #[test]
+    fn fill_rect_paints_clamped_region() {
+        let stride = 4;
+        let height = 3;
+        let mut buf = vec![0u32; stride * height];
+        // request a rect that overflows the buffer; it must clamp, not panic.
+        fill_rect(
+            &mut buf,
+            stride,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 10,
+                h: 10,
+            },
+            0x00ab_cdef,
+        );
+        // row 0 untouched
+        assert!(buf[0..4].iter().all(|&p| p == 0));
+        // (1,1)..(3,2) painted
+        assert_eq!(buf[1 * stride + 1], 0x00ab_cdef);
+        assert_eq!(buf[2 * stride + 3], 0x00ab_cdef);
+        // (0,1) left of rect stays clear
+        assert_eq!(buf[1 * stride], 0);
+    }
+
+    #[test]
+    fn fill_rect_with_zero_stride_is_noop() {
+        // buf_height returns 0 for a zero stride; nothing is written, no panic.
+        let mut buf = vec![0u32; 4];
+        fill_rect(
+            &mut buf,
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            0xfff,
+        );
+        assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn stroke_rect_draws_border_only() {
+        let stride = 5;
+        let height = 5;
+        let mut buf = vec![0u32; stride * height];
+        let c = 0x0000_ff00;
+        stroke_rect(
+            &mut buf,
+            stride,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 5,
+            },
+            c,
+        );
+        // corners and edges are set
+        assert_eq!(buf[0], c); // top-left
+        assert_eq!(buf[4], c); // top-right
+        assert_eq!(buf[4 * stride], c); // bottom-left
+        assert_eq!(buf[4 * stride + 4], c); // bottom-right
+        // interior pixel untouched
+        assert_eq!(buf[2 * stride + 2], 0);
+    }
+
+    #[test]
+    fn stroke_rect_zero_dimension_is_noop() {
+        let mut buf = vec![0u32; 16];
+        stroke_rect(
+            &mut buf,
+            4,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 4,
+            },
+            0xfff,
+        );
+        assert!(buf.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn draw_text_advances_one_cell_per_char() {
+        let mut font = FontAtlas::new(18.0);
+        let cw = font.cell_w;
+        let stride = cw * 4;
+        let height = font.cell_h;
+        let mut buf = vec![0u32; stride * height];
+        draw_text(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            "AB",
+            0x00ff_ffff,
+            0x0000_0000,
+            true,
+            full(stride, height),
+        );
+        // each of the two cells drew at least one foreground pixel within its column band
+        let marked_in = |c0: usize, c1: usize| -> usize {
+            let mut n = 0;
+            for y in 0..height {
+                for x in c0..c1 {
+                    if buf[y * stride + x] != 0 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert!(marked_in(0, cw) > 0, "first glyph cell empty");
+        assert!(marked_in(cw, cw * 2) > 0, "second glyph cell empty");
+        // the third cell was never written to
+        assert_eq!(marked_in(cw * 2, cw * 3), 0);
+    }
+
+    #[test]
     fn clip_blocks_out_of_bounds_fill() {
         let mut font = FontAtlas::new(18.0);
         let stride = font.cell_w * 2;
