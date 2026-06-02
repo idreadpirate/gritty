@@ -48,6 +48,8 @@ pub(crate) struct Gritty {
     pub(crate) rename: Option<String>,
     pub(crate) palette: Option<Palette>,
     pub(crate) broadcast: bool,
+    /// RT-8: pending signal-byte (ETX/EOT/SUB) awaiting second-press confirmation.
+    pub(crate) broadcast_pending_signal: Option<u8>,
     pub(crate) seamless: bool,
     pub(crate) last_proc_poll: Instant,
     pub(crate) last_render: Instant,
@@ -57,6 +59,8 @@ pub(crate) struct Gritty {
     pub(crate) last_click: Option<Instant>,
     /// Consecutive click count at the same location (CA-18).
     pub(crate) click_count: u32,
+    /// CA-21: whether the keybinding help overlay is visible.
+    pub(crate) show_help: bool,
 }
 
 impl Gritty {
@@ -78,6 +82,7 @@ impl Gritty {
             rename: None,
             palette: None,
             broadcast: false,
+            broadcast_pending_signal: None,
             seamless: false,
             last_proc_poll: Instant::now() - Duration::from_secs(5),
             last_render: Instant::now() - FRAME,
@@ -85,6 +90,7 @@ impl Gritty {
             proxy,
             last_click: None,
             click_count: 0,
+            show_help: false,
         }
     }
 
@@ -396,9 +402,20 @@ impl Gritty {
                 }
             })
             .collect();
+        // CA-32: persist window geometry so the next launch restores the same size.
+        let (win_w, win_h) = self
+            .window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                (Some(s.width), Some(s.height))
+            })
+            .unwrap_or((None, None));
         persist::SavedSession {
             active: self.active,
             tabs,
+            win_w,
+            win_h,
         }
     }
 
@@ -452,6 +469,18 @@ impl Gritty {
             self.tabs.iter().map(|t| t.name.chars().count()),
             self.font.cell_w,
             x,
+        )
+    }
+
+    /// CA-28: hit-test the tab strip for `×` and `+` buttons.
+    /// Returns `TabHit::Close(i)` when x falls on tab i's close button,
+    /// `TabHit::New` when x falls on the `+` button, and `None` otherwise.
+    pub(crate) fn tab_button_at(&self, x: usize, w: usize) -> Option<TabHit> {
+        tab_button_at(
+            self.tabs.iter().map(|t| t.name.chars().count()),
+            self.font.cell_w,
+            x,
+            w,
         )
     }
 
@@ -591,9 +620,18 @@ impl ApplicationHandler<Wake> for Gritty {
         if self.window.is_some() {
             return;
         }
+        // CA-32: restore window size from session if available, else use defaults.
+        let saved = persist::load();
+        let (init_w, init_h) = saved
+            .as_ref()
+            .and_then(|s| match (s.win_w, s.win_h) {
+                (Some(w), Some(h)) if w >= 200 && h >= 100 => Some((w as f64, h as f64)),
+                _ => None,
+            })
+            .unwrap_or((960.0, 600.0));
         let mut attrs = Window::default_attributes()
             .with_title("gritty")
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+            .with_inner_size(winit::dpi::PhysicalSize::new(init_w, init_h));
         if let Some(icon) = crate::load_icon() {
             attrs = attrs.with_window_icon(Some(icon));
         }
@@ -609,7 +647,7 @@ impl ApplicationHandler<Wake> for Gritty {
         self._context = Some(context);
 
         // Resume the previous workspace, or start fresh.
-        if persist::load().is_some_and(|s| !s.tabs.is_empty()) {
+        if saved.is_some_and(|s| !s.tabs.is_empty()) {
             self.restore_session();
         } else {
             self.new_tab();
@@ -672,7 +710,7 @@ impl ApplicationHandler<Wake> for Gritty {
             }
 
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Left) => self.begin_selection(),
+                (ElementState::Pressed, MouseButton::Left) => self.begin_selection(event_loop),
                 (ElementState::Released, MouseButton::Left) => {
                     if self.pane_wants_mouse() {
                         if let Some((col, row)) =
@@ -746,12 +784,41 @@ impl ApplicationHandler<Wake> for Gritty {
 }
 
 impl Gritty {
-    pub(crate) fn begin_selection(&mut self) {
+    pub(crate) fn begin_selection(&mut self, event_loop: &ActiveEventLoop) {
         let (x, y) = self.mouse_pos;
 
         // Click on the tab bar switches tabs instead of selecting.
         if (y as usize) < self.bar_h() {
+            let (w, _) = self.win_size();
+            // CA-28: check for × (close) and + (new) button hits first.
+            if let Some(hit) = self.tab_button_at(x as usize, w) {
+                match hit {
+                    TabHit::Close(i) => {
+                        if i < self.tabs.len() {
+                            // switch to that tab then close focus (reuses existing logic)
+                            self.active = i;
+                            self.close_focus(event_loop);
+                            // RT-8: disable broadcast when tab layout changes
+                            self.broadcast = false;
+                            self.broadcast_pending_signal = None;
+                        }
+                    }
+                    TabHit::New => {
+                        self.new_tab();
+                        // RT-8: disable broadcast on new tab (user should re-enable explicitly)
+                        self.broadcast = false;
+                        self.broadcast_pending_signal = None;
+                    }
+                }
+                self.request_redraw();
+                return;
+            }
             if let Some(i) = self.tab_at(x as usize) {
+                // RT-8: auto-disable broadcast on tab switch.
+                if i != self.active {
+                    self.broadcast = false;
+                    self.broadcast_pending_signal = None;
+                }
                 self.active = i;
                 self.drain_pty(); // RT-10: flush newly focused tab's PTY output.
                 self.relayout();
@@ -877,6 +944,75 @@ impl Gritty {
 
 // --- Pure helper functions (unit-testable) ----------------------------------
 
+/// CA-28: Result of a tab-strip button hit-test.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TabHit {
+    /// The `×` close button of tab `i` was clicked.
+    Close(usize),
+    /// The `+` new-tab button was clicked.
+    New,
+}
+
+/// CA-28: Hit-test the tab strip for close (`×`) and new-tab (`+`) buttons.
+///
+/// Layout per tab: ` ▸<name> × ` or ` <name> × ` — the `×` occupies one cell
+/// at the right end of each tab slot.  After all tabs a `+` occupies one cell.
+/// `name_lens`: character count of each tab name; `cw`: cell width in pixels;
+/// `x`: pixel being tested; `w`: total window width (for overflow guard).
+pub(crate) fn tab_button_at(
+    name_lens: impl IntoIterator<Item = usize>,
+    cw: usize,
+    x: usize,
+    w: usize,
+) -> Option<TabHit> {
+    // Tab slot width mirrors paint.rs:
+    //   label = " ▸<name> " or " <name> "  →  (name_chars + 2) cells + "×" (1 cell)
+    //   Then a half-cell gap after each tab slot.
+    // The ▸ marker adds 1 char for the active tab, but for hit-testing purposes
+    // we use the same formula as tab_at (which uses the raw name len + 2) plus
+    // 2 extra cells for " × " padding.  We need to keep this in sync with paint.rs.
+    // paint.rs label: format!(" ▸{} ", tab.name) → len = name.chars + 3 for active
+    //                 format!(" {} ",  tab.name) → len = name.chars + 2 for others
+    // We don't know which is active here, so we use the same slot width for both:
+    // slot_w = (name_chars + 2) * cw  (the text part)
+    //        + cw                     (the "×" cell)
+    // gap    = cw / 2
+    // But we must add 1 for active tab's ▸ marker.
+    // Since tab_at does NOT add the extra ▸, we keep the same base here for
+    // the name portion and append the ×.  The ▸ shifts pixels slightly but
+    // since we are only testing for the × at the END of the slot it's fine to
+    // treat all tabs as (name_chars + 2) wide for the base text.
+    let mut tx = 0usize;
+    for (i, len) in name_lens.into_iter().enumerate() {
+        // text_w mirrors paint.rs (same as tab_at base: (len+2)*cw)
+        let text_w = (len + 2) * cw;
+        // one extra cell for the '×' glyph at the right
+        let slot_w = text_w + cw;
+        let gap = cw / 2;
+        if tx + slot_w > w {
+            break; // overflow: don't draw (or hit-test) past window edge
+        }
+        // The × cell spans [tx + text_w .. tx + slot_w)
+        if x >= tx + text_w && x < tx + slot_w {
+            return Some(TabHit::Close(i));
+        }
+        tx += slot_w + gap;
+    }
+    // '+' button sits right after all tabs, one cell wide.
+    if tx + cw <= w && x >= tx && x < tx + cw {
+        return Some(TabHit::New);
+    }
+    None
+}
+
+/// RT-8: Returns true if `b` is a signal-bearing control byte that should
+/// require a second-press confirmation before being broadcast to all panes.
+/// Specifically: ETX (0x03 / Ctrl+C → SIGINT), EOT (0x04 / Ctrl+D → EOF/SIGHUP),
+/// SUB (0x1a / Ctrl+Z → SIGTSTP).
+pub(crate) fn is_broadcast_signal_byte(b: u8) -> bool {
+    matches!(b, 0x03 | 0x04 | 0x1a)
+}
+
 /// CA-7: Encode an SGR mouse sequence.
 ///
 /// `btn`:   button index (0=left, 1=middle, 2=right; +32=motion, +64=wheel).
@@ -975,5 +1111,76 @@ mod tests {
     #[test]
     fn click_just_over_threshold_resets() {
         assert_eq!(next_click_count(MULTI_CLICK_MS + 1, 1), 1);
+    }
+
+    // --- CA-28 tab button hit-test -------------------------------------------
+
+    #[test]
+    fn tab_button_close_hit() {
+        // One tab with name_len=2: text_w = 4*cw, slot_w = 5*cw.
+        // × spans [40..50) for cw=10.
+        let cw = 10usize;
+        let lens = [2usize];
+        let w = 1000;
+        assert_eq!(tab_button_at(lens, cw, 40, w), Some(TabHit::Close(0)));
+        assert_eq!(tab_button_at(lens, cw, 49, w), Some(TabHit::Close(0)));
+    }
+
+    #[test]
+    fn tab_button_miss_returns_none() {
+        let cw = 10usize;
+        let lens = [2usize];
+        let w = 1000;
+        // x=5 is inside the text area, not the × button.
+        assert_eq!(tab_button_at(lens, cw, 5, w), None);
+    }
+
+    #[test]
+    fn tab_button_new_tab_hit() {
+        // One tab: slot_w = 5*10 = 50, gap = 5. + sits at [55..65).
+        let cw = 10usize;
+        let lens = [2usize];
+        let w = 1000;
+        assert_eq!(tab_button_at(lens, cw, 55, w), Some(TabHit::New));
+        assert_eq!(tab_button_at(lens, cw, 64, w), Some(TabHit::New));
+    }
+
+    #[test]
+    fn tab_button_close_second_tab() {
+        // Two tabs, cw=10:
+        // tab0: slot_w=50 [0..50), × at [40..50), gap 5 → next at 55
+        // tab1 name_len=3: slot_w=60 [55..115), × at [105..115)
+        let cw = 10usize;
+        let lens = [2usize, 3usize];
+        let w = 1000;
+        assert_eq!(tab_button_at(lens, cw, 105, w), Some(TabHit::Close(1)));
+        assert_eq!(tab_button_at(lens, cw, 114, w), Some(TabHit::Close(1)));
+    }
+
+    #[test]
+    fn tab_button_overflow_stops_at_window_edge() {
+        // Window is too narrow to show any tab: nothing should match.
+        let cw = 10usize;
+        let lens = [2usize];
+        let w = 5; // narrower than one tab slot
+        assert_eq!(tab_button_at(lens, cw, 0, w), None);
+        assert_eq!(tab_button_at(lens, cw, 4, w), None);
+    }
+
+    // --- RT-8 control-byte predicate -----------------------------------------
+
+    #[test]
+    fn is_signal_byte_identifies_etx_eot_sub() {
+        assert!(is_broadcast_signal_byte(0x03)); // ETX / Ctrl+C
+        assert!(is_broadcast_signal_byte(0x04)); // EOT / Ctrl+D
+        assert!(is_broadcast_signal_byte(0x1a)); // SUB / Ctrl+Z
+    }
+
+    #[test]
+    fn is_signal_byte_rejects_normal_bytes() {
+        assert!(!is_broadcast_signal_byte(b'a'));
+        assert!(!is_broadcast_signal_byte(0x0d)); // CR (Enter)
+        assert!(!is_broadcast_signal_byte(0x09)); // Tab
+        assert!(!is_broadcast_signal_byte(0x1b)); // ESC
     }
 }

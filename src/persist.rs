@@ -28,6 +28,12 @@ pub struct SavedTab {
 pub struct SavedSession {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
+    /// CA-32: persisted window width in physical pixels (None = use default).
+    #[serde(default)]
+    pub win_w: Option<u32>,
+    /// CA-32: persisted window height in physical pixels (None = use default).
+    #[serde(default)]
+    pub win_h: Option<u32>,
 }
 
 impl SavedSession {
@@ -86,6 +92,8 @@ mod tests {
     fn sample() -> SavedSession {
         SavedSession {
             active: 1,
+            win_w: None,
+            win_h: None,
             tabs: vec![
                 SavedTab {
                     name: "tab 1".into(),
@@ -157,5 +165,27 @@ mod tests {
     fn path_ends_with_expected_file() {
         let p = session_path();
         assert!(p.ends_with("gritty/session.json") || p.ends_with("gritty\\session.json"));
+    }
+
+    // --- CA-32 window geometry persistence -----------------------------------
+
+    #[test]
+    fn win_geometry_roundtrip() {
+        let mut s = sample();
+        s.win_w = Some(1280);
+        s.win_h = Some(800);
+        let json = s.to_json();
+        let back = SavedSession::from_json(&json).expect("parse");
+        assert_eq!(back.win_w, Some(1280));
+        assert_eq!(back.win_h, Some(800));
+    }
+
+    #[test]
+    fn old_session_without_win_geometry_loads_as_none() {
+        // Simulate a session file that predates CA-32 (no win_w/win_h fields).
+        let old_json = r#"{"active":0,"tabs":[]}"#;
+        let s = SavedSession::from_json(old_json).expect("parse old session");
+        assert_eq!(s.win_w, None);
+        assert_eq!(s.win_h, None);
     }
 }

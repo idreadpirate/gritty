@@ -59,7 +59,12 @@ impl Gritty {
             } else {
                 format!(" {} ", tab.name)
             };
-            let tw = label.chars().count() * cw;
+            // CA-28: slot = label text + one cell for '×'.
+            let text_w = (tab.name.chars().count() + 2) * cw;
+            let slot_w = text_w + cw;
+            if tx + slot_w > stride {
+                break; // overflow: stop drawing tabs past the window edge
+            }
             let (fg, bg) = if i == active {
                 (BG, tab.color)
             } else {
@@ -68,10 +73,16 @@ impl Gritty {
             let r = Rect {
                 x: tx,
                 y: 0,
-                w: tw,
+                w: slot_w,
                 h: ch,
             };
             fill_rect(&mut buffer, stride, r, bg);
+            let label_rect = Rect {
+                x: tx,
+                y: 0,
+                w: text_w,
+                h: ch,
+            };
             draw_text(
                 &mut buffer,
                 stride,
@@ -82,9 +93,50 @@ impl Gritty {
                 fg,
                 bg,
                 true,
-                r,
+                label_rect,
             );
-            tx += tw + cw / 2;
+            // CA-28: draw the '×' close button cell.
+            let x_rect = Rect {
+                x: tx + text_w,
+                y: 0,
+                w: cw,
+                h: ch,
+            };
+            draw_text(
+                &mut buffer,
+                stride,
+                &mut self.font,
+                tx + text_w,
+                0,
+                "×",
+                UI_DIM,
+                bg,
+                true,
+                x_rect,
+            );
+            tx += slot_w + cw / 2;
+        }
+        // CA-28: draw the '+' new-tab button after all tabs.
+        if tx + cw <= stride {
+            let plus_rect = Rect {
+                x: tx,
+                y: 0,
+                w: cw,
+                h: ch,
+            };
+            fill_rect(&mut buffer, stride, plus_rect, UI_BAR_BG);
+            draw_text(
+                &mut buffer,
+                stride,
+                &mut self.font,
+                tx,
+                0,
+                "+",
+                UI_DIM,
+                UI_BAR_BG,
+                true,
+                plus_rect,
+            );
         }
 
         let accent = self.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
@@ -289,6 +341,135 @@ impl Gritty {
                     bg,
                     false,
                     irow,
+                );
+            }
+        }
+
+        // RT-8: broadcast pending-signal confirmation prompt.
+        if self.broadcast && self.broadcast_pending_signal.is_some() {
+            let label = " [BROADCAST] press again to send signal to all panes ";
+            let r = Rect {
+                x: 0,
+                y: height.saturating_sub(ch * 2),
+                w: stride,
+                h: ch,
+            };
+            fill_rect(&mut buffer, stride, r, accent);
+            draw_text(
+                &mut buffer,
+                stride,
+                &mut self.font,
+                0,
+                r.y,
+                label,
+                BG,
+                accent,
+                true,
+                r,
+            );
+        }
+
+        // CA-21: keybinding help overlay.
+        if self.show_help {
+            let entries: &[(&str, &str)] = &[
+                ("F1 / Ctrl+Shift+/", "Toggle this help overlay"),
+                ("Ctrl+Shift+T", "New tab"),
+                ("Ctrl+Shift+W", "Close pane"),
+                ("Ctrl+Shift+D", "Split pane right"),
+                ("Ctrl+Shift+E", "Split pane down"),
+                ("Ctrl+Shift+P", "Command palette"),
+                ("Ctrl+Shift+R", "Rename pane"),
+                ("Ctrl+Shift+C", "Copy selection"),
+                ("Ctrl+Shift+V", "Paste"),
+                ("Ctrl+Tab", "Next tab"),
+                ("Ctrl+1-9", "Switch to tab N"),
+                ("Ctrl+0 / +/-", "Font zoom reset/in/out"),
+                ("Ctrl+Alt+Arrows", "Resize pane"),
+                ("Ctrl+Shift+Arrows", "Move focus"),
+                ("Right-click", "Paste"),
+            ];
+            let shown = entries.len();
+            let col_key_w = 24 * cw; // fixed-width key column
+            let col_val_w = 32 * cw;
+            let box_w = (col_key_w + col_val_w + cw * 2)
+                .max(40 * cw.max(1))
+                .min(stride.saturating_sub(cw));
+            let box_h = (shown + 2) * ch;
+            let bx = (stride.saturating_sub(box_w)) / 2;
+            let by = ch * 2;
+            let panel = 0x0020_2030u32;
+            let rbox = Rect {
+                x: bx,
+                y: by,
+                w: box_w,
+                h: box_h,
+            };
+            fill_rect(&mut buffer, stride, rbox, panel);
+            stroke_rect(&mut buffer, stride, rbox, accent);
+            // Header row.
+            let header_rect = Rect {
+                x: bx,
+                y: by,
+                w: box_w,
+                h: ch,
+            };
+            draw_text(
+                &mut buffer,
+                stride,
+                &mut self.font,
+                bx + cw,
+                by,
+                "Keybindings  (Esc / F1 to close)",
+                accent,
+                panel,
+                false,
+                header_rect,
+            );
+            for (i, (binding, desc)) in entries.iter().enumerate() {
+                let iy = by + ch + i * ch;
+                let row_rect = Rect {
+                    x: bx,
+                    y: iy,
+                    w: box_w,
+                    h: ch,
+                };
+                // Key column.
+                let key_rect = Rect {
+                    x: bx + cw,
+                    y: iy,
+                    w: col_key_w,
+                    h: ch,
+                };
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    &mut self.font,
+                    bx + cw,
+                    iy,
+                    binding,
+                    accent,
+                    panel,
+                    false,
+                    key_rect,
+                );
+                // Value column.
+                let val_rect = Rect {
+                    x: bx + cw + col_key_w,
+                    y: iy,
+                    w: row_rect.w.saturating_sub(cw + col_key_w),
+                    h: ch,
+                };
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    &mut self.font,
+                    bx + cw + col_key_w,
+                    iy,
+                    desc,
+                    crate::color::FG,
+                    panel,
+                    false,
+                    val_rect,
                 );
             }
         }

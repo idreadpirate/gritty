@@ -9,6 +9,19 @@ use crate::Dir4;
 
 impl Gritty {
     pub(crate) fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        // CA-21: help overlay swallows all input; Esc/F1/Ctrl+Shift+/ closes it.
+        if self.show_help {
+            let close = matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1))
+                || (self.mods.control_key()
+                    && self.mods.shift_key()
+                    && matches!(key, Key::Character(s) if s == "/"));
+            if close {
+                self.show_help = false;
+                self.request_redraw();
+            }
+            return;
+        }
+
         // Command palette swallows input while open.
         if self.palette.is_some() {
             self.handle_palette_key(event_loop, key);
@@ -39,6 +52,15 @@ impl Gritty {
 
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
+
+        // CA-21: F1 or Ctrl+Shift+/ opens the help overlay.
+        if matches!(key, Key::Named(NamedKey::F1))
+            || (ctrl && shift && matches!(key, Key::Character(s) if s == "/"))
+        {
+            self.show_help = !self.show_help;
+            self.request_redraw();
+            return;
+        }
 
         if ctrl && shift {
             if let Key::Character(s) = key {
@@ -120,6 +142,11 @@ impl Gritty {
                     if d >= 1 {
                         let idx = (d as usize) - 1;
                         if idx < self.tabs.len() {
+                            // RT-8: auto-disable broadcast on tab switch.
+                            if idx != self.active {
+                                self.broadcast = false;
+                                self.broadcast_pending_signal = None;
+                            }
                             self.active = idx;
                             self.drain_pty(); // RT-10: flush newly focused tab.
                             self.relayout();
@@ -133,6 +160,9 @@ impl Gritty {
             // Ctrl+Tab: cycle to the next tab (RT-10: drain PTY after switch).
             if matches!(key, Key::Named(NamedKey::Tab)) {
                 if !self.tabs.is_empty() {
+                    // RT-8: auto-disable broadcast on tab switch.
+                    self.broadcast = false;
+                    self.broadcast_pending_signal = None;
                     self.active = (self.active + 1) % self.tabs.len();
                     self.drain_pty(); // RT-10: flush newly focused tab.
                     self.relayout();
@@ -146,9 +176,30 @@ impl Gritty {
         if let Some(bytes) = crate::key::encode(key, self.mods) {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 if self.broadcast {
-                    for pane in tab.panes.values_mut() {
-                        pane.term.scroll_to_bottom();
-                        pane.pty.write(&bytes);
+                    // RT-8: signal-bearing control bytes require a second-press guard.
+                    let is_signal =
+                        bytes.len() == 1 && crate::app::is_broadcast_signal_byte(bytes[0]);
+                    if is_signal {
+                        let pending = self.broadcast_pending_signal;
+                        if pending == Some(bytes[0]) {
+                            // Second press confirmed — fan out to all panes.
+                            self.broadcast_pending_signal = None;
+                            for pane in tab.panes.values_mut() {
+                                pane.term.scroll_to_bottom();
+                                pane.pty.write(&bytes);
+                            }
+                        } else {
+                            // First press — arm the guard; do NOT send yet.
+                            self.broadcast_pending_signal = Some(bytes[0]);
+                            self.request_redraw();
+                        }
+                    } else {
+                        // Any non-signal keystroke clears a pending guard.
+                        self.broadcast_pending_signal = None;
+                        for pane in tab.panes.values_mut() {
+                            pane.term.scroll_to_bottom();
+                            pane.pty.write(&bytes);
+                        }
                     }
                 } else {
                     let f = tab.focus;
