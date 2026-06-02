@@ -11,6 +11,7 @@ mod key;
 mod layout;
 mod palette;
 mod persist;
+mod proc;
 mod pty;
 mod render;
 mod session;
@@ -18,6 +19,7 @@ mod term;
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -75,6 +77,7 @@ struct Gritty {
     palette: Option<Palette>,
     broadcast: bool,
     seamless: bool,
+    last_proc_poll: Instant,
     proxy: EventLoopProxy<Wake>,
 }
 
@@ -97,7 +100,22 @@ impl Gritty {
             palette: None,
             broadcast: false,
             seamless: false,
+            last_proc_poll: Instant::now() - Duration::from_secs(5),
             proxy,
+        }
+    }
+
+    /// Refresh each pane's foreground process name (one OS snapshot for all).
+    fn update_procs(&mut self) {
+        let procs = proc::snapshot();
+        for tab in &mut self.tabs {
+            for pane in tab.panes.values_mut() {
+                pane.proc_name = pane
+                    .pty
+                    .pid()
+                    .and_then(|pid| proc::foreground_name(&procs, pid))
+                    .unwrap_or_default();
+            }
         }
     }
 
@@ -700,13 +718,20 @@ impl Gritty {
                 let title_rect = Rect { x: rect.x, y: rect.y, w: rect.w, h: ch };
                 let (tfg, tbg) = if is_focus { (BG, accent) } else { (UI_DIM, UI_TITLE_BG) };
                 fill_rect(&mut buffer, stride, title_rect, tbg);
-                let name = self
+                let header = self
                     .tabs
                     .get(active)
                     .and_then(|t| t.panes.get(&id))
-                    .map(|p| p.name.clone())
+                    .map(|p| {
+                        let proc = p.proc_name.as_str();
+                        if proc.is_empty() || proc == "pwsh" || proc == "cmd" || proc == "powershell" {
+                            p.name.clone()
+                        } else {
+                            format!("{}: {}", p.name, proc)
+                        }
+                    })
                     .unwrap_or_default();
-                draw_text(&mut buffer, stride, &mut self.font, rect.x + cw / 2, rect.y, &name, tfg, tbg, true, title_rect);
+                draw_text(&mut buffer, stride, &mut self.font, rect.x + cw / 2, rect.y, &header, tfg, tbg, true, title_rect);
             }
 
             // Grid.
@@ -844,6 +869,10 @@ impl ApplicationHandler<Wake> for Gritty {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         self.drain_pty();
         self.reap_dead(event_loop);
+        if self.last_proc_poll.elapsed() >= Duration::from_millis(750) {
+            self.update_procs();
+            self.last_proc_poll = Instant::now();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {

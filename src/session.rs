@@ -13,6 +13,8 @@ pub struct Pane {
     pub term: Terminal,
     pub pty: Pty,
     pub name: String,
+    /// Foreground process running in the pane (e.g. "nvim"), updated periodically.
+    pub proc_name: String,
 }
 
 impl Pane {
@@ -26,7 +28,7 @@ impl Pane {
         let pty = Pty::spawn("pwsh.exe", &["-NoLogo"], rows as u16, cols as u16, waker.clone())
             .or_else(|_| Pty::spawn("cmd.exe", &[], rows as u16, cols as u16, waker))
             .expect("spawn a native shell");
-        Self { term, pty, name }
+        Self { term, pty, name, proc_name: String::new() }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

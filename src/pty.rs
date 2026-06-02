@@ -16,6 +16,7 @@ pub struct Pty {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     alive: Arc<AtomicBool>,
+    pid: Option<u32>,
     pub rx: Receiver<Vec<u8>>,
 }
 
@@ -40,6 +41,7 @@ impl Pty {
         }
         let child = pair.slave.spawn_command(cmd)?;
         let killer = child.clone_killer();
+        let pid = child.process_id();
 
         // The slave handle must drop or the child never sees EOF on exit.
         drop(pair.slave);
@@ -74,12 +76,17 @@ impl Pty {
             writer,
             killer,
             alive,
+            pid,
             rx,
         })
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Send bytes to the child's stdin.
