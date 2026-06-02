@@ -6,6 +6,7 @@ mod app;
 mod background;
 mod clipboard;
 mod color;
+mod config;
 mod font;
 mod fuzzy;
 mod input;
