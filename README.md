@@ -1,81 +1,115 @@
 <div align="center">
 
+<img src="grittyicon.png" alt="gritty" width="140" />
+
 # gritty
 
-**A lightweight, native Windows terminal multiplexer — written in Rust.**
+**A lightweight, native Windows terminal multiplexer — in Rust.**
 
-Tabs, split panes, per-pane names, copy/paste that just works, and a command
-palette — in a single ~1 MB executable with **no GPU, no runtime, no WSL.**
+Tabs, split panes, a command palette, copy/paste that *actually works*, session
+restore, process-aware panes — in a single **~1.25 MB** executable with **no GPU,
+no Electron, no runtime, no WSL.**
+
+`174 tests` · `262 deps` · CPU-rendered · one `gritty.exe`
 
 </div>
 
 ---
 
-## Why gritty
+## Why it's bad ass
 
-Most "modern" terminals are Electron apps that idle at hundreds of megabytes.
-gritty is the opposite: a CPU-rendered native Win32 app that starts instantly,
-stays light, and never depends on a graphics driver or a browser engine.
+Most "modern" terminals are Chromium in a trench coat — hundreds of MB of RAM to
+draw a grid of text. The classic multiplexer, tmux, can't even run natively on
+Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 
-It extracts the proven cores of two great projects — [WezTerm's
-`portable-pty`](https://github.com/wez/wezterm) for ConPTY and
-[Alacritty's `alacritty_terminal`](https://github.com/alacritty/alacritty) VT
-engine — and wraps them in a lean, original multiplexer and renderer.
+- **It's the terminal *and* the multiplexer, natively.** Speaks Windows **ConPTY**
+  directly — one `.exe`, runs where WSL is banned (locked-down corporate boxes).
+- **Brutally lightweight, by construction.** CPU software rendering (no GPU
+  pipeline, no driver surface), `lto + strip + panic=abort`, ~22 MB idle RAM,
+  near-0% CPU when idle (event-driven repaint with a frame cap + wake coalescing).
+  Adding 15 noisy panes can't peg a core.
+- **Stands on giants, reinvents nothing risky.** It extracts the proven cores —
+  WezTerm's `portable-pty` for ConPTY and Alacritty's `alacritty_terminal` VT
+  engine — and wraps them in its own lean multiplexer, renderer, and UX.
+- **Hardened like it's going to production.** A red-team + code-audit pass drove
+  out paste-injection, PATH-hijack, session-restore DoS, an unmaintained
+  dependency (RUSTSEC-2017-0008), a memory-unsafety race, and silent panics —
+  every fix shipped with tests behind a quality gate (fmt + clippy `-D` + tests +
+  binary/dependency budgets).
+- **True color, zero config.** None of tmux's `TERM`/`terminal-overrides` dance.
 
 ## Features
 
-- **Tabs & split panes** — recursive splits via a binary layout tree; drag a
-  border or use the keyboard to resize.
-- **Named, process-aware panes** — name any pane; the header also shows the
-  foreground process (e.g. `editor: nvim`).
-- **Copy / paste that always works** — drag to select (auto-copy),
-  `Ctrl+Shift+C/V`, right-click paste, bracketed-paste safe.
-- **Command palette** (`Ctrl+Shift+P`) — fuzzy-searchable actions.
-- **Broadcast input** — type into every pane in a tab at once.
-- **Seamless mode** — hide chrome; just a glow on the focused pane.
-- **Session save/restore** — your tab/pane layout survives restarts.
-- **Scrollback** — wheel scroll; typing snaps back to the live view.
-- **Per-tab neon accents** and a subtle glow background.
+**Multiplexing** — tabs; recursive split panes (binary layout tree); per-pane
+names; per-tab neon accent colors; **seamless mode** (hide all chrome, just a glow
+on the focused pane).
+
+**Input & navigation** — full xterm key encoding (F-keys, modified arrows,
+Alt-as-ESC, Ctrl-masking); mouse reporting to TUI apps (vim/htop/fzf get clicks &
+wheel); double-click word / triple-click line selection; **command palette**
+(`Ctrl+Shift+P`, fuzzy); **keybinding help overlay** (`F1`); font zoom.
+
+**Copy/paste that always works** — drag to auto-copy, `Ctrl+Shift+C/V`,
+right-click paste, **sanitized & bracketed-paste-safe** (strips control/escape
+injection); **Ctrl-click OSC-8 hyperlinks** (scheme-restricted).
+
+**Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
+inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
+scrollback with a position indicator; visual bell.
+
+**Persistence & looks** — **session save/restore** (layout, names, colors, window
+geometry survive restarts); optional `config.toml`; the "gunmetal & amber"
+industrial theme; gamma-correct text; WCAG-AA UI contrast; embedded-fallback font
+so it never fails to start.
+
+**Resilience** — bounded PTY backpressure, graceful device-loss handling, a real
+error dialog instead of a silent crash if no shell can spawn.
+
+## Resize a pane three ways
+Drag the border · `Ctrl+Alt+Arrows` · `Ctrl+Mouse-wheel`.
 
 ## Install / build
 
-Requires the Rust toolchain (MSVC target) on Windows.
+Rust toolchain (MSVC target) on Windows 10/11:
 
 ```sh
-git clone <repo> gritty
+git clone https://github.com/idreadpirate/gritty
 cd gritty
 cargo build --release
 ./target/release/gritty.exe
 ```
 
-The release binary is a single self-contained `gritty.exe` (~1 MB).
+Output is one self-contained `gritty.exe` (~1.25 MB).
 
-## Usage
-
-Run `gritty.exe`. It opens a tab with one pane running PowerShell (falling back
-to `cmd`). Split, name, and arrange panes; close a pane with `Ctrl+Shift+W` or
-by typing `exit`. Your layout is saved on exit and restored next launch.
-
-See **[docs/KEYBINDINGS.md](docs/KEYBINDINGS.md)** for the full reference. The
-essentials:
+## Keybindings (essentials)
 
 | Action | Keys |
 |---|---|
-| Command palette | `Ctrl+Shift+P` |
+| Command palette / help | `Ctrl+Shift+P` / `F1` |
 | Split right / down | `Ctrl+Shift+D` / `Ctrl+Shift+E` |
 | Move focus / resize pane | `Ctrl+Shift+Arrows` / `Ctrl+Alt+Arrows` |
-| Rename pane | `Ctrl+Shift+R` |
-| New tab / switch tab | `Ctrl+Shift+T` / `Ctrl+1..9` |
+| Rename pane / close pane | `Ctrl+Shift+R` / `Ctrl+Shift+W` |
+| New tab / switch tab | `Ctrl+Shift+T` / `Ctrl+1…9` |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| Font zoom | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
+
+Full reference: **[docs/KEYBINDINGS.md](docs/KEYBINDINGS.md)**.
+
+## Honest scope
+
+gritty is the best **local** terminal on Windows. It is **not** a replacement for
+tmux on a server: it doesn't host detachable remote sessions over SSH. For
+remote/headless multiplexing, use tmux. See **[docs/COMPARISON.md](docs/COMPARISON.md)**
+for the measured, side-by-side honesty (including where tmux still wins).
+
+Two known deferrals, tracked with rationale: per-cell damage-tracking (a perf
+optimization — idle CPU is already bounded) and a UI-Automation screen-reader
+provider (a large dedicated a11y effort).
 
 ## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md) — module map and design decisions
-- [Comparison](docs/COMPARISON.md) — gritty vs tmux and others (measured, honest)
-- [Keybindings](docs/KEYBINDINGS.md) — full reference
-- [Contributing](CONTRIBUTING.md) — build, test, and style guide
-- [Changelog](CHANGELOG.md)
+- [Architecture](docs/ARCHITECTURE.md) · [Comparison](docs/COMPARISON.md) ·
+  [Keybindings](docs/KEYBINDINGS.md) · [Contributing](CONTRIBUTING.md) ·
+  [Changelog](CHANGELOG.md)
 
 ## License
-
 MIT — see [LICENSE](LICENSE).
