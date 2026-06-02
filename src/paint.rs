@@ -4,7 +4,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::app::Gritty;
-use crate::color::{self, ACCENT, BG, FG, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
+use crate::color::{self, ACCENT, BG, FG, PANE_SEP, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
 use crate::font::FontAtlas;
 use crate::layout::Rect;
 use crate::render::{self, draw_cell, draw_text, fill_rect, stroke_rect, Cell};
@@ -26,7 +26,9 @@ impl Gritty {
         if surface.resize(nz_w, nz_h).is_err() {
             return; // skip this frame instead of crashing
         }
-        let mut buffer = surface.buffer_mut().expect("buffer");
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return; // transient device-context loss — skip this frame (CA-1)
+        };
 
         self.background.resize(stride, height);
         buffer.copy_from_slice(&self.background.px);
@@ -105,6 +107,19 @@ impl Gritty {
                 r,
             );
         }
+
+        // Tab strip bottom separator — faint 1px line between tabs and content (CA-29).
+        fill_rect(
+            &mut buffer,
+            stride,
+            Rect {
+                x: 0,
+                y: ch.saturating_sub(1),
+                w: stride,
+                h: 1,
+            },
+            PANE_SEP,
+        );
 
         // Panes.
         let area = Rect {
@@ -188,9 +203,12 @@ impl Gritty {
                 );
             }
 
-            // Focused pane always gets the accent glow border.
+            // Focused pane gets the accent glow border; unfocused panes get a
+            // subtle 1px separator so pane boundaries remain visible (CA-24).
             if is_focus {
                 stroke_rect(&mut buffer, stride, rect, accent);
+            } else {
+                stroke_rect(&mut buffer, stride, rect, PANE_SEP);
             }
         }
 
@@ -287,7 +305,9 @@ impl Gritty {
             );
         }
 
-        buffer.present().expect("present");
+        if buffer.present().is_err() {
+            return; // transient present failure — skip frame, don't crash (CA-1)
+        }
         self.last_render = std::time::Instant::now();
         self.redraw_pending = false;
     }
@@ -307,7 +327,10 @@ pub(crate) fn draw_pane_grid(
     let content = pane.term.term.renderable_content();
     let selection = content.selection;
     let at_bottom = content.display_offset == 0;
-    let cursor_visible = is_focus && at_bottom && content.cursor.shape != CursorShape::Hidden;
+    let cursor_shape = content.cursor.shape;
+    let cursor_hidden = cursor_shape == CursorShape::Hidden;
+    // Focused pane: block cursor inverts cell; unfocused: hollow outline drawn after grid.
+    let cursor_active = at_bottom && !cursor_hidden;
     let cur_row = content.cursor.point.line.0;
     let cur_col = content.cursor.point.column.0 as i32;
 
@@ -336,7 +359,14 @@ pub(crate) fn draw_pane_grid(
         if selection.is_some_and(|r| r.contains(item.point)) {
             bg = SELECTION_BG;
             fill_bg = true;
-        } else if cursor_visible && line == cur_row && col as i32 == cur_col {
+        } else if is_focus
+            && cursor_active
+            && line == cur_row
+            && col as i32 == cur_col
+            && cursor_shape == CursorShape::Block
+        {
+            // Focused block cursor: invert the cell (CA-17).
+            // Beam and Underline draw overlays after the cell; no bg change here.
             bg = accent;
             fg = BG;
             fill_bg = true;
@@ -367,6 +397,59 @@ pub(crate) fn draw_pane_grid(
                     h: 1,
                 },
                 fg,
+            );
+        }
+    }
+
+    // Post-grid cursor overlays (CA-17).
+    if cursor_active && cur_row >= 0 && cur_col >= 0 {
+        let cur_px = grid.x + cur_col as usize * cw;
+        let cur_py = grid.y + cur_row as usize * ch;
+        if is_focus {
+            match cursor_shape {
+                CursorShape::Underline => {
+                    // 2px bar at the bottom of the cell.
+                    render::fill_rect(
+                        buffer,
+                        stride,
+                        Rect {
+                            x: cur_px,
+                            y: cur_py + ch.saturating_sub(2),
+                            w: cw,
+                            h: 2,
+                        },
+                        accent,
+                    );
+                }
+                CursorShape::Beam => {
+                    // 2px vertical bar at the left edge of the cell.
+                    render::fill_rect(
+                        buffer,
+                        stride,
+                        Rect {
+                            x: cur_px,
+                            y: cur_py,
+                            w: 2,
+                            h: ch,
+                        },
+                        accent,
+                    );
+                }
+                // Block is handled inline above; Hidden is excluded by cursor_active.
+                _ => {}
+            }
+        } else {
+            // Unfocused pane: hollow dim outline at cursor position (CA-17).
+            render::stroke_rect(
+                buffer,
+                stride,
+                Rect {
+                    x: cur_px,
+                    y: cur_py,
+                    w: cw,
+                    h: ch,
+                },
+                UI_DIM,
             );
         }
     }
