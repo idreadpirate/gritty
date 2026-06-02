@@ -1,7 +1,8 @@
 // gritty — a lightweight, standalone native Windows terminal.
-// M3/M4: live PTY-backed grid + keyboard input (interactive shell).
+// M5: copy/paste — mouse selection w/ auto-copy, Ctrl+Shift+C/V, right-click paste.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clipboard;
 mod color;
 mod font;
 mod key;
@@ -12,20 +13,22 @@ mod term;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::vte::ansi::CursorShape;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowId};
 
-use color::{BG, CURSOR, FG};
+use clipboard::Clip;
+use color::{BG, CURSOR, FG, SELECTION_BG};
 use font::FontAtlas;
 use pty::Pty;
 use render::{draw_cell, Cell};
 use term::Terminal;
 
-/// Wakes the event loop when PTY output arrives.
 #[derive(Debug, Clone, Copy)]
 struct Wake;
 
@@ -37,6 +40,9 @@ struct Gritty {
     terminal: Option<Terminal>,
     pty: Option<Pty>,
     mods: ModifiersState,
+    clip: Clip,
+    mouse_pos: (f64, f64),
+    selecting: bool,
     proxy: EventLoopProxy<Wake>,
 }
 
@@ -50,15 +56,32 @@ impl Gritty {
             terminal: None,
             pty: None,
             mods: ModifiersState::empty(),
+            clip: Clip::new(),
+            mouse_pos: (0.0, 0.0),
+            selecting: false,
             proxy,
         }
     }
 
-    /// Grid dimensions for the current window size.
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
         let cols = (w as usize / self.font.cell_w).max(1);
         let rows = (h as usize / self.font.cell_h).max(1);
         (cols, rows)
+    }
+
+    fn pixel_to_point(&self, x: f64, y: f64) -> (Point, Side) {
+        let cw = self.font.cell_w as f64;
+        let chh = self.font.cell_h as f64;
+        let max_col = self
+            .terminal
+            .as_ref()
+            .map(|t| t.size.cols.saturating_sub(1))
+            .unwrap_or(0);
+        let col = ((x / cw).floor().max(0.0) as usize).min(max_col);
+        let off = self.terminal.as_ref().map(|t| t.display_offset()).unwrap_or(0) as i32;
+        let row = (y / chh).floor().max(0.0) as i32;
+        let side = if (x % cw) < cw / 2.0 { Side::Left } else { Side::Right };
+        (Point::new(Line(row - off), Column(col)), side)
     }
 
     fn drain_pty(&mut self) {
@@ -71,6 +94,81 @@ impl Gritty {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    fn copy_selection(&mut self) {
+        if let Some(t) = self.terminal.as_ref() {
+            if let Some(text) = t.term.selection_to_string() {
+                if !text.is_empty() {
+                    self.clip.copy(&text);
+                }
+            }
+        }
+    }
+
+    fn paste(&mut self) {
+        let Some(text) = self.clip.paste() else { return };
+        let bracketed = self.terminal.as_ref().map_or(false, |t| t.bracketed_paste());
+        let data = term::wrap_paste(&text, bracketed);
+        if let Some(pty) = self.pty.as_mut() {
+            pty.write(&data);
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(window) = self.window.as_ref() else { return };
+        let size = window.inner_size();
+        let (w, h) = (size.width.max(1), size.height.max(1));
+        let stride = w as usize;
+        let height = h as usize;
+
+        let Some(surface) = self.surface.as_mut() else { return };
+        surface
+            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+            .expect("resize");
+        let mut buffer = surface.buffer_mut().expect("buffer");
+        buffer.fill(BG);
+
+        if let Some(terminal) = self.terminal.as_ref() {
+            let content = terminal.term.renderable_content();
+            let selection = content.selection;
+            let at_bottom = content.display_offset == 0;
+            let cursor_visible = at_bottom && content.cursor.shape != CursorShape::Hidden;
+            let cur_row = content.cursor.point.line.0;
+            let cur_col = content.cursor.point.column.0 as i32;
+
+            for item in content.display_iter {
+                let line = item.point.line.0;
+                if line < 0 {
+                    continue;
+                }
+                let row = line as usize;
+                let col = item.point.column.0;
+                let cell = item.cell;
+
+                let mut fg = color::to_rgb(cell.fg, FG);
+                let mut bg = color::to_rgb(cell.bg, BG);
+
+                if selection.map_or(false, |r| r.contains(item.point)) {
+                    bg = SELECTION_BG;
+                } else if cursor_visible && line == cur_row && col as i32 == cur_col {
+                    bg = CURSOR;
+                    fg = BG;
+                }
+
+                draw_cell(
+                    &mut buffer,
+                    stride,
+                    height,
+                    &mut self.font,
+                    col,
+                    row,
+                    Cell { ch: cell.c, fg, bg },
+                );
+            }
+        }
+
+        buffer.present().expect("present");
     }
 }
 
@@ -89,7 +187,6 @@ impl ApplicationHandler<Wake> for Gritty {
 
         let size = window.inner_size();
         let (cols, rows) = self.grid_dims(size.width.max(1), size.height.max(1));
-
         let terminal = Terminal::new(cols, rows);
 
         let proxy = self.proxy.clone();
@@ -118,14 +215,65 @@ impl ApplicationHandler<Wake> for Gritty {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let Some(bytes) = key::encode(&event.logical_key, self.mods) {
-                        if let Some(pty) = self.pty.as_mut() {
-                            pty.write(&bytes);
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                // Clipboard shortcuts take priority over byte encoding.
+                if self.mods.control_key() && self.mods.shift_key() {
+                    if let Key::Character(s) = &event.logical_key {
+                        match s.to_lowercase().as_str() {
+                            "c" => {
+                                self.copy_selection();
+                                return;
+                            }
+                            "v" => {
+                                self.paste();
+                                return;
+                            }
+                            _ => {}
                         }
                     }
                 }
+                if let Some(bytes) = key::encode(&event.logical_key, self.mods) {
+                    if let Some(pty) = self.pty.as_mut() {
+                        pty.write(&bytes);
+                    }
+                }
             }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x, position.y);
+                if self.selecting {
+                    let (point, side) = self.pixel_to_point(position.x, position.y);
+                    if let Some(t) = self.terminal.as_mut() {
+                        if let Some(sel) = t.term.selection.as_mut() {
+                            sel.update(point, side);
+                        }
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
+                (ElementState::Pressed, MouseButton::Left) => {
+                    let (point, side) = self.pixel_to_point(self.mouse_pos.0, self.mouse_pos.1);
+                    if let Some(t) = self.terminal.as_mut() {
+                        t.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+                    }
+                    self.selecting = true;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+                (ElementState::Released, MouseButton::Left) => {
+                    self.selecting = false;
+                    self.copy_selection();
+                }
+                (ElementState::Pressed, MouseButton::Right) => self.paste(),
+                _ => {}
+            },
 
             WindowEvent::Resized(new) => {
                 let (cols, rows) = self.grid_dims(new.width.max(1), new.height.max(1));
@@ -144,60 +292,6 @@ impl ApplicationHandler<Wake> for Gritty {
 
             _ => {}
         }
-    }
-}
-
-impl Gritty {
-    fn redraw(&mut self) {
-        let Some(window) = self.window.as_ref() else { return };
-        let size = window.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
-        let stride = w as usize;
-        let height = h as usize;
-
-        let Some(surface) = self.surface.as_mut() else { return };
-        surface
-            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-            .expect("resize");
-        let mut buffer = surface.buffer_mut().expect("buffer");
-        buffer.fill(BG);
-
-        if let Some(terminal) = self.terminal.as_ref() {
-            let content = terminal.term.renderable_content();
-            let at_bottom = content.display_offset == 0;
-            let cursor_visible = at_bottom && content.cursor.shape != CursorShape::Hidden;
-            let cur_row = content.cursor.point.line.0;
-            let cur_col = content.cursor.point.column.0 as i32;
-
-            for item in content.display_iter {
-                let line = item.point.line.0;
-                if line < 0 {
-                    continue;
-                }
-                let row = line as usize;
-                let col = item.point.column.0;
-                let cell = item.cell;
-
-                let mut fg = color::to_rgb(cell.fg, FG);
-                let mut bg = color::to_rgb(cell.bg, BG);
-                if cursor_visible && line == cur_row && col as i32 == cur_col {
-                    bg = CURSOR;
-                    fg = BG;
-                }
-
-                draw_cell(
-                    &mut buffer,
-                    stride,
-                    height,
-                    &mut self.font,
-                    col,
-                    row,
-                    Cell { ch: cell.c, fg, bg },
-                );
-            }
-        }
-
-        buffer.present().expect("present");
     }
 }
 

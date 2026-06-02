@@ -11,6 +11,7 @@ fontdue = "0.9"
 portable-pty = "0.8"
 anyhow = "1"
 alacritty_terminal = "0.25"
+arboard = { version = "3", default-features = false }
 
 [profile.release]
 opt-level = 3
