@@ -10,6 +10,8 @@ pub struct Cell {
 }
 
 /// Draw one cell at grid position (col, row) into `buf` (width = `stride`).
+/// When `fill_bg` is false the cell background is left untouched, letting the
+/// decorative base layer show through (used for default-background cells).
 pub fn draw_cell(
     buf: &mut [u32],
     stride: usize,
@@ -18,6 +20,7 @@ pub fn draw_cell(
     col: usize,
     row: usize,
     cell: Cell,
+    fill_bg: bool,
 ) {
     let cw = font.cell_w;
     let ch_h = font.cell_h;
@@ -26,18 +29,20 @@ pub fn draw_cell(
     let y0 = row * ch_h;
 
     // Background fill for the whole cell.
-    for yy in 0..ch_h {
-        let y = y0 + yy;
-        if y >= height {
-            break;
-        }
-        let base = y * stride;
-        for xx in 0..cw {
-            let x = x0 + xx;
-            if x >= stride {
+    if fill_bg {
+        for yy in 0..ch_h {
+            let y = y0 + yy;
+            if y >= height {
                 break;
             }
-            buf[base + x] = cell.bg;
+            let base = y * stride;
+            for xx in 0..cw {
+                let x = x0 + xx;
+                if x >= stride {
+                    break;
+                }
+                buf[base + x] = cell.bg;
+            }
         }
     }
 
@@ -106,7 +111,7 @@ mod tests {
         let height = font.cell_h * 2;
         let mut buf = vec![0x0011_1111u32; stride * height];
         draw_cell(&mut buf, stride, height, &mut font, 0, 0,
-            Cell { ch: 'M', fg: 0x00ff_ffff, bg: 0x0011_1111 });
+            Cell { ch: 'M', fg: 0x00ff_ffff, bg: 0x0011_1111 }, true);
         let marked = buf.iter().filter(|&&p| p != 0x0011_1111).count();
         assert!(marked > 0, "glyph 'M' drew no foreground pixels");
     }
@@ -118,7 +123,18 @@ mod tests {
         let height = font.cell_h;
         let mut buf = vec![0x0011_1111u32; stride * height];
         draw_cell(&mut buf, stride, height, &mut font, 0, 0,
-            Cell { ch: ' ', fg: 0x00ff_ffff, bg: 0x0022_2222 });
+            Cell { ch: ' ', fg: 0x00ff_ffff, bg: 0x0022_2222 }, true);
         assert!(buf.iter().all(|&p| p == 0x0022_2222), "space must be pure bg");
+    }
+
+    #[test]
+    fn space_no_fill_leaves_buffer_untouched() {
+        let mut font = FontAtlas::new(18.0);
+        let stride = font.cell_w;
+        let height = font.cell_h;
+        let mut buf = vec![0x00ab_cdefu32; stride * height];
+        draw_cell(&mut buf, stride, height, &mut font, 0, 0,
+            Cell { ch: ' ', fg: 0x00ff_ffff, bg: 0x0022_2222 }, false);
+        assert!(buf.iter().all(|&p| p == 0x00ab_cdef), "no-fill space must not touch buffer");
     }
 }

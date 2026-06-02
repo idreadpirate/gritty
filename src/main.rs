@@ -2,6 +2,7 @@
 // M5: copy/paste — mouse selection w/ auto-copy, Ctrl+Shift+C/V, right-click paste.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod clipboard;
 mod color;
 mod font;
@@ -15,13 +16,14 @@ use std::rc::Rc;
 
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::vte::ansi::CursorShape;
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowId};
 
+use background::Background;
 use clipboard::Clip;
 use color::{BG, CURSOR, FG, SELECTION_BG};
 use font::FontAtlas;
@@ -37,6 +39,7 @@ struct Gritty {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     _context: Option<softbuffer::Context<Rc<Window>>>,
     font: FontAtlas,
+    background: Background,
     terminal: Option<Terminal>,
     pty: Option<Pty>,
     mods: ModifiersState,
@@ -53,6 +56,7 @@ impl Gritty {
             surface: None,
             _context: None,
             font: FontAtlas::new(18.0),
+            background: Background::new(),
             terminal: None,
             pty: None,
             mods: ModifiersState::empty(),
@@ -127,7 +131,10 @@ impl Gritty {
             .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
             .expect("resize");
         let mut buffer = surface.buffer_mut().expect("buffer");
-        buffer.fill(BG);
+
+        // Decorative base layer (cached; recomputed only on size change).
+        self.background.resize(stride, height);
+        buffer.copy_from_slice(&self.background.px);
 
         if let Some(terminal) = self.terminal.as_ref() {
             let content = terminal.term.renderable_content();
@@ -149,11 +156,17 @@ impl Gritty {
                 let mut fg = color::to_rgb(cell.fg, FG);
                 let mut bg = color::to_rgb(cell.bg, BG);
 
+                // Default-bg cells stay transparent so the glow shows through.
+                let is_default_bg = matches!(cell.bg, Color::Named(NamedColor::Background));
+                let mut fill_bg = !is_default_bg;
+
                 if selection.map_or(false, |r| r.contains(item.point)) {
                     bg = SELECTION_BG;
+                    fill_bg = true;
                 } else if cursor_visible && line == cur_row && col as i32 == cur_col {
                     bg = CURSOR;
                     fg = BG;
+                    fill_bg = true;
                 }
 
                 draw_cell(
@@ -164,6 +177,7 @@ impl Gritty {
                     col,
                     row,
                     Cell { ch: cell.c, fg, bg },
+                    fill_bg,
                 );
             }
         }
