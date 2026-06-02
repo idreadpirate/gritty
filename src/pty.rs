@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Bounded output queue per pane (~256 * 8 KB = 2 MB max buffered). A flooding
@@ -15,9 +15,17 @@ const QUEUE_DEPTH: usize = 256;
 use anyhow::Result;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
+/// Returns true when `data` contains an ANSI DSR cursor-position query (ESC [ 6 n).
+/// portable-pty ≥ 0.9 enables PSUEDOCONSOLE_INHERIT_CURSOR, which causes the
+/// ConPTY layer to emit this sequence at startup; the child process blocks until
+/// it receives a CPR reply (ESC [ row ; col R).
+fn contains_dsr(data: &[u8]) -> bool {
+    data.windows(4).any(|w| w == b"\x1b[6n")
+}
+
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     alive: Arc<AtomicBool>,
     notified: Arc<AtomicBool>,
@@ -62,7 +70,7 @@ impl Pty {
         // The slave handle must drop or the child never sees EOF on exit.
         drop(pair.slave);
 
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
         let alive = Arc::new(AtomicBool::new(true));
@@ -73,6 +81,13 @@ impl Pty {
         let notified = Arc::new(AtomicBool::new(false));
         let notified_reader = notified.clone();
 
+        // Share the writer with the reader thread so it can reply to DSR queries.
+        // portable-pty 0.9 sets PSUEDOCONSOLE_INHERIT_CURSOR which causes the
+        // ConPTY to emit ESC[6n (cursor position request) immediately; the child
+        // blocks until it receives a reply.  We synthesise ESC[1;1R here so the
+        // child starts without waiting for the real terminal emulator to answer.
+        let writer_for_dsr = Arc::clone(&writer);
+
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -80,7 +95,17 @@ impl Pty {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        let chunk = &buf[..n];
+                        // Auto-reply to cursor-position DSR (ESC [ 6 n) so that
+                        // the child shell does not block waiting for a position
+                        // report from the terminal emulator.
+                        if contains_dsr(chunk) {
+                            if let Ok(mut w) = writer_for_dsr.lock() {
+                                let _ = w.write_all(b"\x1b[1;1R");
+                                let _ = w.flush();
+                            }
+                        }
+                        if tx.send(chunk.to_vec()).is_err() {
                             break;
                         }
                         if !notified_reader.swap(true, Ordering::AcqRel) {
@@ -122,8 +147,10 @@ impl Pty {
 
     /// Send bytes to the child's stdin.
     pub fn write(&mut self, data: &[u8]) {
-        let _ = self.writer.write_all(data);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(data);
+            let _ = w.flush();
+        }
     }
 
     /// Resize the PTY (call on window resize).

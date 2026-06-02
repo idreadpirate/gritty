@@ -8,7 +8,7 @@ description = "A lightweight native Windows terminal"
 winit = "0.30"
 softbuffer = "0.4"
 fontdue = "0.9"
-portable-pty = "0.8"
+portable-pty = "0.9"
 anyhow = "1"
 alacritty_terminal = "0.25"
 arboard = { version = "3", default-features = false }
