@@ -117,6 +117,7 @@ pub fn draw_cell(
 }
 
 /// Draw a string starting at pixel (px, py), one monospace cell per char.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     buf: &mut [u32],
     stride: usize,

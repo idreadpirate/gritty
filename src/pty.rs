@@ -4,9 +4,13 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread;
+
+/// Bounded output queue per pane (~256 * 8 KB = 2 MB max buffered). A flooding
+/// shell applies backpressure instead of growing memory without limit.
+const QUEUE_DEPTH: usize = 256;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -16,6 +20,7 @@ pub struct Pty {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     alive: Arc<AtomicBool>,
+    notified: Arc<AtomicBool>,
     pid: Option<u32>,
     pub rx: Receiver<Vec<u8>>,
 }
@@ -51,8 +56,13 @@ impl Pty {
 
         let alive = Arc::new(AtomicBool::new(true));
         let alive_reader = alive.clone();
+        // Coalesces wakes: the UI is only pinged on the transition from
+        // "nothing pending" to "data waiting", collapsing a flood of reads into
+        // one wake per drain cycle.
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified_reader = notified.clone();
 
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -62,7 +72,9 @@ impl Pty {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
-                        waker();
+                        if !notified_reader.swap(true, Ordering::AcqRel) {
+                            waker();
+                        }
                     }
                 }
             }
@@ -76,6 +88,7 @@ impl Pty {
             writer,
             killer,
             alive,
+            notified,
             pid,
             rx,
         })
@@ -83,6 +96,12 @@ impl Pty {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Call before draining `rx`: re-arms the wake so output arriving during or
+    /// after the drain triggers a fresh wake (no lost updates).
+    pub fn mark_drained(&self) {
+        self.notified.store(false, Ordering::Release);
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -139,5 +158,33 @@ mod tests {
             "did not see echoed text; got: {:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    #[test]
+    fn high_volume_no_loss_or_deadlock() {
+        // 2000 numbered lines: exercises sustained draining without loss/hang.
+        let pty = Pty::spawn(
+            "cmd.exe",
+            &["/c", "for /L %i in (1,1,2000) do @echo line%i"],
+            24,
+            80,
+            || {},
+        )
+        .expect("spawn");
+
+        let mut out = String::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            pty.mark_drained();
+            while let Ok(c) = pty.rx.try_recv() {
+                out.push_str(&String::from_utf8_lossy(&c));
+            }
+            if out.contains("line2000") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(out.contains("line1"), "missing first line");
+        assert!(out.contains("line2000"), "missing last line (loss or deadlock)");
     }
 }

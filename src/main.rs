@@ -78,8 +78,14 @@ struct Gritty {
     broadcast: bool,
     seamless: bool,
     last_proc_poll: Instant,
+    last_render: Instant,
+    redraw_pending: bool,
     proxy: EventLoopProxy<Wake>,
 }
+
+/// Minimum spacing between repaints (~120 fps). Bursty PTY output coalesces into
+/// at most one frame per interval, so 15 noisy panes can't peg a core.
+const FRAME: Duration = Duration::from_millis(8);
 
 impl Gritty {
     fn new(proxy: EventLoopProxy<Wake>) -> Self {
@@ -101,7 +107,22 @@ impl Gritty {
             broadcast: false,
             seamless: false,
             last_proc_poll: Instant::now() - Duration::from_secs(5),
+            last_render: Instant::now() - FRAME,
+            redraw_pending: false,
             proxy,
+        }
+    }
+
+    /// Request a repaint, but no faster than `FRAME`. If we're inside the
+    /// cooldown, defer via `WaitUntil` so the frame still lands promptly.
+    fn schedule_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        self.redraw_pending = true;
+        if self.last_render.elapsed() >= FRAME {
+            self.request_redraw();
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.last_render + FRAME,
+            ));
         }
     }
 
@@ -259,15 +280,25 @@ impl Gritty {
         }
     }
 
-    fn drain_pty(&mut self) {
-        for tab in &mut self.tabs {
+    /// Drain every pane's output into its grid. Returns true if the *visible*
+    /// (active) tab changed, so we only repaint when there's something to see.
+    fn drain_pty(&mut self) -> bool {
+        let active = self.active;
+        let mut visible_dirty = false;
+        for (ti, tab) in self.tabs.iter_mut().enumerate() {
             for pane in tab.panes.values_mut() {
+                pane.pty.mark_drained();
+                let mut got = false;
                 while let Ok(chunk) = pane.pty.rx.try_recv() {
                     pane.term.feed(&chunk);
+                    got = true;
+                }
+                if got && ti == active {
+                    visible_dirty = true;
                 }
             }
         }
-        self.request_redraw();
+        visible_dirty
     }
 
     fn request_redraw(&self) {
@@ -291,16 +322,13 @@ impl Gritty {
                 changed = true;
                 let tab = &mut self.tabs[ti];
                 let tree = std::mem::replace(&mut tab.tree, Node::Leaf(id));
-                match tree.without(id) {
-                    Some(t) => {
-                        tab.tree = t;
-                        if tab.focus == id {
-                            let mut lv = Vec::new();
-                            tab.tree.leaves(&mut lv);
-                            tab.focus = *lv.first().unwrap_or(&id);
-                        }
+                if let Some(t) = tree.without(id) {
+                    tab.tree = t;
+                    if tab.focus == id {
+                        let mut lv = Vec::new();
+                        tab.tree.leaves(&mut lv);
+                        tab.focus = *lv.first().unwrap_or(&id);
                     }
-                    None => {}
                 }
                 tab.panes.remove(&id);
             }
@@ -345,7 +373,7 @@ impl Gritty {
             .tabs
             .get(self.active)
             .and_then(|t| t.panes.get(&t.focus))
-            .map_or(false, |p| p.term.bracketed_paste());
+            .is_some_and(|p| p.term.bracketed_paste());
         let data = term::wrap_paste(&text, bracketed);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let f = tab.focus;
@@ -747,11 +775,8 @@ impl Gritty {
         }
 
         // Command palette overlay.
-        if self.palette.is_some() {
-            let (query, sel, matches) = {
-                let p = self.palette.as_ref().unwrap();
-                (p.query.clone(), p.sel, p.matches())
-            };
+        if let Some(p) = self.palette.as_ref() {
+            let (query, sel, matches) = (p.query.clone(), p.sel, p.matches());
             let shown = matches.len().min(8);
             let box_w = (stride * 2 / 3).max(40 * cw.max(1)).min(stride.saturating_sub(cw));
             let box_h = (shown + 1) * ch + ch / 2;
@@ -788,8 +813,9 @@ impl Gritty {
         }
 
         buffer.present().expect("present");
+        self.last_render = Instant::now();
+        self.redraw_pending = false;
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -823,7 +849,7 @@ fn draw_pane_grid(
         let mut bg = color::to_rgb(cell.bg, BG);
         let is_default_bg = matches!(cell.bg, Color::Named(NamedColor::Background));
         let mut fill_bg = !is_default_bg;
-        if selection.map_or(false, |r| r.contains(item.point)) {
+        if selection.is_some_and(|r| r.contains(item.point)) {
             bg = SELECTION_BG;
             fill_bg = true;
         } else if cursor_visible && line == cur_row && col as i32 == cur_col {
@@ -859,7 +885,7 @@ impl ApplicationHandler<Wake> for Gritty {
         self._context = Some(context);
 
         // Resume the previous workspace, or start fresh.
-        if persist::load().map_or(false, |s| !s.tabs.is_empty()) {
+        if persist::load().is_some_and(|s| !s.tabs.is_empty()) {
             self.restore_session();
         } else {
             self.new_tab();
@@ -867,11 +893,22 @@ impl ApplicationHandler<Wake> for Gritty {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
-        self.drain_pty();
+        let mut dirty = self.drain_pty();
         self.reap_dead(event_loop);
         if self.last_proc_poll.elapsed() >= Duration::from_millis(750) {
             self.update_procs();
             self.last_proc_poll = Instant::now();
+            dirty = true; // headers may have changed
+        }
+        if dirty {
+            self.schedule_redraw(event_loop);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // A deferred (throttled) frame is now due.
+        if self.redraw_pending && self.last_render.elapsed() >= FRAME {
+            self.request_redraw();
         }
     }
 
@@ -932,7 +969,10 @@ impl ApplicationHandler<Wake> for Gritty {
                 self.request_redraw();
             }
 
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            }
 
             _ => {}
         }
