@@ -37,7 +37,10 @@ pub fn deepest_descendant(procs: &[Proc], root: u32) -> Option<u32> {
 }
 
 pub fn name_of(procs: &[Proc], pid: u32) -> Option<String> {
-    procs.iter().find(|p| p.pid == pid).map(|p| strip_exe(&p.name))
+    procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .map(|p| strip_exe(&p.name))
 }
 
 fn strip_exe(name: &str) -> String {
@@ -98,13 +101,21 @@ mod tests {
     use super::*;
 
     fn p(pid: u32, ppid: u32, name: &str) -> Proc {
-        Proc { pid, ppid, name: name.into() }
+        Proc {
+            pid,
+            ppid,
+            name: name.into(),
+        }
     }
 
     #[test]
     fn finds_deepest_descendant() {
         // shell(100) -> nvim(200) -> language-server(300)
-        let procs = vec![p(100, 1, "pwsh.exe"), p(200, 100, "nvim.exe"), p(300, 200, "rust-analyzer.exe")];
+        let procs = vec![
+            p(100, 1, "pwsh.exe"),
+            p(200, 100, "nvim.exe"),
+            p(300, 200, "rust-analyzer.exe"),
+        ];
         let d = deepest_descendant(&procs, 100).unwrap();
         assert_eq!(name_of(&procs, d).unwrap(), "rust-analyzer");
     }

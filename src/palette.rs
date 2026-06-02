@@ -36,14 +36,19 @@ pub struct Palette {
 
 impl Palette {
     pub fn new() -> Self {
-        Self { query: String::new(), sel: 0 }
+        Self {
+            query: String::new(),
+            sel: 0,
+        }
     }
 
     /// Commands matching the query, best score first.
     pub fn matches(&self) -> Vec<(&'static str, Cmd)> {
         let mut scored: Vec<(i32, &'static str, Cmd)> = COMMANDS
             .iter()
-            .filter_map(|(label, cmd)| crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *cmd)))
+            .filter_map(|(label, cmd)| {
+                crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *cmd))
+            })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, l, c)| (l, c)).collect()

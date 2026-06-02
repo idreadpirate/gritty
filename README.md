@@ -71,6 +71,7 @@ essentials:
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — module map and design decisions
+- [Comparison](docs/COMPARISON.md) — gritty vs tmux and others (measured, honest)
 - [Keybindings](docs/KEYBINDINGS.md) — full reference
 - [Contributing](CONTRIBUTING.md) — build, test, and style guide
 - [Changelog](CHANGELOG.md)

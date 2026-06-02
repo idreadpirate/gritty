@@ -27,7 +27,14 @@ impl FontAtlas {
         let (m, _) = font.rasterize('M', px);
         let cell_w = m.advance_width.ceil().max(1.0) as usize;
 
-        Self { font, px, cell_w, cell_h, ascent, cache: HashMap::new() }
+        Self {
+            font,
+            px,
+            cell_w,
+            cell_h,
+            ascent,
+            cache: HashMap::new(),
+        }
     }
 
     /// Rasterized coverage bitmap for `ch`, cached.

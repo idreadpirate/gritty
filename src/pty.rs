@@ -185,6 +185,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(out.contains("line1"), "missing first line");
-        assert!(out.contains("line2000"), "missing last line (loss or deadlock)");
+        assert!(
+            out.contains("line2000"),
+            "missing last line (loss or deadlock)"
+        );
     }
 }

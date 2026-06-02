@@ -17,8 +17,8 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 
 /// Standard 16-color ANSI palette (indices 0..=15).
 const ANSI16: [u32; 16] = [
-    0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5,
-    0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
+    0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5, 0x7f7f7f,
+    0xff0000, 0x00ff00, 0xffff00, 0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff,
 ];
 
 /// Resolve a cell color; `default` is used for the Foreground/Background defaults.
@@ -71,7 +71,11 @@ fn indexed(i: u8) -> u32 {
         16..=231 => {
             let i = i - 16;
             let conv = |v: u8| -> u8 {
-                if v == 0 { 0 } else { 55 + v * 40 }
+                if v == 0 {
+                    0
+                } else {
+                    55 + v * 40
+                }
             };
             rgb(conv(i / 36), conv((i % 36) / 6), conv(i % 6))
         }

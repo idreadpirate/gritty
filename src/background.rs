@@ -18,7 +18,11 @@ const DOT_SPACING: usize = 22;
 
 impl Background {
     pub fn new() -> Self {
-        Self { px: Vec::new(), w: 0, h: 0 }
+        Self {
+            px: Vec::new(),
+            w: 0,
+            h: 0,
+        }
     }
 
     /// Recompute the cache if the size changed.
@@ -34,14 +38,19 @@ impl Background {
         let cx = w as f32 * 0.5;
         let cy = h as f32 * 0.32;
         // Farthest-corner squared distance for normalization (no sqrt per pixel).
-        let max_d2 = [(0.0, 0.0), (w as f32, 0.0), (0.0, h as f32), (w as f32, h as f32)]
-            .iter()
-            .map(|(x, y)| {
-                let dx = x - cx;
-                let dy = y - cy;
-                dx * dx + dy * dy
-            })
-            .fold(1.0f32, f32::max);
+        let max_d2 = [
+            (0.0, 0.0),
+            (w as f32, 0.0),
+            (0.0, h as f32),
+            (w as f32, h as f32),
+        ]
+        .iter()
+        .map(|(x, y)| {
+            let dx = x - cx;
+            let dy = y - cy;
+            dx * dx + dy * dy
+        })
+        .fold(1.0f32, f32::max);
 
         for y in 0..h {
             for x in 0..w {
@@ -89,6 +98,9 @@ mod tests {
         // Both chosen off the dot grid (coords not multiples of DOT_SPACING).
         let center = bg.px[10 * 40 + 20]; // (20,10)
         let edge = bg.px[29 * 40 + 39]; // (39,29)
-        assert!(center > edge, "center {center:#x} not brighter than edge {edge:#x}");
+        assert!(
+            center > edge,
+            "center {center:#x} not brighter than edge {edge:#x}"
+        );
     }
 }

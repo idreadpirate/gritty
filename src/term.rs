@@ -114,9 +114,16 @@ mod tests {
             t.feed(b"line\r\n");
         }
         t.scroll(3);
-        assert!(t.display_offset() > 0, "scrolling up should leave the bottom");
+        assert!(
+            t.display_offset() > 0,
+            "scrolling up should leave the bottom"
+        );
         t.scroll_to_bottom();
-        assert_eq!(t.display_offset(), 0, "scroll_to_bottom should return to live view");
+        assert_eq!(
+            t.display_offset(),
+            0,
+            "scroll_to_bottom should return to live view"
+        );
     }
 
     #[test]

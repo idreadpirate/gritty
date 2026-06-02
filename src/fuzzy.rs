@@ -3,7 +3,11 @@
 /// Score `text` against `query` (case-insensitive). Higher is better;
 /// None means `query` is not a subsequence of `text`.
 pub fn score(query: &str, text: &str) -> Option<i32> {
-    let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let q: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     if q.is_empty() {
         return Some(0);
     }

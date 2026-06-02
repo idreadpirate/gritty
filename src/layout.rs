@@ -34,15 +34,35 @@ pub fn child_areas(axis: Axis, ratio: f32, area: Rect) -> (Rect, Rect) {
         Axis::LeftRight => {
             let wa = ((area.w as f32) * ratio).round() as usize;
             (
-                Rect { x: area.x, y: area.y, w: wa, h: area.h },
-                Rect { x: area.x + wa, y: area.y, w: area.w.saturating_sub(wa), h: area.h },
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    w: wa,
+                    h: area.h,
+                },
+                Rect {
+                    x: area.x + wa,
+                    y: area.y,
+                    w: area.w.saturating_sub(wa),
+                    h: area.h,
+                },
             )
         }
         Axis::TopBottom => {
             let ha = ((area.h as f32) * ratio).round() as usize;
             (
-                Rect { x: area.x, y: area.y, w: area.w, h: ha },
-                Rect { x: area.x, y: area.y + ha, w: area.w, h: area.h.saturating_sub(ha) },
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    w: area.w,
+                    h: ha,
+                },
+                Rect {
+                    x: area.x,
+                    y: area.y + ha,
+                    w: area.w,
+                    h: area.h.saturating_sub(ha),
+                },
             )
         }
     }
@@ -106,18 +126,16 @@ impl Node {
                     Some(Node::Leaf(id))
                 }
             }
-            Node::Split { axis, ratio, a, b } => {
-                match (a.without(target), b.without(target)) {
-                    (Some(a), Some(b)) => Some(Node::Split {
-                        axis,
-                        ratio,
-                        a: Box::new(a),
-                        b: Box::new(b),
-                    }),
-                    (Some(n), None) | (None, Some(n)) => Some(n),
-                    (None, None) => None,
-                }
-            }
+            Node::Split { axis, ratio, a, b } => match (a.without(target), b.without(target)) {
+                (Some(a), Some(b)) => Some(Node::Split {
+                    axis,
+                    ratio,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                }),
+                (Some(n), None) | (None, Some(n)) => Some(n),
+                (None, None) => None,
+            },
         }
     }
 
@@ -244,7 +262,12 @@ impl Node {
 mod tests {
     use super::*;
 
-    const AREA: Rect = Rect { x: 0, y: 0, w: 100, h: 60 };
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 60,
+    };
 
     fn rects(node: &Node) -> Vec<(usize, Rect)> {
         let mut v = Vec::new();
@@ -263,8 +286,30 @@ mod tests {
         let mut n = Node::Leaf(0);
         assert!(n.split_leaf(0, 1, Axis::LeftRight));
         let r = rects(&n);
-        assert_eq!(r[0], (0, Rect { x: 0, y: 0, w: 50, h: 60 }));
-        assert_eq!(r[1], (1, Rect { x: 50, y: 0, w: 50, h: 60 }));
+        assert_eq!(
+            r[0],
+            (
+                0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 50,
+                    h: 60
+                }
+            )
+        );
+        assert_eq!(
+            r[1],
+            (
+                1,
+                Rect {
+                    x: 50,
+                    y: 0,
+                    w: 50,
+                    h: 60
+                }
+            )
+        );
     }
 
     #[test]
@@ -272,8 +317,30 @@ mod tests {
         let mut n = Node::Leaf(0);
         assert!(n.split_leaf(0, 1, Axis::TopBottom));
         let r = rects(&n);
-        assert_eq!(r[0], (0, Rect { x: 0, y: 0, w: 100, h: 30 }));
-        assert_eq!(r[1], (1, Rect { x: 0, y: 30, w: 100, h: 30 }));
+        assert_eq!(
+            r[0],
+            (
+                0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 30
+                }
+            )
+        );
+        assert_eq!(
+            r[1],
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 30,
+                    w: 100,
+                    h: 30
+                }
+            )
+        );
     }
 
     #[test]

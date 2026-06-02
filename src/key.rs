@@ -52,7 +52,10 @@ mod tests {
 
     #[test]
     fn enter_is_cr() {
-        assert_eq!(encode(&Key::Named(NamedKey::Enter), ModifiersState::empty()), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Enter), ModifiersState::empty()),
+            Some(b"\r".to_vec())
+        );
     }
 
     #[test]

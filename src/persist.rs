@@ -84,8 +84,14 @@ mod tests {
                         b: Box::new(Node::Leaf(1)),
                     },
                     panes: vec![
-                        SavedPane { id: 0, name: "editor".into() },
-                        SavedPane { id: 1, name: "logs".into() },
+                        SavedPane {
+                            id: 0,
+                            name: "editor".into(),
+                        },
+                        SavedPane {
+                            id: 1,
+                            name: "logs".into(),
+                        },
                     ],
                 },
                 SavedTab {
@@ -94,7 +100,10 @@ mod tests {
                     focus: 0,
                     next_id: 1,
                     tree: Node::Leaf(0),
-                    panes: vec![SavedPane { id: 0, name: "term 1".into() }],
+                    panes: vec![SavedPane {
+                        id: 0,
+                        name: "term 1".into(),
+                    }],
                 },
             ],
         }

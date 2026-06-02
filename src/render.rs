@@ -12,7 +12,11 @@ pub struct Cell {
 }
 
 fn buf_height(buf: &[u32], stride: usize) -> usize {
-    if stride == 0 { 0 } else { buf.len() / stride }
+    if stride == 0 {
+        0
+    } else {
+        buf.len() / stride
+    }
 }
 
 /// Fill a rectangle (clamped to the buffer) with a solid color.
@@ -33,10 +37,50 @@ pub fn stroke_rect(buf: &mut [u32], stride: usize, rect: Rect, color: u32) {
     if rect.w == 0 || rect.h == 0 {
         return;
     }
-    fill_rect(buf, stride, Rect { x: rect.x, y: rect.y, w: rect.w, h: 1 }, color);
-    fill_rect(buf, stride, Rect { x: rect.x, y: rect.y + rect.h - 1, w: rect.w, h: 1 }, color);
-    fill_rect(buf, stride, Rect { x: rect.x, y: rect.y, w: 1, h: rect.h }, color);
-    fill_rect(buf, stride, Rect { x: rect.x + rect.w - 1, y: rect.y, w: 1, h: rect.h }, color);
+    fill_rect(
+        buf,
+        stride,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: 1,
+        },
+        color,
+    );
+    fill_rect(
+        buf,
+        stride,
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.h - 1,
+            w: rect.w,
+            h: 1,
+        },
+        color,
+    );
+    fill_rect(
+        buf,
+        stride,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: 1,
+            h: rect.h,
+        },
+        color,
+    );
+    fill_rect(
+        buf,
+        stride,
+        Rect {
+            x: rect.x + rect.w - 1,
+            y: rect.y,
+            w: 1,
+            h: rect.h,
+        },
+        color,
+    );
 }
 
 /// Draw one cell with its top-left at pixel (px, py), clipped to `clip`.
@@ -132,7 +176,16 @@ pub fn draw_text(
 ) {
     let cw = font.cell_w;
     for (i, ch) in text.chars().enumerate() {
-        draw_cell(buf, stride, font, px + i * cw, py, Cell { ch, fg, bg }, fill_bg, clip);
+        draw_cell(
+            buf,
+            stride,
+            font,
+            px + i * cw,
+            py,
+            Cell { ch, fg, bg },
+            fill_bg,
+            clip,
+        );
     }
 }
 
@@ -152,7 +205,12 @@ mod tests {
     use crate::font::FontAtlas;
 
     fn full(stride: usize, height: usize) -> Rect {
-        Rect { x: 0, y: 0, w: stride, h: height }
+        Rect {
+            x: 0,
+            y: 0,
+            w: stride,
+            h: height,
+        }
     }
 
     #[test]
@@ -167,8 +225,20 @@ mod tests {
         let stride = font.cell_w * 2;
         let height = font.cell_h * 2;
         let mut buf = vec![0x0011_1111u32; stride * height];
-        draw_cell(&mut buf, stride, &mut font, 0, 0,
-            Cell { ch: 'M', fg: 0x00ff_ffff, bg: 0x0011_1111 }, true, full(stride, height));
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: 'M',
+                fg: 0x00ff_ffff,
+                bg: 0x0011_1111,
+            },
+            true,
+            full(stride, height),
+        );
         let marked = buf.iter().filter(|&&p| p != 0x0011_1111).count();
         assert!(marked > 0, "glyph 'M' drew no foreground pixels");
     }
@@ -179,9 +249,24 @@ mod tests {
         let stride = font.cell_w;
         let height = font.cell_h;
         let mut buf = vec![0x0011_1111u32; stride * height];
-        draw_cell(&mut buf, stride, &mut font, 0, 0,
-            Cell { ch: ' ', fg: 0x00ff_ffff, bg: 0x0022_2222 }, true, full(stride, height));
-        assert!(buf.iter().all(|&p| p == 0x0022_2222), "space must be pure bg");
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: ' ',
+                fg: 0x00ff_ffff,
+                bg: 0x0022_2222,
+            },
+            true,
+            full(stride, height),
+        );
+        assert!(
+            buf.iter().all(|&p| p == 0x0022_2222),
+            "space must be pure bg"
+        );
     }
 
     #[test]
@@ -190,9 +275,24 @@ mod tests {
         let stride = font.cell_w;
         let height = font.cell_h;
         let mut buf = vec![0x00ab_cdefu32; stride * height];
-        draw_cell(&mut buf, stride, &mut font, 0, 0,
-            Cell { ch: ' ', fg: 0x00ff_ffff, bg: 0x0022_2222 }, false, full(stride, height));
-        assert!(buf.iter().all(|&p| p == 0x00ab_cdef), "no-fill space must not touch buffer");
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: ' ',
+                fg: 0x00ff_ffff,
+                bg: 0x0022_2222,
+            },
+            false,
+            full(stride, height),
+        );
+        assert!(
+            buf.iter().all(|&p| p == 0x00ab_cdef),
+            "no-fill space must not touch buffer"
+        );
     }
 
     #[test]
@@ -203,9 +303,29 @@ mod tests {
         let cwid = font.cell_w;
         let mut buf = vec![0x0000_0000u32; stride * height];
         // Clip to the left half only; draw a filled cell in the right half.
-        let clip = Rect { x: 0, y: 0, w: cwid, h: height };
-        draw_cell(&mut buf, stride, &mut font, cwid, 0,
-            Cell { ch: ' ', fg: 0xfff, bg: 0x00ff_ffff }, true, clip);
-        assert!(buf.iter().all(|&p| p == 0), "clip must prevent drawing outside it");
+        let clip = Rect {
+            x: 0,
+            y: 0,
+            w: cwid,
+            h: height,
+        };
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            cwid,
+            0,
+            Cell {
+                ch: ' ',
+                fg: 0xfff,
+                bg: 0x00ff_ffff,
+            },
+            true,
+            clip,
+        );
+        assert!(
+            buf.iter().all(|&p| p == 0),
+            "clip must prevent drawing outside it"
+        );
     }
 }

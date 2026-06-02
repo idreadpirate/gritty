@@ -25,10 +25,21 @@ impl Pane {
         let waker = move || {
             let _ = proxy.send_event(Wake);
         };
-        let pty = Pty::spawn("pwsh.exe", &["-NoLogo"], rows as u16, cols as u16, waker.clone())
-            .or_else(|_| Pty::spawn("cmd.exe", &[], rows as u16, cols as u16, waker))
-            .expect("spawn a native shell");
-        Self { term, pty, name, proc_name: String::new() }
+        let pty = Pty::spawn(
+            "pwsh.exe",
+            &["-NoLogo"],
+            rows as u16,
+            cols as u16,
+            waker.clone(),
+        )
+        .or_else(|_| Pty::spawn("cmd.exe", &[], rows as u16, cols as u16, waker))
+        .expect("spawn a native shell");
+        Self {
+            term,
+            pty,
+            name,
+            proc_name: String::new(),
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -51,10 +62,23 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(name: String, color: u32, cols: usize, rows: usize, proxy: EventLoopProxy<Wake>) -> Self {
+    pub fn new(
+        name: String,
+        color: u32,
+        cols: usize,
+        rows: usize,
+        proxy: EventLoopProxy<Wake>,
+    ) -> Self {
         let mut panes = HashMap::new();
         panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy));
-        Self { panes, tree: Node::Leaf(0), focus: 0, name, color, next_id: 1 }
+        Self {
+            panes,
+            tree: Node::Leaf(0),
+            focus: 0,
+            name,
+            color,
+            next_id: 1,
+        }
     }
 
     /// Rebuild a tab from a saved snapshot, spawning a fresh shell per pane.
