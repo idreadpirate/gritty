@@ -7,6 +7,84 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
 
+/// Percent-decode a URI path component.  Only `%XX` sequences are decoded;
+/// everything else is passed through unchanged.  Invalid sequences (non-hex
+/// digits, truncated) are left as-is rather than producing replacement chars.
+///
+/// This is a pure, dependency-free helper — the only external encoding used
+/// in OSC 7 URIs is `%XX` for non-ASCII/reserved bytes.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = bytes[i + 1];
+            let lo = bytes[i + 2];
+            if let (Some(h), Some(l)) = (hex_digit(hi), hex_digit(lo)) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // The path is guaranteed to be UTF-8 on shells that emit OSC 7 correctly.
+    // Fall back to lossy conversion so malformed bytes never panic.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse an OSC 7 `file://host/path` URI into an OS path string.
+///
+/// The format is `file://[host]/path`; on Windows the path begins with a
+/// leading `/` then the drive letter, e.g. `/C:/Users/…`.  We strip that
+/// leading `/` and convert forward slashes to backslashes so the result is
+/// usable directly as a `cwd` argument.
+///
+/// Returns `None` if the string does not start with `file://`.
+fn osc7_uri_to_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    // Skip the (possibly empty) host component up to the first `/`.
+    let path_part = if let Some(slash) = rest.find('/') {
+        &rest[slash..] // includes the leading '/'
+    } else {
+        return None; // no path at all
+    };
+    let decoded = percent_decode(path_part);
+
+    // On Windows the URI path looks like `/C:/Users/foo`.
+    // Strip the leading slash before the drive letter.
+    #[cfg(windows)]
+    let decoded = {
+        // Strip leading '/' only when followed by a drive letter + ':'
+        // (e.g. "/C:/…" → "C:\…").
+        if decoded.len() >= 3
+            && decoded.starts_with('/')
+            && decoded.as_bytes()[1].is_ascii_alphabetic()
+            && decoded.as_bytes()[2] == b':'
+        {
+            decoded[1..].replace('/', "\\")
+        } else {
+            decoded
+        }
+    };
+
+    #[cfg(not(windows))]
+    let decoded = decoded;
+
+    Some(decoded)
+}
+
 #[derive(Clone, Copy)]
 pub struct TermSize {
     pub cols: usize,
@@ -68,6 +146,9 @@ pub struct Terminal {
     // `title()` may not be wired up yet.
     #[allow(dead_code)]
     title: Arc<Mutex<String>>,
+    /// Latest working-directory path announced via OSC 7, or `None` if none
+    /// has been received yet.
+    cwd: Option<String>,
 }
 
 impl Terminal {
@@ -85,6 +166,7 @@ impl Terminal {
             parser: Processor::new(),
             size,
             title,
+            cwd: None,
         }
     }
 
@@ -98,9 +180,72 @@ impl Terminal {
         self.title.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// Returns the latest working directory announced via OSC 7, or `None`.
+    pub fn cwd(&self) -> Option<String> {
+        self.cwd.clone()
+    }
+
     /// Feed raw PTY output through the VT parser into the grid.
+    ///
+    /// In addition to advancing the VT state machine, we scan `bytes` for
+    /// OSC 7 sequences (`ESC ] 7 ; <uri> BEL` or `ESC ] 7 ; <uri> ST`).
+    /// Alacritty's event model does not surface OSC 7, so we detect it in the
+    /// raw byte stream ourselves — the same approach used by WezTerm, kitty,
+    /// and foot.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        self.scan_osc7(bytes);
+    }
+
+    /// Scan a raw PTY chunk for `ESC ] 7 ; <uri> BEL` or `ESC ] 7 ; <uri> ST`
+    /// sequences and update `self.cwd` when found.
+    ///
+    /// We look for the literal prefix `\x1b]7;` and then collect bytes until
+    /// BEL (`\x07`) or the two-byte string-terminator `\x1b\\`.  Multiple
+    /// occurrences in one chunk are handled; only the last one wins (matches
+    /// the order in which a shell emits them).
+    fn scan_osc7(&mut self, bytes: &[u8]) {
+        // The OSC 7 prefix as raw bytes: ESC ] 7 ;
+        const PREFIX: &[u8] = b"\x1b]7;";
+        let mut i = 0;
+        while i + PREFIX.len() < bytes.len() {
+            // Find the next prefix occurrence.
+            let Some(offset) = bytes[i..].windows(PREFIX.len()).position(|w| w == PREFIX) else {
+                break;
+            };
+            let start = i + offset + PREFIX.len(); // first byte of the URI
+
+            // Collect the URI up to BEL or ST.
+            let mut end = None;
+            let mut j = start;
+            while j < bytes.len() {
+                if bytes[j] == b'\x07' {
+                    // BEL terminator
+                    end = Some((j, j + 1));
+                    break;
+                }
+                if bytes[j] == b'\x1b' && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                    // ST (String Terminator) = ESC \
+                    end = Some((j, j + 2));
+                    break;
+                }
+                j += 1;
+            }
+
+            if let Some((uri_end, next_i)) = end {
+                if let Ok(uri) = std::str::from_utf8(&bytes[start..uri_end]) {
+                    if let Some(path) = osc7_uri_to_path(uri) {
+                        self.cwd = Some(path);
+                    }
+                }
+                i = next_i;
+            } else {
+                // No terminator found; skip past this prefix to avoid an
+                // infinite loop, but stop scanning (partial sequence at end
+                // of chunk — the shell will retransmit on the next prompt).
+                break;
+            }
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -291,5 +436,75 @@ mod tests {
         // Drive a second OSC 0 to update:
         t.feed(b"\x1b]0;updated\x07");
         assert_eq!(t.title(), "updated");
+    }
+
+    // --- OSC 7 (shell cwd) tests ---
+
+    #[test]
+    fn osc7_bel_terminator_updates_cwd() {
+        let mut t = Terminal::new(80, 24);
+        assert!(t.cwd().is_none(), "cwd starts empty");
+        // Windows-style URI: file://hostname/C:/Users/alice
+        t.feed(b"\x1b]7;file://myhost/C:/Users/alice\x07");
+        let cwd = t.cwd().expect("cwd should be set after OSC 7");
+        // On Windows the leading '/' is stripped and slashes converted.
+        #[cfg(windows)]
+        assert_eq!(cwd, "C:\\Users\\alice");
+        #[cfg(not(windows))]
+        assert_eq!(cwd, "/C:/Users/alice");
+    }
+
+    #[test]
+    fn osc7_st_terminator_updates_cwd() {
+        let mut t = Terminal::new(80, 24);
+        // Use ST (ESC \) as the terminator instead of BEL.
+        t.feed(b"\x1b]7;file:///tmp/work\x1b\\");
+        let cwd = t.cwd().expect("cwd should be set with ST terminator");
+        assert_eq!(cwd, "/tmp/work");
+    }
+
+    #[test]
+    fn osc7_last_sequence_wins() {
+        let mut t = Terminal::new(80, 24);
+        // Two OSC 7 sequences in one chunk; the last one should win.
+        t.feed(b"\x1b]7;file:///first\x07\x1b]7;file:///second\x07");
+        assert_eq!(t.cwd().as_deref(), Some("/second"));
+    }
+
+    #[test]
+    fn osc7_percent_decode_in_path() {
+        let mut t = Terminal::new(80, 24);
+        // Space encoded as %20.
+        t.feed(b"\x1b]7;file:///my%20dir\x07");
+        assert_eq!(t.cwd().as_deref(), Some("/my dir"));
+    }
+
+    // --- percent_decode unit tests ---
+
+    #[test]
+    fn percent_decode_plain_string() {
+        assert_eq!(percent_decode("hello"), "hello");
+    }
+
+    #[test]
+    fn percent_decode_space() {
+        assert_eq!(percent_decode("my%20dir"), "my dir");
+    }
+
+    #[test]
+    fn percent_decode_mixed() {
+        assert_eq!(percent_decode("a%2Fb%20c"), "a/b c");
+    }
+
+    #[test]
+    fn percent_decode_invalid_sequence_passed_through() {
+        // %XX where XX are not valid hex — leave as-is.
+        assert_eq!(percent_decode("a%ZZb"), "a%ZZb");
+    }
+
+    #[test]
+    fn percent_decode_truncated_at_end() {
+        // Percent sign at the very end with only one hex digit — leave as-is.
+        assert_eq!(percent_decode("a%2"), "a%2");
     }
 }

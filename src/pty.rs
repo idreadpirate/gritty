@@ -28,7 +28,15 @@ pub struct Pty {
 impl Pty {
     /// Spawn `program args...` on a fresh PTY of the given size.
     /// `waker` is called whenever new output arrives, so the UI loop can wake.
-    pub fn spawn<W>(program: &str, args: &[&str], rows: u16, cols: u16, waker: W) -> Result<Self>
+    /// When `cwd` is `Some(path)`, the child process starts in that directory.
+    pub fn spawn<W>(
+        program: &str,
+        args: &[&str],
+        rows: u16,
+        cols: u16,
+        waker: W,
+        cwd: Option<&str>,
+    ) -> Result<Self>
     where
         W: Fn() + Send + 'static,
     {
@@ -43,6 +51,9 @@ impl Pty {
         let mut cmd = CommandBuilder::new(program);
         for a in args {
             cmd.arg(a);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
         }
         let child = pair.slave.spawn_command(cmd)?;
         let killer = child.clone_killer();
@@ -139,7 +150,7 @@ mod tests {
 
     #[test]
     fn conpty_echo_roundtrips() {
-        let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {})
+        let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {}, None)
             .expect("spawn cmd.exe over ConPTY");
 
         let mut out = Vec::new();
@@ -167,6 +178,7 @@ mod tests {
             24,
             80,
             || {},
+            None,
         )
         .expect("spawn");
 

@@ -69,7 +69,13 @@ fn shell_candidates() -> Vec<(String, Vec<&'static str>)> {
 }
 
 impl Pane {
-    pub fn new(name: String, cols: usize, rows: usize, proxy: EventLoopProxy<Wake>) -> Self {
+    pub fn new(
+        name: String,
+        cols: usize,
+        rows: usize,
+        proxy: EventLoopProxy<Wake>,
+        cwd: Option<&str>,
+    ) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let term = Terminal::new(cols, rows);
@@ -81,7 +87,7 @@ impl Pane {
             if !std::path::Path::new(&path).exists() {
                 continue;
             }
-            if let Ok(p) = Pty::spawn(&path, &args, rows as u16, cols as u16, waker.clone()) {
+            if let Ok(p) = Pty::spawn(&path, &args, rows as u16, cols as u16, waker.clone(), cwd) {
                 pty = Some(p);
                 break;
             }
@@ -127,7 +133,7 @@ impl Tab {
         proxy: EventLoopProxy<Wake>,
     ) -> Self {
         let mut panes = HashMap::new();
-        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy));
+        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None));
         Self {
             panes,
             tree: Node::Leaf(0),
@@ -150,7 +156,7 @@ impl Tab {
         let (plan, focus, next_id) = plan_from_saved(saved);
         let mut panes = HashMap::new();
         for (id, name) in plan {
-            panes.insert(id, Pane::new(name, cols, rows, proxy.clone()));
+            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None));
         }
         Self {
             panes,
@@ -172,13 +178,18 @@ impl Tab {
     }
 
     /// Split the focused pane along `axis`, focusing the new pane.
+    /// The new pane inherits the focused pane's working directory (OSC 7 cwd).
     pub fn split(&mut self, axis: Axis, proxy: EventLoopProxy<Wake>) {
         let id = self.next_id;
         if self.tree.split_leaf(self.focus, id, axis) {
             self.next_id += 1;
             let name = format!("term {}", id + 1);
+            // Read the focused pane's latest OSC 7 cwd (if any) so the new
+            // shell starts in the same directory.
+            let inherited_cwd = self.panes.get(&self.focus).and_then(|p| p.term.cwd());
             // Sized properly on the next relayout.
-            self.panes.insert(id, Pane::new(name, 80, 24, proxy));
+            self.panes
+                .insert(id, Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref()));
             self.focus = id;
         }
     }
