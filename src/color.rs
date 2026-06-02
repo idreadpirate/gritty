@@ -120,9 +120,9 @@ mod tests {
         assert_eq!(to_rgb(Color::Indexed(16), FG), 0x0000_0000);
         // index 231 is the cube max: all channels 55 + 5*40 = 255.
         assert_eq!(to_rgb(Color::Indexed(231), FG), 0x00ff_ffff);
-        // a mid cube value exercises the non-zero conversion on each channel.
-        assert_eq!(to_rgb(Color::Indexed(16 + 43), FG), {
-            let v = 55 + 40; // step 1 on r and b
+        // a mid cube value: index 53 = 16 + 37 → i=37=1*36+1 → r=1,g=0,b=1 → rgb(95,0,95).
+        assert_eq!(to_rgb(Color::Indexed(16 + 37), FG), {
+            let v = 55 + 40; // step 1 on r and b, step 0 on g
             rgb(v, 0, v)
         });
     }
@@ -148,12 +148,24 @@ mod tests {
         assert_eq!(to_rgb(Color::Named(NamedColor::White), FG), ANSI16[7]);
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlack), FG), ANSI16[8]);
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightRed), FG), ANSI16[9]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightGreen), FG), ANSI16[10]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightYellow), FG), ANSI16[11]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightGreen), FG),
+            ANSI16[10]
+        );
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightYellow), FG),
+            ANSI16[11]
+        );
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightBlue), FG), ANSI16[12]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightMagenta), FG), ANSI16[13]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightMagenta), FG),
+            ANSI16[13]
+        );
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightCyan), FG), ANSI16[14]);
-        assert_eq!(to_rgb(Color::Named(NamedColor::BrightWhite), FG), ANSI16[15]);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::BrightWhite), FG),
+            ANSI16[15]
+        );
     }
 
     #[test]
@@ -166,7 +178,10 @@ mod tests {
         assert_eq!(to_rgb(Color::Named(NamedColor::DimMagenta), FG), 0x80_0080);
         assert_eq!(to_rgb(Color::Named(NamedColor::DimCyan), FG), 0x00_8080);
         assert_eq!(to_rgb(Color::Named(NamedColor::DimWhite), FG), 0x80_8080);
-        assert_eq!(to_rgb(Color::Named(NamedColor::DimForeground), FG), 0x80_8080);
+        assert_eq!(
+            to_rgb(Color::Named(NamedColor::DimForeground), FG),
+            0x80_8080
+        );
     }
 
     #[test]
@@ -214,7 +229,7 @@ pub fn style_flags(mut fg: u32, mut bg: u32, flags: Flags) -> (u32, u32, bool) {
 }
 
 #[cfg(test)]
-mod tests {
+mod style_tests {
     use super::*;
 
     #[test]

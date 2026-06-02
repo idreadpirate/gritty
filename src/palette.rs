@@ -1,6 +1,6 @@
 // Command palette: a fuzzy-searchable list of actions (the "Control Center").
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
     SplitRight,
     SplitDown,

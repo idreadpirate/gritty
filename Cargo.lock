@@ -633,6 +633,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softbuffer",
+ "toml",
  "windows-sys 0.59.0",
  "winit",
  "winresource",

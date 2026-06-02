@@ -1,6 +1,8 @@
 // Wraps alacritty_terminal's VT engine: parse PTY bytes into a grid we can read.
 
-use alacritty_terminal::event::VoidListener;
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
@@ -23,10 +25,49 @@ impl Dimensions for TermSize {
     }
 }
 
+/// Captures OSC 0/2 window title events emitted by the VT parser.
+///
+/// `EventListener::send_event` takes `&self`, so interior mutability
+/// (Arc<Mutex>) is required to update the title without `&mut self`.
+/// The same `Arc` is held by `Terminal` so callers can read the current title.
+#[derive(Clone)]
+pub(crate) struct TitleListener {
+    title: Arc<Mutex<String>>,
+}
+
+impl TitleListener {
+    fn new(title: Arc<Mutex<String>>) -> Self {
+        Self { title }
+    }
+}
+
+impl EventListener for TitleListener {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::Title(new_title) => {
+                if let Ok(mut guard) = self.title.lock() {
+                    *guard = new_title;
+                }
+            }
+            Event::ResetTitle => {
+                if let Ok(mut guard) = self.title.lock() {
+                    guard.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct Terminal {
-    pub term: Term<VoidListener>,
+    pub term: Term<TitleListener>,
     parser: Processor,
     pub size: TermSize,
+    // Shared with TitleListener; updated on every OSC 0/2 event.
+    // `#[allow(dead_code)]` silences the lint for the binary crate where
+    // `title()` may not be wired up yet.
+    #[allow(dead_code)]
+    title: Arc<Mutex<String>>,
 }
 
 impl Terminal {
@@ -36,12 +77,25 @@ impl Terminal {
             scrolling_history: 5000,
             ..Config::default()
         };
-        let term = Term::new(config, &size, VoidListener);
+        let title = Arc::new(Mutex::new(String::new()));
+        let listener = TitleListener::new(Arc::clone(&title));
+        let term = Term::new(config, &size, listener);
         Self {
             term,
             parser: Processor::new(),
             size,
+            title,
         }
+    }
+
+    /// Returns the latest window title set via OSC 0/2, or an empty string if
+    /// none has been set (or after a `ResetTitle` event).
+    // `dead_code` suppressed: callers will wire this up in app.rs/main.rs;
+    // the method is `pub` but binary-crate reachability analysis still flags it
+    // when no call site exists yet.
+    #[allow(dead_code)]
+    pub fn title(&self) -> String {
+        self.title.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Feed raw PTY output through the VT parser into the grid.
@@ -218,5 +272,24 @@ mod tests {
         assert_eq!(s.columns(), 7);
         assert_eq!(s.screen_lines(), 3);
         assert_eq!(s.total_lines(), 3);
+    }
+
+    #[test]
+    fn osc_title_captured_via_osc0() {
+        let mut t = Terminal::new(80, 24);
+        // OSC 0 ; <title> ST — sets icon name *and* window title.
+        t.feed(b"\x1b]0;hello\x07");
+        assert_eq!(t.title(), "hello", "title should reflect OSC 0 payload");
+    }
+
+    #[test]
+    fn osc_title_updated_and_reset() {
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b]2;world\x07");
+        assert_eq!(t.title(), "world");
+        // OSC 104 (reset colors) → ResetTitle not triggered; OSC l (xterm iconName) - skip.
+        // Drive a second OSC 0 to update:
+        t.feed(b"\x1b]0;updated\x07");
+        assert_eq!(t.title(), "updated");
     }
 }

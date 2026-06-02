@@ -315,10 +315,10 @@ mod tests {
         // row 0 untouched
         assert!(buf[0..4].iter().all(|&p| p == 0));
         // (1,1)..(3,2) painted
-        assert_eq!(buf[1 * stride + 1], 0x00ab_cdef);
+        assert_eq!(buf[stride + 1], 0x00ab_cdef);
         assert_eq!(buf[2 * stride + 3], 0x00ab_cdef);
         // (0,1) left of rect stays clear
-        assert_eq!(buf[1 * stride], 0);
+        assert_eq!(buf[stride], 0);
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(buf[4], c); // top-right
         assert_eq!(buf[4 * stride], c); // bottom-left
         assert_eq!(buf[4 * stride + 4], c); // bottom-right
-        // interior pixel untouched
+                                            // interior pixel untouched
         assert_eq!(buf[2 * stride + 2], 0);
     }
 
