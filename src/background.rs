@@ -9,11 +9,11 @@ pub struct Background {
     h: usize,
 }
 
-// Edge color (deep near-black) and center glow (subtle indigo).
-const EDGE: (i32, i32, i32) = (0x10, 0x10, 0x16);
-const GLOW: (i32, i32, i32) = (0x20, 0x1e, 0x30);
+// Edge (deep indigo-charcoal, matches BG) and center glow (desaturated plum).
+const EDGE: (i32, i32, i32) = (0x12, 0x11, 0x1a);
+const GLOW: (i32, i32, i32) = (0x22, 0x1e, 0x2e);
 // Dotted grid.
-const DOT_ADD: (i32, i32, i32) = (0x12, 0x12, 0x1c);
+const DOT_ADD: (i32, i32, i32) = (0x16, 0x12, 0x1c);
 const DOT_SPACING: usize = 22;
 
 impl Background {

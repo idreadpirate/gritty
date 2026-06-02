@@ -42,14 +42,14 @@ use session::Tab;
 #[derive(Debug, Clone, Copy)]
 struct Wake;
 
-/// Edgy neon accents — each new tab takes the next one.
+/// Industrial gunmetal/amber accents — each new tab takes the next one.
 const TAB_PALETTE: [u32; 6] = [
-    0x00ff_3d9a, // pink
-    0x003d_f0ff, // cyan
-    0x004d_ff88, // green
-    0x00ff_a23d, // orange
-    0x00b4_5cff, // purple
-    0x00ff_e04d, // yellow
+    0x00ff_7b00, // molten orange
+    0x00e6_9522, // industrial amber
+    0x00c0_8a4a, // bronze
+    0x00b8_7333, // copper
+    0x007f_a6c9, // steel blue
+    0x00d4_a017, // gold
 ];
 
 #[derive(Clone, Copy)]
@@ -1275,8 +1275,9 @@ impl Gritty {
     }
 }
 
-/// Paint the OS title bar (the caption that shows "gritty") solid white, with
-/// dark caption text so it stays readable. Windows 11 only; a no-op elsewhere.
+/// Paint the OS title bar (the caption that shows "gritty") the same
+/// indigo-charcoal as the app body with steel-grey text, so the icon sits in a
+/// seamless dark header. Windows 11 only; a no-op elsewhere.
 #[cfg(windows)]
 fn style_caption(window: &Window) {
     use windows_sys::Win32::Graphics::Dwm::{
@@ -1291,19 +1292,19 @@ fn style_caption(window: &Window) {
         return;
     };
     let hwnd = w.hwnd.get() as *mut core::ffi::c_void;
-    let white: u32 = 0x00FF_FFFF; // COLORREF 0x00BBGGRR
-    let dark: u32 = 0x0020_2020;
+    let caption: u32 = 0x001F_1516; // #16151F indigo-charcoal as BBGGRR
+    let text: u32 = 0x00D9_D1C9; // #C9D1D9 steel grey as BBGGRR
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_CAPTION_COLOR as u32,
-            &white as *const u32 as *const core::ffi::c_void,
+            &caption as *const u32 as *const core::ffi::c_void,
             4,
         );
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_TEXT_COLOR as u32,
-            &dark as *const u32 as *const core::ffi::c_void,
+            &text as *const u32 as *const core::ffi::c_void,
             4,
         );
     }

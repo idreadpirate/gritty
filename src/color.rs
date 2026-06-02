@@ -2,14 +2,15 @@
 
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-pub const FG: u32 = 0x00d0_d0d0;
-pub const BG: u32 = 0x0018_1818;
-pub const CURSOR: u32 = 0x00ff_3d9a; // gritty pink accent (from the logo)
-pub const SELECTION_BG: u32 = 0x0050_2a44;
-pub const ACCENT: u32 = 0x00ff_3d9a; // focused pane / active tab
-pub const UI_BAR_BG: u32 = 0x0014_141a; // tab bar
-pub const UI_TITLE_BG: u32 = 0x001e_1e26; // inactive pane title
-pub const UI_DIM: u32 = 0x00a0_a0a8; // inactive UI text
+// gritty "gunmetal & amber" theme — pulled from the industrial skull icon.
+pub const FG: u32 = 0x00c9_d1d9; // steel light-grey text
+pub const BG: u32 = 0x0016_151f; // deep indigo-charcoal
+pub const CURSOR: u32 = 0x00ff_7b00; // molten orange (the skull's inner glow)
+pub const SELECTION_BG: u32 = 0x003a_2e20; // warm gunmetal
+pub const ACCENT: u32 = 0x00ff_7b00; // focused pane / active tab — molten orange
+pub const UI_BAR_BG: u32 = 0x0016_151f; // tab bar — matches BG (seamless top)
+pub const UI_TITLE_BG: u32 = 0x001e_1c28; // inactive pane title
+pub const UI_DIM: u32 = 0x008c_6d47; // inactive UI text — bronze
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
