@@ -59,6 +59,18 @@ impl Terminal {
         self.term.grid().display_offset()
     }
 
+    /// Scroll the viewport by `lines` (positive = up into history).
+    pub fn scroll(&mut self, lines: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Jump back to the live bottom of the output.
+    pub fn scroll_to_bottom(&mut self) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
     /// True if the running program enabled bracketed paste mode.
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
@@ -93,6 +105,18 @@ mod tests {
     #[test]
     fn wrap_paste_bracketed_wraps() {
         assert_eq!(wrap_paste("x", true), b"\x1b[200~x\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn scroll_up_then_bottom() {
+        let mut t = Terminal::new(20, 5);
+        for _ in 0..50 {
+            t.feed(b"line\r\n");
+        }
+        t.scroll(3);
+        assert!(t.display_offset() > 0, "scrolling up should leave the bottom");
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0, "scroll_to_bottom should return to live view");
     }
 
     #[test]

@@ -252,6 +252,9 @@ impl ApplicationHandler<Wake> for Gritty {
                     }
                 }
                 if let Some(bytes) = key::encode(&event.logical_key, self.mods) {
+                    if let Some(terminal) = self.terminal.as_mut() {
+                        terminal.scroll_to_bottom();
+                    }
                     if let Some(pty) = self.pty.as_mut() {
                         pty.write(&bytes);
                     }
@@ -302,6 +305,23 @@ impl ApplicationHandler<Wake> for Gritty {
                 }
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        (p.y / self.font.cell_h as f64) as i32
+                    }
+                };
+                if lines != 0 {
+                    if let Some(terminal) = self.terminal.as_mut() {
+                        terminal.scroll(lines);
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
             }
 
