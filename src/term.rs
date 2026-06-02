@@ -78,11 +78,38 @@ impl Terminal {
     }
 }
 
-/// Build the byte stream for pasting `text`, normalizing newlines to CR and
-/// wrapping in bracketed-paste markers when the program requested them.
+/// Build the byte stream for pasting `text`.
+///
+/// Security (RT-4, RT-5b): clipboard content is untrusted — it may carry escape
+/// sequences (OSC/title/CSI injection) or an embedded bracketed-paste end marker
+/// that would terminate the paste and run the rest as live input. We normalize
+/// newlines to CR and strip C0/C1 control bytes except TAB and the normalized CR.
+/// Dropping ESC (0x1B) neutralizes all escape injection, including any embedded
+/// `\x1b[201~`, so the markers we add ourselves are the only ones present.
 pub fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let cleaned = text.replace("\r\n", "\r").replace('\n', "\r");
-    let mut data = Vec::new();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut prev_cr = false;
+    for ch in text.chars() {
+        match ch {
+            '\r' => {
+                cleaned.push('\r');
+                prev_cr = true;
+                continue;
+            }
+            '\n' => {
+                if !prev_cr {
+                    cleaned.push('\r'); // CRLF -> single CR, lone LF -> CR
+                }
+            }
+            '\t' => cleaned.push('\t'),
+            c if (c as u32) < 0x20 => {} // drop other C0 (incl. ESC)
+            c if ('\u{80}'..='\u{9f}').contains(&c) => {} // drop C1
+            c => cleaned.push(c),
+        }
+        prev_cr = false;
+    }
+
+    let mut data = Vec::with_capacity(cleaned.len() + 12);
     if bracketed {
         data.extend_from_slice(b"\x1b[200~");
     }
@@ -105,6 +132,27 @@ mod tests {
     #[test]
     fn wrap_paste_bracketed_wraps() {
         assert_eq!(wrap_paste("x", true), b"\x1b[200~x\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn wrap_paste_strips_control_and_escapes() {
+        // ESC and BEL dropped; printable SGR text kept; tab preserved.
+        assert_eq!(
+            wrap_paste("a\x1b[31mb\x07\tc", false),
+            b"a[31mb\tc".to_vec()
+        );
+    }
+
+    #[test]
+    fn wrap_paste_neutralizes_embedded_end_marker() {
+        // An embedded end marker must not appear in the payload (its ESC is gone),
+        // so the only markers are the wrappers we add.
+        let out = wrap_paste("x\x1b[201~y", true);
+        assert_eq!(out, b"\x1b[200~x[201~y\x1b[201~".to_vec());
+        // exactly one real end marker (the trailing wrapper)
+        let needle = b"\x1b[201~";
+        let count = out.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count, 1);
     }
 
     #[test]
