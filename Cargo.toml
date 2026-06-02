@@ -1,0 +1,18 @@
+[package]
+name = "gritty"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight native Windows terminal"
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+fontdue = "0.9"
+portable-pty = "0.8"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
