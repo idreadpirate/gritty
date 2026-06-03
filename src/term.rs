@@ -288,6 +288,58 @@ impl Terminal {
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::Relaxed)
     }
+
+    /// Peek the bell flag without consuming it (unlike [`take_bell`]). The
+    /// dirty-rect renderer reads this to decide a frame must be a full repaint
+    /// (so the amber flash overlay paints) before letting `draw_pane_grid`
+    /// actually consume it via `take_bell`.
+    pub fn has_bell(&self) -> bool {
+        self.bell.load(Ordering::Relaxed)
+    }
+
+    /// Whether an active text selection exists. The renderer forces a full
+    /// repaint while a selection is present so a partial (damaged-rows-only)
+    /// frame can never leave a stale highlight stripe on rows it didn't touch.
+    pub fn has_selection(&self) -> bool {
+        self.term.selection.is_some()
+    }
+
+    /// Collect this frame's damage as 0-based screen rows, then reset the
+    /// engine's damage state for the next frame.
+    ///
+    /// `Damage::Full` means the whole viewport changed (or the engine asked for
+    /// a full repaint — e.g. while scrolled into history); the caller repaints
+    /// the entire pane grid. `Damage::Lines` lists exactly the screen rows that
+    /// changed since the last reset, so a steady-state spinner repaints ~one row
+    /// instead of the whole grid. The yielded row index already accounts for
+    /// `display_offset` (alacritty's `TermDamageIterator` maps it), so at the
+    /// live bottom `row == grid line`.
+    ///
+    /// Must be called once per painted frame so damage does not accumulate.
+    pub fn take_damage(&mut self) -> Damage {
+        use alacritty_terminal::term::TermDamage;
+        let dmg = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(iter) => Damage::Lines(iter.map(|b| b.line).collect()),
+        };
+        self.term.reset_damage();
+        dmg
+    }
+
+    /// Clear the engine's accumulated damage without collecting it. A full
+    /// repaint redraws every cell regardless, so it only needs the reset — this
+    /// avoids the `Vec` allocation `take_damage` would make for the line list.
+    pub fn reset_damage(&mut self) {
+        self.term.reset_damage();
+    }
+}
+
+/// Per-frame VT damage, in 0-based screen rows. See [`Terminal::take_damage`].
+pub enum Damage {
+    /// The entire viewport must be repainted.
+    Full,
+    /// Only these screen rows changed since the last reset.
+    Lines(Vec<usize>),
 }
 
 /// RT-20: hard cap on a single paste's payload (post-sanitization bytes). Guards
@@ -595,6 +647,54 @@ mod tests {
         t.feed(b"\x07");
         assert!(t.take_bell(), "first take returns true");
         assert!(!t.take_bell(), "second take returns false (consumed)");
+    }
+
+    #[test]
+    fn has_bell_peeks_without_consuming() {
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        assert!(!t.has_bell());
+        t.feed(b"\x07");
+        assert!(t.has_bell(), "peek sees the bell");
+        assert!(t.has_bell(), "peek does NOT consume it");
+        assert!(t.take_bell(), "take still consumes it");
+        assert!(!t.has_bell(), "now cleared");
+    }
+
+    // --- dirty-rect damage tests ---------------------------------------------
+
+    #[test]
+    fn take_damage_starts_full_then_goes_partial() {
+        // A fresh terminal reports full damage (nothing has been painted yet);
+        // after that reset, a small edit on one row reports only that row — the
+        // property dirty-rect rendering relies on.
+        let mut t = Terminal::new(20, 5, 100);
+        assert!(
+            matches!(t.take_damage(), Damage::Full),
+            "first frame should be full damage"
+        );
+        t.feed(b"hello");
+        match t.take_damage() {
+            Damage::Lines(rows) => {
+                assert!(rows.contains(&0), "row 0 should be damaged, got {rows:?}");
+                assert!(
+                    !rows.contains(&4),
+                    "an untouched bottom row must NOT be damaged, got {rows:?}"
+                );
+            }
+            Damage::Full => panic!("a single-row edit should be partial, not full"),
+        }
+    }
+
+    #[test]
+    fn reset_damage_clears_full_flag() {
+        // `reset_damage` (the cheap full-frame reset path) must clear the engine's
+        // initial `full` flag, or every subsequent frame would force a full repaint.
+        let mut t = Terminal::new(20, 5, 100);
+        t.reset_damage();
+        assert!(
+            !matches!(t.take_damage(), Damage::Full),
+            "reset_damage should clear the full flag"
+        );
     }
 
     // --- percent_decode unit tests ---

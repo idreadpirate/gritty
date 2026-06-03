@@ -133,6 +133,25 @@ pub(crate) struct Win {
     /// window to a comfortable, screen-centered size instead of returning to the
     /// (often near-full-screen) pre-maximize size.
     pub(crate) was_maximized: bool,
+    /// Persistent CPU framebuffer the renderer composites into. softbuffer's
+    /// surface buffer does NOT preserve previous-frame contents, so dirty-rect
+    /// (partial) painting needs its own retained buffer: a partial frame
+    /// overwrites only the damaged grid rows here, then the whole backbuffer is
+    /// blitted to the surface and presented. Sized `bb_w * bb_h` u32 pixels.
+    pub(crate) backbuffer: Vec<u32>,
+    /// Pixel dimensions `backbuffer` is currently sized for. A mismatch with the
+    /// live window size forces a full repaint (and a resize) before compositing.
+    pub(crate) bb_w: usize,
+    pub(crate) bb_h: usize,
+    /// Structural render signature of the last painted frame (tab bar, layout,
+    /// focus, overlays, titles, theme, geometry — everything *except* per-pane
+    /// grid cell content). When it changes the next frame is a full repaint; when
+    /// it is unchanged only per-pane VT damage drives a partial repaint.
+    pub(crate) last_sig: u64,
+    /// Force the next frame to be a full repaint regardless of the signature.
+    /// Set on creation (the backbuffer is empty) and for one frame after a bell
+    /// flash (so the transient amber overlay is cleared from the backbuffer).
+    pub(crate) force_full: bool,
 }
 
 pub(crate) struct Gritty {
@@ -281,6 +300,13 @@ impl Gritty {
             // CA-52: no resize pending yet.
             pending_resize: None,
             was_maximized: false,
+            // Dirty-rect: backbuffer is allocated lazily on the first frame; an
+            // empty buffer (bb_w/bb_h == 0) forces that first frame to be full.
+            backbuffer: Vec::new(),
+            bb_w: 0,
+            bb_h: 0,
+            last_sig: 0,
+            force_full: true,
         })
     }
 
@@ -370,6 +396,92 @@ impl Gritty {
                 (s.width.max(1) as usize, s.height.max(1) as usize)
             })
             .unwrap_or((1, 1))
+    }
+
+    /// Dirty-rect: a structural fingerprint of everything `redraw` paints
+    /// *except* per-pane grid cell content (which the VT damage API tracks). When
+    /// this differs from the last painted frame's value, the next frame must be a
+    /// full repaint; when it matches, only damaged grid rows are repainted.
+    ///
+    /// It folds in window geometry, the tab bar (names/colors/activity + active
+    /// index), the active tab's layout + focus, each visible pane's header text
+    /// (name + foreground process), every overlay's visible state, the OS focus
+    /// (cursor hollowing), font cell metrics (zoom), and the live theme colors.
+    /// Anything that moves a non-grid pixel is included here so a partial frame
+    /// can never leave it stale.
+    pub(crate) fn render_sig(&self, wi: usize, w: usize, h: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hh = std::collections::hash_map::DefaultHasher::new();
+        let Some(win) = self.windows.get(wi) else {
+            return 0;
+        };
+        w.hash(&mut hh);
+        h.hash(&mut hh);
+        win.seamless.hash(&mut hh);
+        win.broadcast.hash(&mut hh);
+        win.broadcast_pending_signal.hash(&mut hh);
+        win.show_help.hash(&mut hh);
+        win.os_focused.hash(&mut hh);
+        win.active.hash(&mut hh);
+        self.font.cell_w.hash(&mut hh);
+        self.font.cell_h.hash(&mut hh);
+        // Live theme — recolors every glyph/chrome if a runtime theme switch lands.
+        crate::color::bg().hash(&mut hh);
+        crate::color::fg().hash(&mut hh);
+        crate::color::accent().hash(&mut hh);
+        // Overlays: any visible text/selection change must repaint the chrome.
+        match &win.palette {
+            Some(p) => {
+                1u8.hash(&mut hh);
+                p.query.hash(&mut hh);
+                p.sel.hash(&mut hh);
+            }
+            None => 0u8.hash(&mut hh),
+        }
+        win.rename.hash(&mut hh);
+        win.rename_is_tab.hash(&mut hh);
+        win.preedit.hash(&mut hh);
+        // Tab bar.
+        for tab in &win.tabs {
+            tab.name.hash(&mut hh);
+            tab.color.hash(&mut hh);
+            tab.activity.hash(&mut hh);
+        }
+        // Active tab: focus + layout + per-pane header text.
+        if let Some(tab) = win.tabs.get(win.active) {
+            tab.focus.hash(&mut hh);
+            for (id, r) in self.pane_rects(wi, w, h) {
+                id.hash(&mut hh);
+                r.x.hash(&mut hh);
+                r.y.hash(&mut hh);
+                r.w.hash(&mut hh);
+                r.h.hash(&mut hh);
+                if let Some(p) = tab.panes.get(&id) {
+                    p.name.hash(&mut hh);
+                    p.proc_name.hash(&mut hh);
+                }
+            }
+        }
+        hh.finish()
+    }
+
+    /// Dirty-rect: per-frame conditions in the active tab's panes that force a
+    /// full repaint even when [`render_sig`] is unchanged. Returns
+    /// `(any_bell, any_selection, any_scrolled)`:
+    /// * a pending bell needs the full-frame amber flash overlay,
+    /// * an active selection must never be left stale on an un-repainted row, and
+    /// * a pane scrolled into history shows a scrollbar and uses full VT damage.
+    pub(crate) fn active_grid_flags(&self, wi: usize) -> (bool, bool, bool) {
+        let Some(tab) = self.active_tab(wi) else {
+            return (false, false, false);
+        };
+        let (mut bell, mut sel, mut scroll) = (false, false, false);
+        for p in tab.panes.values() {
+            bell |= p.term.has_bell();
+            sel |= p.term.has_selection();
+            scroll |= p.term.display_offset() != 0;
+        }
+        (bell, sel, scroll)
     }
 
     pub(crate) fn content_rect(&self, w: usize, h: usize) -> Rect {

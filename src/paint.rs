@@ -13,50 +13,66 @@ use crate::session;
 
 impl Gritty {
     pub(crate) fn redraw(&mut self, wi: usize) {
+        if wi >= self.windows.len() {
+            return;
+        }
         let (w, h) = self.win_size(wi);
         let stride = w;
         let height = h;
 
-        if wi >= self.windows.len() {
-            return;
-        }
-        // Split borrows: the glyph atlas is shared across windows, the
-        // surface/state belongs to this window. They are distinct fields of
+        // Phase 1 — gather everything the paint needs from `&self` BEFORE taking
+        // the mutable borrows (font atlas + window) the draw holds; the helpers
+        // below all borrow `&self`. `sig` is the structural fingerprint (chrome,
+        // layout, titles, theme, geometry); the flags are per-frame grid
+        // conditions that force a full repaint even when `sig` is unchanged.
+        let sig = self.render_sig(wi, w, h);
+        let (any_bell, any_sel, any_scroll) = self.active_grid_flags(wi);
+        let rects = self.pane_rects(wi, w, h);
+
+        // Phase 2 — mutable borrows. The glyph atlas is shared across windows; the
+        // surface/backbuffer/state belong to this window. Distinct fields of
         // `self`, so borrowing both at once is sound.
         let font = &mut self.font;
         let win = &mut self.windows[wi];
 
-        // Account this frame up-front. The surface/buffer/present steps below may
-        // bail out early ("skip this frame" on a minimized/occluded window or a
-        // transient device-context loss). If we left `redraw_pending` set with a
-        // stale `last_render`, `about_to_wait` would re-request a redraw every
-        // tick — pegging a core at 100% (reads as a freeze). Clearing here means a
-        // skipped frame simply waits for the next real trigger (PTY output,
-        // resize, focus/occlude) to repaint.
+        // Account this frame up-front. The present step below may bail out early
+        // ("skip this frame" on a minimized/occluded window or a transient
+        // device-context loss). If we left `redraw_pending` set with a stale
+        // `last_render`, `about_to_wait` would re-request a redraw every tick —
+        // pegging a core at 100% (reads as a freeze). Clearing here means a
+        // skipped frame simply waits for the next real trigger to repaint.
         win.last_render = std::time::Instant::now();
         win.redraw_pending = false;
 
         // CA-54: a window the OS reports as occluded/minimized is not on screen,
-        // so skip the whole paint (full-buffer blit + per-cell render). Bookkeeping
-        // was cleared above, so this won't busy-spin `about_to_wait`; the next
-        // `Occluded(false)` re-shows and requests a fresh frame.
+        // so skip the whole paint. Bookkeeping was cleared above, so this won't
+        // busy-spin `about_to_wait`; the next `Occluded(false)` re-shows it.
         if !win.visible {
             return;
         }
 
-        // w/h are clamped to >=1 by win_size(), but construct defensively so a
-        // future refactor can't turn this into a panic (CA-14).
-        let nz_w = NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN);
-        let nz_h = NonZeroU32::new(h as u32).unwrap_or(NonZeroU32::MIN);
-        if win.surface.resize(nz_w, nz_h).is_err() {
-            return; // skip this frame instead of crashing
+        // Dirty-rect: decide full vs. partial repaint. A full repaint rebuilds the
+        // whole backbuffer (chrome + every pane grid); a partial repaint overwrites
+        // only the VT-damaged grid rows, leaving the retained backbuffer otherwise
+        // intact. Force full on the first frame, a resize, any structural change
+        // (signature), or the per-frame grid conditions (bell flash, live
+        // selection, scrolled-into-history view).
+        let need = stride.saturating_mul(height);
+        let size_changed = win.bb_w != stride || win.bb_h != height || win.backbuffer.len() != need;
+        let mut do_full = win.force_full
+            || size_changed
+            || sig != win.last_sig
+            || any_bell
+            || any_sel
+            || any_scroll;
+        win.force_full = false;
+        win.last_sig = sig;
+        if size_changed {
+            win.backbuffer.resize(need, 0);
+            win.bb_w = stride;
+            win.bb_h = height;
+            do_full = true;
         }
-        let Ok(mut buffer) = win.surface.buffer_mut() else {
-            return; // transient device-context loss — skip this frame (CA-1)
-        };
-
-        win.background.resize(stride, height);
-        buffer.copy_from_slice(&win.background.px);
 
         let (cw, ch) = (font.cell_w, font.cell_h);
         let active = win.active;
@@ -74,418 +90,316 @@ impl Gritty {
             tab.activity = false;
         }
 
-        // Tab bar.
-        fill_rect(
-            &mut buffer,
-            stride,
-            Rect {
-                x: 0,
-                y: 0,
-                w: stride,
-                h: ch,
-            },
-            UI_BAR_BG,
-        );
-        let mut tx = 0usize;
-        for (i, tab) in win.tabs.iter().enumerate() {
-            // CA-25: prefix active tab with a glyph marker (not color alone).
-            // CA-46: a background tab with output/bell activity since last viewed
-            // gets a `•` marker in the same leading-pad cell, so it doesn't shift
-            // the tab geometry the hit-tests depend on.
-            let label = if i == active {
-                format!(" ▸{} ", tab.name)
-            } else if tab.activity {
-                format!("•{} ", tab.name)
+        // Pre-pass: snapshot per-pane VT damage (partial frame) or just clear it
+        // (full frame), before borrowing the backbuffer so the `&mut win.tabs` and
+        // backbuffer borrows never overlap. Resetting every painted frame keeps
+        // the next frame's damage clean. Indices align with `rects`.
+        let mut pane_dmg: Vec<crate::term::Damage> = Vec::new();
+        if let Some(tab) = win.tabs.get_mut(active) {
+            if do_full {
+                for p in tab.panes.values_mut() {
+                    p.term.reset_damage();
+                }
             } else {
-                format!(" {} ", tab.name)
-            };
-            // CA-28: slot = label text + one cell for '×'.
-            // CA-45: size the slot by the name's display width (CJK = 2 cells),
-            // the same measure the hit-tests use, so render and click agree.
-            let text_w = (crate::layout::name_cols(&tab.name) + 2) * cw;
-            let slot_w = text_w + cw;
-            if tx + slot_w > stride {
-                break; // overflow: stop drawing tabs past the window edge
+                pane_dmg.reserve(rects.len());
+                for (id, _r) in &rects {
+                    pane_dmg.push(
+                        tab.panes
+                            .get_mut(id)
+                            .map(|p| p.term.take_damage())
+                            .unwrap_or(crate::term::Damage::Full),
+                    );
+                }
             }
-            let (fg, bg) = if i == active {
-                (color::bg(), tab.color)
-            } else {
-                (tab.color, UI_BAR_BG)
-            };
-            let r = Rect {
-                x: tx,
-                y: 0,
-                w: slot_w,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, r, bg);
-            let label_rect = Rect {
-                x: tx,
-                y: 0,
-                w: text_w,
-                h: ch,
-            };
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                tx,
-                0,
-                &label,
-                fg,
-                bg,
-                true,
-                label_rect,
-            );
-            // CA-28: draw the '×' close button cell.
-            let x_rect = Rect {
-                x: tx + text_w,
-                y: 0,
-                w: cw,
-                h: ch,
-            };
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                tx + text_w,
-                0,
-                "×",
-                UI_DIM,
-                bg,
-                true,
-                x_rect,
-            );
-            tx += slot_w + cw / 2;
         }
-        // CA-28: draw the '+' new-tab button after all tabs.
-        if tx + cw <= stride {
-            let plus_rect = Rect {
-                x: tx,
-                y: 0,
-                w: cw,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, plus_rect, UI_BAR_BG);
-            draw_text(
+
+        // Composite into the persistent backbuffer. We `take` it into an owned
+        // `Vec` (restored in Phase 4) so the existing full-repaint code below can
+        // keep rendering through `&mut buffer` exactly as it did into softbuffer's
+        // `Buffer` — both `DerefMut` to `[u32]`. softbuffer's surface buffer is NOT
+        // retained between frames, so a partial frame must paint into this
+        // retained buffer, not the surface.
+        let mut buffer = std::mem::take(&mut win.backbuffer);
+
+        if do_full {
+            win.background.resize(stride, height);
+            buffer.copy_from_slice(&win.background.px);
+
+            // Tab bar.
+            fill_rect(
                 &mut buffer,
                 stride,
-                font,
-                tx,
-                0,
-                "+",
-                UI_DIM,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: stride,
+                    h: ch,
+                },
                 UI_BAR_BG,
-                true,
-                plus_rect,
             );
-        }
-
-        let accent = win
-            .tabs
-            .get(active)
-            .map(|t| t.color)
-            .unwrap_or(color::accent());
-
-        // Broadcast indicator at the right of the tab bar.
-        if win.broadcast {
-            let label = " BROADCAST ";
-            let lw = label.chars().count() * cw;
-            let r = Rect {
-                x: stride.saturating_sub(lw),
-                y: 0,
-                w: lw,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, r, accent);
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                r.x,
-                0,
-                label,
-                color::bg(),
-                accent,
-                true,
-                r,
-            );
-        }
-
-        // Tab strip bottom separator — faint 1px line between tabs and content (CA-29).
-        fill_rect(
-            &mut buffer,
-            stride,
-            Rect {
-                x: 0,
-                y: ch.saturating_sub(1),
-                w: stride,
-                h: 1,
-            },
-            PANE_SEP,
-        );
-
-        // Panes.
-        let area = Rect {
-            x: 0,
-            y: ch,
-            w: stride,
-            h: height.saturating_sub(ch),
-        };
-        let mut rects = Vec::new();
-        let focus = win.tabs.get(active).map(|t| t.focus).unwrap_or(0);
-        if let Some(tab) = win.tabs.get(active) {
-            tab.tree.layout(area, &mut rects);
-        }
-
-        for (id, rect) in &rects {
-            let id = *id;
-            let rect = *rect;
-            let is_focus = id == focus;
-
-            // Pane title bar (hidden in seamless mode).
-            if !seamless {
-                let title_rect = Rect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.w,
+            let mut tx = 0usize;
+            for (i, tab) in win.tabs.iter().enumerate() {
+                // CA-25: prefix active tab with a glyph marker (not color alone).
+                // CA-46: a background tab with output/bell activity since last viewed
+                // gets a `•` marker in the same leading-pad cell, so it doesn't shift
+                // the tab geometry the hit-tests depend on.
+                let label = if i == active {
+                    format!(" ▸{} ", tab.name)
+                } else if tab.activity {
+                    format!("•{} ", tab.name)
+                } else {
+                    format!(" {} ", tab.name)
+                };
+                // CA-28: slot = label text + one cell for '×'.
+                // CA-45: size the slot by the name's display width (CJK = 2 cells),
+                // the same measure the hit-tests use, so render and click agree.
+                let text_w = (crate::layout::name_cols(&tab.name) + 2) * cw;
+                let slot_w = text_w + cw;
+                if tx + slot_w > stride {
+                    break; // overflow: stop drawing tabs past the window edge
+                }
+                let (fg, bg) = if i == active {
+                    (color::bg(), tab.color)
+                } else {
+                    (tab.color, UI_BAR_BG)
+                };
+                let r = Rect {
+                    x: tx,
+                    y: 0,
+                    w: slot_w,
                     h: ch,
                 };
-                let (tfg, tbg) = if is_focus {
-                    (color::bg(), accent)
-                } else {
-                    (UI_DIM, UI_TITLE_BG)
-                };
-                fill_rect(&mut buffer, stride, title_rect, tbg);
-                let header = win
-                    .tabs
-                    .get(active)
-                    .and_then(|t| t.panes.get(&id))
-                    .map(|p| {
-                        let proc = p.proc_name.as_str();
-                        let base = if proc.is_empty()
-                            || proc == "pwsh"
-                            || proc == "cmd"
-                            || proc == "powershell"
-                        {
-                            p.name.clone()
-                        } else {
-                            format!("{}: {}", p.name, proc)
-                        };
-                        // CA-25: add a non-color marker for the focused pane title.
-                        if is_focus {
-                            format!("▸ {base}")
-                        } else {
-                            base
-                        }
-                    })
-                    .unwrap_or_default();
-                draw_text(
-                    &mut buffer,
-                    stride,
-                    font,
-                    rect.x + cw / 2,
-                    rect.y,
-                    &header,
-                    tfg,
-                    tbg,
-                    true,
-                    title_rect,
-                );
-            }
-
-            // Grid.
-            let grid = Rect {
-                x: rect.x,
-                y: rect.y + th,
-                w: rect.w,
-                h: rect.h.saturating_sub(th),
-            };
-            if let Some(pane) = win.tabs.get(active).and_then(|t| t.panes.get(&id)) {
-                draw_pane_grid(
-                    &mut buffer,
-                    stride,
-                    font,
-                    pane,
-                    grid,
-                    is_focus,
-                    os_focused,
-                    accent,
-                );
-            }
-
-            // Focused pane gets the accent glow border; unfocused panes get a
-            // subtle 1px separator so pane boundaries remain visible (CA-24).
-            if is_focus {
-                stroke_rect(&mut buffer, stride, rect, accent);
-            } else {
-                stroke_rect(&mut buffer, stride, rect, PANE_SEP);
-            }
-        }
-
-        // Command palette overlay.
-        if let Some(p) = win.palette.as_ref() {
-            let (query, sel, matches) = (p.query.clone(), p.sel, p.matches());
-            let shown = matches.len().min(8);
-            let box_w = (stride * 2 / 3)
-                .max(40 * cw.max(1))
-                .min(stride.saturating_sub(cw));
-            let box_h = (shown + 1) * ch + ch / 2;
-            let bx = (stride.saturating_sub(box_w)) / 2;
-            let by = ch * 2;
-            let panel = 0x0020_2030u32;
-            let rbox = Rect {
-                x: bx,
-                y: by,
-                w: box_w,
-                h: box_h,
-            };
-            fill_rect(&mut buffer, stride, rbox, panel);
-            stroke_rect(&mut buffer, stride, rbox, accent);
-
-            let qline = format!("> {query}_");
-            let qrect = Rect {
-                x: bx,
-                y: by,
-                w: box_w,
-                h: ch,
-            };
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                bx + cw,
-                by + ch / 4,
-                &qline,
-                accent,
-                panel,
-                false,
-                qrect,
-            );
-
-            for (i, (label, _)) in matches.iter().take(shown).enumerate() {
-                let iy = by + ch + ch / 2 + i * ch;
-                let irow = Rect {
-                    x: bx,
-                    y: iy,
-                    w: box_w,
+                fill_rect(&mut buffer, stride, r, bg);
+                let label_rect = Rect {
+                    x: tx,
+                    y: 0,
+                    w: text_w,
                     h: ch,
-                };
-                let (fg, bg) = if i == sel {
-                    fill_rect(&mut buffer, stride, irow, accent);
-                    (color::bg(), accent)
-                } else {
-                    (color::fg(), panel)
                 };
                 draw_text(
                     &mut buffer,
                     stride,
                     font,
-                    bx + cw,
-                    iy,
-                    label,
+                    tx,
+                    0,
+                    &label,
                     fg,
                     bg,
-                    false,
-                    irow,
+                    true,
+                    label_rect,
                 );
-            }
-        }
-
-        // RT-8: broadcast pending-signal confirmation prompt.
-        if win.broadcast && win.broadcast_pending_signal.is_some() {
-            let label = " [BROADCAST] press again to send signal to all panes ";
-            let r = Rect {
-                x: 0,
-                y: height.saturating_sub(ch * 2),
-                w: stride,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, r, accent);
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                0,
-                r.y,
-                label,
-                color::bg(),
-                accent,
-                true,
-                r,
-            );
-        }
-
-        // CA-21: keybinding help overlay.
-        if win.show_help {
-            let entries: &[(&str, &str)] = &[
-                ("F1 / Ctrl+Shift+/", "Toggle this help overlay"),
-                ("Ctrl+Shift+T", "New tab"),
-                ("Ctrl+Shift+W", "Close pane"),
-                ("Ctrl+Shift+D", "Split pane right"),
-                ("Ctrl+Shift+E", "Split pane down"),
-                ("Ctrl+Shift+P", "Command palette"),
-                ("Ctrl+Shift+R", "Rename pane"),
-                ("Ctrl+Shift+C", "Copy selection"),
-                ("Ctrl+Shift+V", "Paste"),
-                ("Ctrl+Shift+B", "Broadcast-paste clipboard to ALL panes"),
-                ("Ctrl+Tab", "Next tab"),
-                ("Ctrl+1-9", "Switch to tab N"),
-                ("Ctrl+0 / +/-", "Font zoom reset/in/out"),
-                ("Ctrl+Alt+Arrows", "Resize pane"),
-                ("Ctrl+Shift+Arrows", "Move focus"),
-                ("Right-click", "Paste"),
-            ];
-            let shown = entries.len();
-            let col_key_w = 24 * cw; // fixed-width key column
-            let col_val_w = 32 * cw;
-            let box_w = (col_key_w + col_val_w + cw * 2)
-                .max(40 * cw.max(1))
-                .min(stride.saturating_sub(cw));
-            let box_h = (shown + 2) * ch;
-            let bx = (stride.saturating_sub(box_w)) / 2;
-            let by = ch * 2;
-            let panel = 0x0020_2030u32;
-            let rbox = Rect {
-                x: bx,
-                y: by,
-                w: box_w,
-                h: box_h,
-            };
-            fill_rect(&mut buffer, stride, rbox, panel);
-            stroke_rect(&mut buffer, stride, rbox, accent);
-            // Header row.
-            let header_rect = Rect {
-                x: bx,
-                y: by,
-                w: box_w,
-                h: ch,
-            };
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                bx + cw,
-                by,
-                "Keybindings  (Esc / F1 to close)",
-                accent,
-                panel,
-                false,
-                header_rect,
-            );
-            for (i, (binding, desc)) in entries.iter().enumerate() {
-                let iy = by + ch + i * ch;
-                let row_rect = Rect {
-                    x: bx,
-                    y: iy,
-                    w: box_w,
+                // CA-28: draw the '×' close button cell.
+                let x_rect = Rect {
+                    x: tx + text_w,
+                    y: 0,
+                    w: cw,
                     h: ch,
                 };
-                // Key column.
-                let key_rect = Rect {
-                    x: bx + cw,
-                    y: iy,
-                    w: col_key_w,
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    tx + text_w,
+                    0,
+                    "×",
+                    UI_DIM,
+                    bg,
+                    true,
+                    x_rect,
+                );
+                tx += slot_w + cw / 2;
+            }
+            // CA-28: draw the '+' new-tab button after all tabs.
+            if tx + cw <= stride {
+                let plus_rect = Rect {
+                    x: tx,
+                    y: 0,
+                    w: cw,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, plus_rect, UI_BAR_BG);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    tx,
+                    0,
+                    "+",
+                    UI_DIM,
+                    UI_BAR_BG,
+                    true,
+                    plus_rect,
+                );
+            }
+
+            let accent = win
+                .tabs
+                .get(active)
+                .map(|t| t.color)
+                .unwrap_or(color::accent());
+
+            // Broadcast indicator at the right of the tab bar.
+            if win.broadcast {
+                let label = " BROADCAST ";
+                let lw = label.chars().count() * cw;
+                let r = Rect {
+                    x: stride.saturating_sub(lw),
+                    y: 0,
+                    w: lw,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, accent);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    r.x,
+                    0,
+                    label,
+                    color::bg(),
+                    accent,
+                    true,
+                    r,
+                );
+            }
+
+            // Tab strip bottom separator — faint 1px line between tabs and content (CA-29).
+            fill_rect(
+                &mut buffer,
+                stride,
+                Rect {
+                    x: 0,
+                    y: ch.saturating_sub(1),
+                    w: stride,
+                    h: 1,
+                },
+                PANE_SEP,
+            );
+
+            // Panes.
+            let area = Rect {
+                x: 0,
+                y: ch,
+                w: stride,
+                h: height.saturating_sub(ch),
+            };
+            let mut rects = Vec::new();
+            let focus = win.tabs.get(active).map(|t| t.focus).unwrap_or(0);
+            if let Some(tab) = win.tabs.get(active) {
+                tab.tree.layout(area, &mut rects);
+            }
+
+            for (id, rect) in &rects {
+                let id = *id;
+                let rect = *rect;
+                let is_focus = id == focus;
+
+                // Pane title bar (hidden in seamless mode).
+                if !seamless {
+                    let title_rect = Rect {
+                        x: rect.x,
+                        y: rect.y,
+                        w: rect.w,
+                        h: ch,
+                    };
+                    let (tfg, tbg) = if is_focus {
+                        (color::bg(), accent)
+                    } else {
+                        (UI_DIM, UI_TITLE_BG)
+                    };
+                    fill_rect(&mut buffer, stride, title_rect, tbg);
+                    let header = win
+                        .tabs
+                        .get(active)
+                        .and_then(|t| t.panes.get(&id))
+                        .map(|p| {
+                            let proc = p.proc_name.as_str();
+                            let base = if proc.is_empty()
+                                || proc == "pwsh"
+                                || proc == "cmd"
+                                || proc == "powershell"
+                            {
+                                p.name.clone()
+                            } else {
+                                format!("{}: {}", p.name, proc)
+                            };
+                            // CA-25: add a non-color marker for the focused pane title.
+                            if is_focus {
+                                format!("▸ {base}")
+                            } else {
+                                base
+                            }
+                        })
+                        .unwrap_or_default();
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        rect.x + cw / 2,
+                        rect.y,
+                        &header,
+                        tfg,
+                        tbg,
+                        true,
+                        title_rect,
+                    );
+                }
+
+                // Grid.
+                let grid = Rect {
+                    x: rect.x,
+                    y: rect.y + th,
+                    w: rect.w,
+                    h: rect.h.saturating_sub(th),
+                };
+                if let Some(pane) = win.tabs.get(active).and_then(|t| t.panes.get(&id)) {
+                    draw_pane_grid(
+                        &mut buffer,
+                        stride,
+                        font,
+                        pane,
+                        grid,
+                        is_focus,
+                        os_focused,
+                        accent,
+                        None,
+                    );
+                }
+
+                // Focused pane gets the accent glow border; unfocused panes get a
+                // subtle 1px separator so pane boundaries remain visible (CA-24).
+                if is_focus {
+                    stroke_rect(&mut buffer, stride, rect, accent);
+                } else {
+                    stroke_rect(&mut buffer, stride, rect, PANE_SEP);
+                }
+            }
+
+            // Command palette overlay.
+            if let Some(p) = win.palette.as_ref() {
+                let (query, sel, matches) = (p.query.clone(), p.sel, p.matches());
+                let shown = matches.len().min(8);
+                let box_w = (stride * 2 / 3)
+                    .max(40 * cw.max(1))
+                    .min(stride.saturating_sub(cw));
+                let box_h = (shown + 1) * ch + ch / 2;
+                let bx = (stride.saturating_sub(box_w)) / 2;
+                let by = ch * 2;
+                let panel = 0x0020_2030u32;
+                let rbox = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: box_h,
+                };
+                fill_rect(&mut buffer, stride, rbox, panel);
+                stroke_rect(&mut buffer, stride, rbox, accent);
+
+                let qline = format!("> {query}_");
+                let qrect = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
                     h: ch,
                 };
                 draw_text(
@@ -493,91 +407,305 @@ impl Gritty {
                     stride,
                     font,
                     bx + cw,
-                    iy,
-                    binding,
+                    by + ch / 4,
+                    &qline,
                     accent,
                     panel,
                     false,
-                    key_rect,
+                    qrect,
                 );
-                // Value column.
-                let val_rect = Rect {
-                    x: bx + cw + col_key_w,
-                    y: iy,
-                    w: row_rect.w.saturating_sub(cw + col_key_w),
+
+                for (i, (label, _)) in matches.iter().take(shown).enumerate() {
+                    let iy = by + ch + ch / 2 + i * ch;
+                    let irow = Rect {
+                        x: bx,
+                        y: iy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    let (fg, bg) = if i == sel {
+                        fill_rect(&mut buffer, stride, irow, accent);
+                        (color::bg(), accent)
+                    } else {
+                        (color::fg(), panel)
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        iy,
+                        label,
+                        fg,
+                        bg,
+                        false,
+                        irow,
+                    );
+                }
+            }
+
+            // RT-8: broadcast pending-signal confirmation prompt.
+            if win.broadcast && win.broadcast_pending_signal.is_some() {
+                let label = " [BROADCAST] press again to send signal to all panes ";
+                let r = Rect {
+                    x: 0,
+                    y: height.saturating_sub(ch * 2),
+                    w: stride,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, accent);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    0,
+                    r.y,
+                    label,
+                    color::bg(),
+                    accent,
+                    true,
+                    r,
+                );
+            }
+
+            // CA-21: keybinding help overlay.
+            if win.show_help {
+                let entries: &[(&str, &str)] = &[
+                    ("F1 / Ctrl+Shift+/", "Toggle this help overlay"),
+                    ("Ctrl+Shift+T", "New tab"),
+                    ("Ctrl+Shift+W", "Close pane"),
+                    ("Ctrl+Shift+D", "Split pane right"),
+                    ("Ctrl+Shift+E", "Split pane down"),
+                    ("Ctrl+Shift+P", "Command palette"),
+                    ("Ctrl+Shift+R", "Rename pane"),
+                    ("Ctrl+Shift+C", "Copy selection"),
+                    ("Ctrl+Shift+V", "Paste"),
+                    ("Ctrl+Shift+B", "Broadcast-paste clipboard to ALL panes"),
+                    ("Ctrl+Tab", "Next tab"),
+                    ("Ctrl+1-9", "Switch to tab N"),
+                    ("Ctrl+0 / +/-", "Font zoom reset/in/out"),
+                    ("Ctrl+Alt+Arrows", "Resize pane"),
+                    ("Ctrl+Shift+Arrows", "Move focus"),
+                    ("Right-click", "Paste"),
+                ];
+                let shown = entries.len();
+                let col_key_w = 24 * cw; // fixed-width key column
+                let col_val_w = 32 * cw;
+                let box_w = (col_key_w + col_val_w + cw * 2)
+                    .max(40 * cw.max(1))
+                    .min(stride.saturating_sub(cw));
+                let box_h = (shown + 2) * ch;
+                let bx = (stride.saturating_sub(box_w)) / 2;
+                let by = ch * 2;
+                let panel = 0x0020_2030u32;
+                let rbox = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: box_h,
+                };
+                fill_rect(&mut buffer, stride, rbox, panel);
+                stroke_rect(&mut buffer, stride, rbox, accent);
+                // Header row.
+                let header_rect = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
                     h: ch,
                 };
                 draw_text(
                     &mut buffer,
                     stride,
                     font,
-                    bx + cw + col_key_w,
-                    iy,
-                    desc,
-                    color::fg(),
+                    bx + cw,
+                    by,
+                    "Keybindings  (Esc / F1 to close)",
+                    accent,
                     panel,
                     false,
-                    val_rect,
+                    header_rect,
                 );
+                for (i, (binding, desc)) in entries.iter().enumerate() {
+                    let iy = by + ch + i * ch;
+                    let row_rect = Rect {
+                        x: bx,
+                        y: iy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    // Key column.
+                    let key_rect = Rect {
+                        x: bx + cw,
+                        y: iy,
+                        w: col_key_w,
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        iy,
+                        binding,
+                        accent,
+                        panel,
+                        false,
+                        key_rect,
+                    );
+                    // Value column.
+                    let val_rect = Rect {
+                        x: bx + cw + col_key_w,
+                        y: iy,
+                        w: row_rect.w.saturating_sub(cw + col_key_w),
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw + col_key_w,
+                        iy,
+                        desc,
+                        color::fg(),
+                        panel,
+                        false,
+                        val_rect,
+                    );
+                }
+            }
+
+            // Rename overlay.
+            if let Some(buf_str) = win.rename.clone() {
+                let what = if win.rename_is_tab { "tab" } else { "pane" };
+                let line = format!(" rename {what}: {buf_str}_ ");
+                let r = Rect {
+                    x: 0,
+                    y: height.saturating_sub(ch),
+                    w: stride,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, color::accent());
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    0,
+                    r.y,
+                    &line,
+                    color::bg(),
+                    color::accent(),
+                    true,
+                    r,
+                );
+            }
+
+            // CA-48: IME composition (preedit) overlay. While the user is composing
+            // CJK / dead-key accents, winit delivers the in-progress string before the
+            // final Commit. Show it on a status line so the user sees what they're
+            // typing; it clears on commit or when composition ends.
+            if !win.preedit.is_empty() {
+                let line = format!(" compose: {} ", win.preedit);
+                let r = Rect {
+                    x: 0,
+                    y: height.saturating_sub(ch),
+                    w: stride,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, accent);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    0,
+                    r.y,
+                    &line,
+                    color::bg(),
+                    accent,
+                    true,
+                    r,
+                );
+            }
+        } else {
+            // Partial repaint: overwrite only each pane's VT-damaged grid rows in
+            // the retained backbuffer. The chrome (tab bar, pane titles, borders,
+            // overlays) is left untouched — `render_sig` forces a full frame
+            // whenever any of it changes, so what's already in the backbuffer is
+            // still correct.
+            let accent = win
+                .tabs
+                .get(active)
+                .map(|t| t.color)
+                .unwrap_or(color::accent());
+            let focus = win.tabs.get(active).map(|t| t.focus).unwrap_or(0);
+            for (i, (id, rect)) in rects.iter().enumerate() {
+                let grid = Rect {
+                    x: rect.x,
+                    y: rect.y + th,
+                    w: rect.w,
+                    h: rect.h.saturating_sub(th),
+                };
+                let is_focus = *id == focus;
+                let Some(pane) = win.tabs.get(active).and_then(|t| t.panes.get(id)) else {
+                    continue;
+                };
+                match pane_dmg.get(i) {
+                    Some(crate::term::Damage::Lines(rows)) => {
+                        if rows.is_empty() {
+                            continue; // nothing changed in this pane this frame
+                        }
+                        let nrows = pane.term.size.rows;
+                        let mut mask = vec![false; nrows];
+                        for &r in rows {
+                            if r < nrows {
+                                mask[r] = true;
+                            }
+                        }
+                        draw_pane_grid(
+                            &mut buffer,
+                            stride,
+                            font,
+                            pane,
+                            grid,
+                            is_focus,
+                            os_focused,
+                            accent,
+                            Some(&mask),
+                        );
+                    }
+                    // Full pane damage (alt-screen swap, clear, scroll-region
+                    // shuffle): repaint the whole grid, still only within its rect.
+                    _ => draw_pane_grid(
+                        &mut buffer,
+                        stride,
+                        font,
+                        pane,
+                        grid,
+                        is_focus,
+                        os_focused,
+                        accent,
+                        None,
+                    ),
+                }
             }
         }
 
-        // Rename overlay.
-        if let Some(buf_str) = win.rename.clone() {
-            let what = if win.rename_is_tab { "tab" } else { "pane" };
-            let line = format!(" rename {what}: {buf_str}_ ");
-            let r = Rect {
-                x: 0,
-                y: height.saturating_sub(ch),
-                w: stride,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, r, color::accent());
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                0,
-                r.y,
-                &line,
-                color::bg(),
-                color::accent(),
-                true,
-                r,
-            );
+        // Phase 4 — restore the retained backbuffer, then blit it to the window
+        // surface and present. Restoring first means a transient present failure
+        // (device-context loss) still keeps the backbuffer for the next frame.
+        // softbuffer's surface buffer is not retained between frames, so we copy
+        // the whole backbuffer each frame — a cheap memcpy; the per-cell glyph
+        // rasterization is the cost dirty-rect actually saves.
+        win.backbuffer = buffer;
+        let nz_w = NonZeroU32::new(stride as u32).unwrap_or(NonZeroU32::MIN);
+        let nz_h = NonZeroU32::new(height as u32).unwrap_or(NonZeroU32::MIN);
+        if win.surface.resize(nz_w, nz_h).is_err() {
+            return; // skip this frame instead of crashing (CA-14)
         }
-
-        // CA-48: IME composition (preedit) overlay. While the user is composing
-        // CJK / dead-key accents, winit delivers the in-progress string before the
-        // final Commit. Show it on a status line so the user sees what they're
-        // typing; it clears on commit or when composition ends.
-        if !win.preedit.is_empty() {
-            let line = format!(" compose: {} ", win.preedit);
-            let r = Rect {
-                x: 0,
-                y: height.saturating_sub(ch),
-                w: stride,
-                h: ch,
-            };
-            fill_rect(&mut buffer, stride, r, accent);
-            draw_text(
-                &mut buffer,
-                stride,
-                font,
-                0,
-                r.y,
-                &line,
-                color::bg(),
-                accent,
-                true,
-                r,
-            );
-        }
-
-        // Ignore a transient present failure (device-context loss): skip this
-        // frame rather than crash (CA-1). Frame bookkeeping was already cleared
-        // at the top, so a skipped frame won't busy-spin `about_to_wait`.
-        let _ = buffer.present();
+        let Ok(mut surface) = win.surface.buffer_mut() else {
+            return; // transient device-context loss — skip this frame (CA-1)
+        };
+        surface.copy_from_slice(&win.backbuffer);
+        let _ = surface.present();
     }
 }
 
@@ -591,6 +719,12 @@ pub(crate) fn screen_row(line: i32, display_offset: usize) -> Option<usize> {
     (r >= 0).then_some(r as usize)
 }
 
+/// Paint one pane's terminal grid into `buffer`.
+///
+/// `redraw_rows` drives dirty-rect painting: `None` repaints the whole grid (a
+/// full frame); `Some(mask)` repaints only the screen rows where `mask[row]` is
+/// true (a partial frame), leaving every other row's pixels in the retained
+/// backbuffer untouched. The mask is indexed by 0-based screen row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_pane_grid(
     buffer: &mut [u32],
@@ -601,8 +735,16 @@ pub(crate) fn draw_pane_grid(
     is_focus: bool,
     window_focused: bool,
     accent: u32,
+    redraw_rows: Option<&[bool]>,
 ) {
     let (cw, ch) = (font.cell_w, font.cell_h);
+    // In partial mode a row is repainted only if its mask bit is set; in full
+    // mode every row is repainted.
+    let row_dirty = |row: usize| {
+        redraw_rows
+            .map(|m| m.get(row).copied().unwrap_or(false))
+            .unwrap_or(true)
+    };
     let content = pane.term.term.renderable_content();
     let selection = content.selection;
     let display_offset = content.display_offset;
@@ -617,12 +759,38 @@ pub(crate) fn draw_pane_grid(
     let cur_row = content.cursor.point.line.0;
     let cur_col = content.cursor.point.column.0 as i32;
 
-    // Fill the grid rect with the terminal background before drawing cells.
-    // Without this, cells with the default background color are drawn
-    // transparently, letting the decorative glow show through — which creates
-    // a visible colour mismatch and a "blocked" appearance, especially in
-    // multi-pane layouts where panes sit away from the glow's centre.
-    fill_rect(buffer, stride, grid, color::bg());
+    // Fill the grid with the terminal background before drawing cells. Without
+    // this, cells with the default background color are drawn transparently,
+    // letting the decorative glow show through — a visible colour mismatch and
+    // "blocked" look, especially in multi-pane layouts away from the glow centre.
+    // Full mode clears the whole grid; partial mode clears only the damaged row
+    // strips (clamped to the grid bottom) so untouched rows keep their pixels.
+    match redraw_rows {
+        None => fill_rect(buffer, stride, grid, color::bg()),
+        Some(mask) => {
+            let gy1 = grid.y + grid.h;
+            for (row, &dirty) in mask.iter().enumerate() {
+                if !dirty {
+                    continue;
+                }
+                let y0 = grid.y + row * ch;
+                if y0 >= gy1 {
+                    break;
+                }
+                fill_rect(
+                    buffer,
+                    stride,
+                    Rect {
+                        x: grid.x,
+                        y: y0,
+                        w: grid.w,
+                        h: ch.min(gy1 - y0),
+                    },
+                    color::bg(),
+                );
+            }
+        }
+    }
 
     for item in content.display_iter {
         let line = item.point.line.0;
@@ -633,6 +801,10 @@ pub(crate) fn draw_pane_grid(
         let Some(row) = screen_row(line, display_offset) else {
             continue;
         };
+        // Dirty-rect: skip cells on rows we are not repainting this frame.
+        if !row_dirty(row) {
+            continue;
+        }
         let cell = item.cell;
         // The spacer after a wide glyph is painted by the wide cell itself (CA-5).
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -711,7 +883,11 @@ pub(crate) fn draw_pane_grid(
     }
 
     // CA-27: visual bell — brief amber flash over the pane for this frame only.
-    if pane.term.take_bell() {
+    // Only on a full pane repaint: a pending bell forces a full-window frame
+    // (`any_bell` in `redraw`), so a partial frame never carries one. Guarding
+    // here also keeps the transient flash from being baked into the retained
+    // backbuffer (and never consumes the bell on a partial frame).
+    if redraw_rows.is_none() && pane.term.take_bell() {
         // Blend a translucent amber overlay (≈25% opacity) across the pane grid.
         // Alpha-blend: out = src * alpha + dst * (1 - alpha), alpha = 64/255 ≈ 0.25.
         const BELL_COLOR: u32 = 0x00ff_7b00; // molten orange (matches ACCENT)
@@ -770,8 +946,11 @@ pub(crate) fn draw_pane_grid(
         );
     }
 
-    // Post-grid cursor overlays (CA-17).
-    if cursor_active && cur_row >= 0 && cur_col >= 0 {
+    // Post-grid cursor overlays (CA-17). In partial mode only re-apply when the
+    // cursor's row was repainted this frame; otherwise the retained overlay in
+    // the backbuffer is already correct (the cursor only moves when its old and
+    // new rows are both damaged, so a moved cursor always lands here).
+    if cursor_active && cur_row >= 0 && cur_col >= 0 && row_dirty(cur_row as usize) {
         let cur_px = grid.x + cur_col as usize * cw;
         let cur_py = grid.y + cur_row as usize * ch;
         if cursor_solid {
