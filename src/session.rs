@@ -17,6 +17,25 @@ pub struct Pane {
     pub proc_name: String,
 }
 
+/// User-tunable knobs that affect how a pane's shell is spawned (CA-37). Derived
+/// once from `config.toml` at startup and threaded into every `Pane::new`.
+#[derive(Debug, Clone)]
+pub struct SpawnCfg {
+    /// Lines of scrollback kept per pane.
+    pub scrollback: usize,
+    /// Optional absolute path to a preferred shell, tried before the built-ins.
+    pub shell: Option<String>,
+}
+
+impl Default for SpawnCfg {
+    fn default() -> Self {
+        Self {
+            scrollback: crate::term::DEFAULT_SCROLLBACK,
+            shell: None,
+        }
+    }
+}
+
 /// Reconcile a saved tab into a consistent 1:1 leaf↔pane plan: one pane per tree
 /// leaf (name from `saved.panes` or a default), a `focus` that is a real leaf,
 /// and a `next_id` past every id. Orphan panes (absent from the tree) are
@@ -68,6 +87,22 @@ fn shell_candidates() -> Vec<(String, Vec<&'static str>)> {
     ]
 }
 
+/// The ordered shell candidates with a user-configured shell prepended (CA-37).
+///
+/// RT-2/RT-6: a configured shell is honored only when it is an *absolute* path,
+/// never a bare name — otherwise it is ignored and we fall back to the trusted
+/// built-ins. (A non-existent path is skipped by the spawn loop's `exists()`
+/// guard, so a typo degrades gracefully instead of failing to start.)
+fn candidates_with_override(shell: Option<&str>) -> Vec<(String, Vec<&'static str>)> {
+    let mut out = shell_candidates();
+    if let Some(s) = shell {
+        if std::path::Path::new(s).is_absolute() {
+            out.insert(0, (s.to_string(), vec![]));
+        }
+    }
+    out
+}
+
 impl Pane {
     pub fn new(
         name: String,
@@ -75,15 +110,16 @@ impl Pane {
         rows: usize,
         proxy: EventLoopProxy<Wake>,
         cwd: Option<&str>,
+        cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let term = Terminal::new(cols, rows);
+        let term = Terminal::new(cols, rows, cfg.scrollback);
         let waker = move || {
             let _ = proxy.send_event(Wake);
         };
         let mut pty = None;
-        for (path, args) in shell_candidates() {
+        for (path, args) in candidates_with_override(cfg.shell.as_deref()) {
             if !std::path::Path::new(&path).exists() {
                 continue;
             }
@@ -138,9 +174,10 @@ impl Tab {
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<Wake>,
+        cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let mut panes = HashMap::new();
-        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None)?);
+        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None, cfg)?);
         Ok(Self {
             panes,
             tree: Node::Leaf(0),
@@ -160,11 +197,12 @@ impl Tab {
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<Wake>,
+        cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let (plan, focus, next_id) = plan_from_saved(saved);
         let mut panes = HashMap::new();
         for (id, name) in plan {
-            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None)?);
+            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None, cfg)?);
         }
         Ok(Self {
             panes,
@@ -189,7 +227,12 @@ impl Tab {
     /// Split the focused pane along `axis`, focusing the new pane.
     /// The new pane inherits the focused pane's working directory (OSC 7 cwd).
     /// Returns `Err` if shell spawn fails; the tree is left unmodified in that case.
-    pub fn split(&mut self, axis: Axis, proxy: EventLoopProxy<Wake>) -> Result<(), String> {
+    pub fn split(
+        &mut self,
+        axis: Axis,
+        proxy: EventLoopProxy<Wake>,
+        cfg: &SpawnCfg,
+    ) -> Result<(), String> {
         let id = self.next_id;
         // Clone the tree before mutating so we can roll back on spawn failure.
         let tree_before = self.tree.clone();
@@ -199,7 +242,7 @@ impl Tab {
             // shell starts in the same directory.
             let inherited_cwd = self.panes.get(&self.focus).and_then(|p| p.term.cwd());
             // Sized properly on the next relayout. Roll back the tree split on failure.
-            match Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref()) {
+            match Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref(), cfg) {
                 Ok(pane) => {
                     self.next_id += 1;
                     self.panes.insert(id, pane);
@@ -305,7 +348,7 @@ mod tests {
         impl FakePane {
             fn new(cols: usize, rows: usize) -> Self {
                 Self {
-                    term: Terminal::new(cols, rows),
+                    term: Terminal::new(cols, rows, crate::term::DEFAULT_SCROLLBACK),
                     resize_log: Vec::new(),
                 }
             }
@@ -351,7 +394,9 @@ mod tests {
 
         // Three "tabs", each a single fake pane sized 80x24. `active` is tab 2,
         // but the resize must update tabs 0 and 1 (the background ones) too.
-        let mut tabs: Vec<Terminal> = (0..3).map(|_| Terminal::new(80, 24)).collect();
+        let mut tabs: Vec<Terminal> = (0..3)
+            .map(|_| Terminal::new(80, 24, crate::term::DEFAULT_SCROLLBACK))
+            .collect();
         let active = 2usize;
 
         // The active-only path (the pre-CA-140 bug): only `active` would resize.
@@ -380,6 +425,46 @@ mod tests {
                 "shell candidate must be an absolute path, got: {path}"
             );
         }
+    }
+
+    /// CA-37: a config `shell` override (absolute path) is tried first, ahead of
+    /// the built-in candidates.
+    #[test]
+    fn shell_override_is_prepended_when_absolute() {
+        let with = super::candidates_with_override(Some(r"C:\tools\nu.exe"));
+        assert_eq!(
+            with.first().map(|(p, _)| p.as_str()),
+            Some(r"C:\tools\nu.exe"),
+            "absolute config shell must be tried first"
+        );
+        // It only adds one entry; the built-ins still follow.
+        assert_eq!(with.len(), super::shell_candidates().len() + 1);
+    }
+
+    /// CA-37/RT-2: a bare-name (non-absolute) override is ignored — never resolved
+    /// via PATH, where a hijacked `nu.exe` could be picked up.
+    #[test]
+    fn shell_override_rejects_bare_name() {
+        let with = super::candidates_with_override(Some("nu.exe"));
+        assert_eq!(
+            with.len(),
+            super::shell_candidates().len(),
+            "a non-absolute shell override must be dropped, not resolved via PATH"
+        );
+        assert!(
+            with.iter()
+                .all(|(p, _)| std::path::Path::new(p).is_absolute()),
+            "every candidate must remain an absolute path"
+        );
+    }
+
+    /// CA-37: with no override the list is exactly the built-in candidates.
+    #[test]
+    fn no_shell_override_keeps_builtins() {
+        assert_eq!(
+            super::candidates_with_override(None),
+            super::shell_candidates()
+        );
     }
 
     /// RT-6: `Pane::new` returns `Err` (not panic) when no candidate path

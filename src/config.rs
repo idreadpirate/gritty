@@ -1,9 +1,8 @@
 // Configuration surface for gritty (CA-10).
 // Reads an optional `%APPDATA%\gritty\config.toml` at startup.
 // Missing or invalid files fall back to compiled-in defaults — the
-// "just works" story is preserved.  Wiring Config into the rest of the app
-// is a follow-up task; this module is intentionally unused for now.
-#![allow(dead_code)]
+// "just works" story is preserved.  Loaded once at startup (CA-37) and threaded
+// into the runtime theme, initial font size, and per-pane shell/scrollback.
 
 use std::path::PathBuf;
 

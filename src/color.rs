@@ -1,9 +1,13 @@
 // Map alacritty/vte colors to 0x00RRGGBB framebuffer pixels.
 
+use std::sync::OnceLock;
+
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 // gritty "gunmetal & amber" theme — pulled from the industrial skull icon.
+// FG/BG/ACCENT are the *compiled-in defaults*; the live values (which a user's
+// config.toml can override, CA-37) are read through `fg()`/`bg()`/`accent()`.
 pub const FG: u32 = 0x00c9_d1d9; // steel light-grey text
 pub const BG: u32 = 0x0016_151f; // deep indigo-charcoal
 pub const CURSOR: u32 = 0x00ff_7b00; // molten orange (the skull's inner glow)
@@ -16,6 +20,68 @@ pub const UI_TITLE_BG: u32 = 0x001e_1c28; // inactive pane title
 pub const UI_DIM: u32 = 0x00b0_8050; // inactive UI text — warm bronze, ~5.49:1 vs BG
 /// Subtle 1px separator between unfocused panes and below the tab strip (CA-24/CA-29).
 pub const PANE_SEP: u32 = 0x002d_2b3d; // muted indigo line
+
+/// The three user-overridable theme colors (CA-37). Each falls back to the
+/// compiled-in default when `config.toml` omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Theme {
+    pub fg: u32,
+    pub bg: u32,
+    pub accent: u32,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            fg: FG,
+            bg: BG,
+            accent: ACCENT,
+        }
+    }
+}
+
+impl Theme {
+    /// Resolve a theme from optional config overrides, masking to the
+    /// `0x00RRGGBB` framebuffer-pixel space so a stray alpha byte can't leak in.
+    pub fn from_overrides(fg: Option<u32>, bg: Option<u32>, accent: Option<u32>) -> Self {
+        let d = Theme::default();
+        Self {
+            fg: fg.map(|c| c & 0x00ff_ffff).unwrap_or(d.fg),
+            bg: bg.map(|c| c & 0x00ff_ffff).unwrap_or(d.bg),
+            accent: accent.map(|c| c & 0x00ff_ffff).unwrap_or(d.accent),
+        }
+    }
+}
+
+/// Process-wide active theme. Set once at startup from config (CA-37); read
+/// everywhere through the accessors below. Immutable after the single init —
+/// `set` only on the first call, later calls are ignored.
+static THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Install the runtime theme (idempotent: only the first call wins).
+pub fn init_theme(theme: Theme) {
+    let _ = THEME.set(theme);
+}
+
+/// The active theme (defaults until `init_theme` runs).
+fn theme() -> Theme {
+    THEME.get().copied().unwrap_or_default()
+}
+
+/// Live foreground color (config override or default).
+pub fn fg() -> u32 {
+    theme().fg
+}
+
+/// Live background color (config override or default).
+pub fn bg() -> u32 {
+    theme().bg
+}
+
+/// Live accent color (config override or default).
+pub fn accent() -> u32 {
+    theme().accent
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -63,9 +129,9 @@ fn named(n: NamedColor, _default: u32) -> u32 {
         DimMagenta => 0x800080,
         DimCyan => 0x008080,
         DimWhite => 0x808080,
-        Foreground | BrightForeground => FG,
+        Foreground | BrightForeground => fg(),
         DimForeground => 0x808080,
-        Background => BG,
+        Background => bg(),
         Cursor => CURSOR,
     }
 }
@@ -228,6 +294,27 @@ mod tests {
         assert_eq!(to_rgb(Color::Named(NamedColor::BrightForeground), 0), FG);
         assert_eq!(to_rgb(Color::Named(NamedColor::Background), 0), BG);
         assert_eq!(to_rgb(Color::Named(NamedColor::Cursor), 0), CURSOR);
+    }
+
+    /// CA-37: a config override sets the corresponding theme color; an omitted
+    /// override falls back to the compiled-in default, and a stray alpha byte is
+    /// masked away so only `0x00RRGGBB` reaches the framebuffer.
+    #[test]
+    fn theme_overrides_apply_mask_and_default() {
+        // All present (with a high alpha byte that must be stripped).
+        let t = Theme::from_overrides(Some(0xFF12_3456), Some(0x00ab_cdef), Some(0x0000_00ff));
+        assert_eq!(t.fg, 0x0012_3456, "alpha byte must be masked off fg");
+        assert_eq!(t.bg, 0x00ab_cdef);
+        assert_eq!(t.accent, 0x0000_00ff);
+
+        // Partial override: only accent set, fg/bg fall back to defaults.
+        let t = Theme::from_overrides(None, None, Some(0x0010_2030));
+        assert_eq!(t.fg, FG);
+        assert_eq!(t.bg, BG);
+        assert_eq!(t.accent, 0x0010_2030);
+
+        // No overrides at all == the default theme.
+        assert_eq!(Theme::from_overrides(None, None, None), Theme::default());
     }
 }
 

@@ -16,7 +16,7 @@ use crate::layout::{self, Axis, Rect};
 use crate::palette::Palette;
 use crate::persist::{self, SavedWindow};
 use crate::proc;
-use crate::session::Tab;
+use crate::session::{SpawnCfg, Tab};
 use crate::{Dir4, Wake, FRAME, TAB_PALETTE};
 
 /// Default font size in pixels.
@@ -110,6 +110,9 @@ pub(crate) struct Win {
     /// drawn hollow when the window is unfocused (convention), independent of
     /// which *pane* is focused inside it.
     pub(crate) os_focused: bool,
+    /// CA-39: the OS caption currently set on this window, so `set_title` only
+    /// fires when the focused pane's OSC 0/2 title actually changes.
+    pub(crate) title: String,
 }
 
 pub(crate) struct Gritty {
@@ -123,19 +126,34 @@ pub(crate) struct Gritty {
     pub(crate) mods: winit::keyboard::ModifiersState,
     pub(crate) last_proc_poll: Instant,
     pub(crate) proxy: EventLoopProxy<Wake>,
+    /// CA-37: shell-spawn knobs (scrollback + optional shell) read from
+    /// `config.toml` at startup and threaded into every pane we create.
+    pub(crate) spawn_cfg: SpawnCfg,
 }
 
 impl Gritty {
     pub(crate) fn new(proxy: EventLoopProxy<Wake>) -> Self {
+        // CA-37: load the user's config once at startup and apply every knob —
+        // colors via the runtime theme, font size as the initial zoom level, and
+        // scrollback/shell carried in `spawn_cfg` to each pane.
+        let cfg = crate::config::load();
+        crate::color::init_theme(crate::color::Theme::from_overrides(
+            cfg.fg, cfg.bg, cfg.accent,
+        ));
+        let font_px = sanitize_font_px(cfg.font_size);
         Self {
             windows: Vec::new(),
             focused: 0,
-            font: FontAtlas::new(DEFAULT_FONT_PX),
-            font_px: DEFAULT_FONT_PX,
+            font: FontAtlas::new(font_px),
+            font_px,
             clip: Clip::new(),
             mods: winit::keyboard::ModifiersState::empty(),
             last_proc_poll: Instant::now() - Duration::from_secs(5),
             proxy,
+            spawn_cfg: SpawnCfg {
+                scrollback: cfg.scrollback,
+                shell: cfg.shell,
+            },
         }
     }
 
@@ -196,6 +214,8 @@ impl Gritty {
             // CA-54/CA-47: a freshly created window is shown and takes OS focus.
             visible: true,
             os_focused: true,
+            // CA-39: matches the `with_title("gritty")` attr set above.
+            title: "gritty".to_string(),
         })
     }
 
@@ -219,7 +239,11 @@ impl Gritty {
     /// caller can skip a repaint when nothing did — otherwise an idle window full
     /// of panes would repaint on every poll and burn CPU for no visible change.
     pub(crate) fn update_procs(&mut self) -> bool {
-        let procs = proc::snapshot();
+        // CA-38/RT-14: build the parent→children map ONCE per poll and reuse it
+        // across every pane, instead of rebuilding it per pane via the free
+        // `proc::foreground_name` (which was O(P×N)). `Snapshot::foreground_name`
+        // is O(N) per call against the prebuilt map.
+        let snap = proc::Snapshot::capture();
         let mut changed = false;
         for win in &mut self.windows {
             for tab in &mut win.tabs {
@@ -227,7 +251,7 @@ impl Gritty {
                     let name = pane
                         .pty
                         .pid()
-                        .and_then(|pid| proc::foreground_name(&procs, pid))
+                        .and_then(|pid| snap.foreground_name(pid))
                         .unwrap_or_default();
                     if name != pane.proc_name {
                         pane.proc_name = name;
@@ -237,6 +261,27 @@ impl Gritty {
             }
         }
         changed
+    }
+
+    /// CA-39: reflect each window's focused pane's OSC 0/2 title in the OS
+    /// caption. The title comes from the focused pane of the active tab; an empty
+    /// title shows the bare app name. We only call `set_title` when the composed
+    /// caption actually changed (cached in `Win::title`), so a steady title costs
+    /// no syscalls and the taskbar text doesn't churn.
+    pub(crate) fn update_titles(&mut self) {
+        for win in &mut self.windows {
+            let osc = win
+                .tabs
+                .get(win.active)
+                .and_then(|t| t.panes.get(&t.focus))
+                .map(|p| p.term.title())
+                .unwrap_or_default();
+            let caption = window_caption(&osc);
+            if caption != win.title {
+                win.window.set_title(&caption);
+                win.title = caption;
+            }
+        }
     }
 
     pub(crate) fn bar_h(&self) -> usize {
@@ -351,7 +396,14 @@ impl Gritty {
             ),
             None => return,
         };
-        match Tab::new(format!("tab {n}"), color, cols, rows, self.proxy.clone()) {
+        match Tab::new(
+            format!("tab {n}"),
+            color,
+            cols,
+            rows,
+            self.proxy.clone(),
+            &self.spawn_cfg,
+        ) {
             Ok(tab) => {
                 if let Some(win) = self.windows.get_mut(wi) {
                     win.tabs.push(tab);
@@ -383,6 +435,8 @@ impl Gritty {
 
     pub(crate) fn split_focus(&mut self, wi: usize, axis: Axis) {
         let proxy = self.proxy.clone();
+        // CA-37: clone the spawn knobs before the `&mut self.windows` borrow below.
+        let spawn_cfg = self.spawn_cfg.clone();
         let mut spawn_err: Option<String> = None;
         if let Some(win) = self.windows.get_mut(wi) {
             let active = win.active;
@@ -397,7 +451,7 @@ impl Gritty {
                 // existing pane intact — but report it instead of swallowing it
                 // silently, mirroring `new_tab`'s non-fatal feedback. `split`
                 // already rolled back its tree on failure, so the tab is fine.
-                if let Err(e) = tab.split(axis, proxy) {
+                if let Err(e) = tab.split(axis, proxy, &spawn_cfg) {
                     spawn_err = Some(e);
                 }
             }
@@ -862,7 +916,9 @@ impl Gritty {
             let tabs: Vec<Tab> = sw
                 .tabs
                 .iter()
-                .filter_map(|st| Tab::from_saved(st, cols, rows, self.proxy.clone()).ok())
+                .filter_map(|st| {
+                    Tab::from_saved(st, cols, rows, self.proxy.clone(), &self.spawn_cfg).ok()
+                })
                 .collect();
             if tabs.is_empty() {
                 continue;
@@ -1304,6 +1360,9 @@ impl ApplicationHandler<Wake> for Gritty {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         let dirty = self.drain_pty();
         self.reap_dead(event_loop);
+        // CA-39: the OSC 0/2 title may have changed in the bytes we just drained;
+        // push it to the OS caption (no-op when unchanged).
+        self.update_titles();
         let mut proc_dirty = false;
         // CA-54: skip the (full process-table) snapshot entirely when no window is
         // visible — an occluded/minimized app shows no titles, so polling is pure
@@ -2046,6 +2105,30 @@ pub(crate) fn window_cap_reached(current_windows: usize) -> bool {
     current_windows >= MAX_WINDOWS
 }
 
+/// CA-37: clamp a config-supplied font size into the supported zoom range. A
+/// non-finite or out-of-range value (a crafted/typo'd `config.toml`) falls back
+/// to the compiled-in default rather than producing a zero/huge/NaN atlas.
+pub(crate) fn sanitize_font_px(px: f32) -> f32 {
+    if px.is_finite() && (MIN_FONT_PX..=MAX_FONT_PX).contains(&px) {
+        px
+    } else {
+        DEFAULT_FONT_PX
+    }
+}
+
+/// CA-39: the OS window caption for a focused pane whose program announced
+/// `osc_title` via OSC 0/2. An empty title (none set, or after `ResetTitle`)
+/// shows the bare app name; otherwise it's `gritty — <title>`. Pure so the
+/// composing rule is unit-tested without a window.
+pub(crate) fn window_caption(osc_title: &str) -> String {
+    let t = osc_title.trim();
+    if t.is_empty() {
+        "gritty".to_string()
+    } else {
+        format!("gritty — {t}")
+    }
+}
+
 /// CA-110: whether `reap_dead` must skip this pass because a tab tear-off drag is
 /// in flight. Reaping shifts `win.tabs`, which would invalidate the press-time
 /// `TabDrag.index` captured for the drop, so reaping is frozen until the drag
@@ -2201,6 +2284,35 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- CA-37 config wiring -------------------------------------------------
+
+    #[test]
+    fn sanitize_font_px_accepts_in_range_and_clamps_garbage() {
+        // A sane in-range size is passed through unchanged.
+        assert_eq!(sanitize_font_px(20.0), 20.0);
+        assert_eq!(sanitize_font_px(MIN_FONT_PX), MIN_FONT_PX);
+        assert_eq!(sanitize_font_px(MAX_FONT_PX), MAX_FONT_PX);
+        // Out-of-range, zero, negative, and non-finite all fall back to default.
+        assert_eq!(sanitize_font_px(0.0), DEFAULT_FONT_PX);
+        assert_eq!(sanitize_font_px(-5.0), DEFAULT_FONT_PX);
+        assert_eq!(sanitize_font_px(10_000.0), DEFAULT_FONT_PX);
+        assert_eq!(sanitize_font_px(f32::NAN), DEFAULT_FONT_PX);
+        assert_eq!(sanitize_font_px(f32::INFINITY), DEFAULT_FONT_PX);
+    }
+
+    // --- CA-39 OSC 0/2 window caption ----------------------------------------
+
+    #[test]
+    fn window_caption_composes_and_falls_back() {
+        // Empty (no title / after ResetTitle) shows the bare app name.
+        assert_eq!(window_caption(""), "gritty");
+        assert_eq!(window_caption("   "), "gritty", "whitespace-only is empty");
+        // A real title is composed as `gritty — <title>`.
+        assert_eq!(window_caption("vim README.md"), "gritty — vim README.md");
+        // Surrounding whitespace is trimmed.
+        assert_eq!(window_caption("  ssh box  "), "gritty — ssh box");
+    }
 
     // --- CA-7 SGR encoding ---------------------------------------------------
 

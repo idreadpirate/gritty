@@ -5,7 +5,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::app::Gritty;
-use crate::color::{self, ACCENT, BG, FG, PANE_SEP, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
+use crate::color::{self, PANE_SEP, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
 use crate::font::FontAtlas;
 use crate::layout::Rect;
 use crate::render::{self, draw_cell, draw_text, fill_rect, stroke_rect, Cell};
@@ -108,7 +108,7 @@ impl Gritty {
                 break; // overflow: stop drawing tabs past the window edge
             }
             let (fg, bg) = if i == active {
-                (BG, tab.color)
+                (color::bg(), tab.color)
             } else {
                 (tab.color, UI_BAR_BG)
             };
@@ -181,7 +181,11 @@ impl Gritty {
             );
         }
 
-        let accent = win.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
+        let accent = win
+            .tabs
+            .get(active)
+            .map(|t| t.color)
+            .unwrap_or(color::accent());
 
         // Broadcast indicator at the right of the tab bar.
         if win.broadcast {
@@ -201,7 +205,7 @@ impl Gritty {
                 r.x,
                 0,
                 label,
-                BG,
+                color::bg(),
                 accent,
                 true,
                 r,
@@ -248,7 +252,7 @@ impl Gritty {
                     h: ch,
                 };
                 let (tfg, tbg) = if is_focus {
-                    (BG, accent)
+                    (color::bg(), accent)
                 } else {
                     (UI_DIM, UI_TITLE_BG)
                 };
@@ -369,9 +373,9 @@ impl Gritty {
                 };
                 let (fg, bg) = if i == sel {
                     fill_rect(&mut buffer, stride, irow, accent);
-                    (BG, accent)
+                    (color::bg(), accent)
                 } else {
-                    (FG, panel)
+                    (color::fg(), panel)
                 };
                 draw_text(
                     &mut buffer,
@@ -405,7 +409,7 @@ impl Gritty {
                 0,
                 r.y,
                 label,
-                BG,
+                color::bg(),
                 accent,
                 true,
                 r,
@@ -510,7 +514,7 @@ impl Gritty {
                     bx + cw + col_key_w,
                     iy,
                     desc,
-                    crate::color::FG,
+                    color::fg(),
                     panel,
                     false,
                     val_rect,
@@ -528,7 +532,7 @@ impl Gritty {
                 w: stride,
                 h: ch,
             };
-            fill_rect(&mut buffer, stride, r, ACCENT);
+            fill_rect(&mut buffer, stride, r, color::accent());
             draw_text(
                 &mut buffer,
                 stride,
@@ -536,8 +540,8 @@ impl Gritty {
                 0,
                 r.y,
                 &line,
-                BG,
-                ACCENT,
+                color::bg(),
+                color::accent(),
                 true,
                 r,
             );
@@ -588,8 +592,8 @@ pub(crate) fn draw_pane_grid(
         let row = line as usize;
         let col = item.point.column.0;
 
-        let base_fg = color::to_rgb(cell.fg, FG);
-        let base_bg = color::to_rgb(cell.bg, BG);
+        let base_fg = color::to_rgb(cell.fg, color::fg());
+        let base_bg = color::to_rgb(cell.bg, color::bg());
         let is_default_bg = matches!(cell.bg, Color::Named(NamedColor::Background));
 
         // SGR flags (inverse/bold/dim/hidden/underline) — CA-4.
@@ -609,7 +613,7 @@ pub(crate) fn draw_pane_grid(
             // Focused block cursor: invert the cell (CA-17).
             // Beam and Underline draw overlays after the cell; no bg change here.
             bg = accent;
-            fg = BG;
+            fg = color::bg();
             fill_bg = true;
         }
 

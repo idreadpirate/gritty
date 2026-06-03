@@ -86,6 +86,10 @@ fn osc7_uri_to_path(uri: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// Default lines of scrollback kept per pane when no config override applies.
+/// Mirrors `config::Config::default().scrollback`.
+pub const DEFAULT_SCROLLBACK: usize = 5000;
+
 #[derive(Clone, Copy)]
 pub struct TermSize {
     pub cols: usize,
@@ -147,10 +151,8 @@ pub struct Terminal {
     pub term: Term<TitleListener>,
     parser: Processor,
     pub size: TermSize,
-    // Shared with TitleListener; updated on every OSC 0/2 event.
-    // `#[allow(dead_code)]` silences the lint for the binary crate where
-    // `title()` may not be wired up yet.
-    #[allow(dead_code)]
+    // Shared with TitleListener; updated on every OSC 0/2 event and read by
+    // `title()` (CA-39).
     title: Arc<Mutex<String>>,
     /// Latest working-directory path announced via OSC 7, or `None` if none
     /// has been received yet.
@@ -161,10 +163,10 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(cols: usize, rows: usize, scrollback: usize) -> Self {
         let size = TermSize { cols, rows };
         let config = Config {
-            scrolling_history: 5000,
+            scrolling_history: scrollback,
             ..Config::default()
         };
         let title = Arc::new(Mutex::new(String::new()));
@@ -183,10 +185,6 @@ impl Terminal {
 
     /// Returns the latest window title set via OSC 0/2, or an empty string if
     /// none has been set (or after a `ResetTitle` event).
-    // `dead_code` suppressed: callers will wire this up in app.rs/main.rs;
-    // the method is `pub` but binary-crate reachability analysis still flags it
-    // when no call site exists yet.
-    #[allow(dead_code)]
     pub fn title(&self) -> String {
         self.title.lock().map(|g| g.clone()).unwrap_or_default()
     }
@@ -399,7 +397,7 @@ mod tests {
 
     #[test]
     fn scroll_up_then_bottom() {
-        let mut t = Terminal::new(20, 5);
+        let mut t = Terminal::new(20, 5, DEFAULT_SCROLLBACK);
         for _ in 0..50 {
             t.feed(b"line\r\n");
         }
@@ -417,8 +415,38 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_param_caps_history() {
+        // CA-37: the scrollback knob must actually reach the VT engine. A tiny
+        // history (2 lines) on a 5-row grid means after writing far more lines than
+        // fit, we can only scroll up by the history depth — not unbounded.
+        let mut t = Terminal::new(20, 5, 2);
+        for _ in 0..100 {
+            t.feed(b"line\r\n");
+        }
+        t.scroll(1000); // ask to scroll way past the top
+                        // display_offset is clamped to the available history (<= scrollback).
+        assert!(
+            t.display_offset() <= 2,
+            "offset {} exceeds the 2-line scrollback cap",
+            t.display_offset()
+        );
+
+        // A generous scrollback allows scrolling much further back.
+        let mut big = Terminal::new(20, 5, 1000);
+        for _ in 0..100 {
+            big.feed(b"line\r\n");
+        }
+        big.scroll(1000);
+        assert!(
+            big.display_offset() > 2,
+            "a 1000-line scrollback should allow scrolling past 2 lines, got {}",
+            big.display_offset()
+        );
+    }
+
+    #[test]
     fn feed_writes_chars_into_grid() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         t.feed(b"hello");
 
         let content = t.term.renderable_content();
@@ -433,7 +461,7 @@ mod tests {
 
     #[test]
     fn resize_updates_dimensions() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         t.resize(120, 40);
         assert_eq!(t.size.cols, 120);
         assert_eq!(t.size.rows, 40);
@@ -444,7 +472,7 @@ mod tests {
 
     #[test]
     fn bracketed_paste_reflects_terminal_mode() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         assert!(!t.bracketed_paste(), "off by default");
         // DECSET 2004 enables bracketed paste mode.
         t.feed(b"\x1b[?2004h");
@@ -464,7 +492,7 @@ mod tests {
 
     #[test]
     fn osc_title_captured_via_osc0() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         // OSC 0 ; <title> ST — sets icon name *and* window title.
         t.feed(b"\x1b]0;hello\x07");
         assert_eq!(t.title(), "hello", "title should reflect OSC 0 payload");
@@ -472,7 +500,7 @@ mod tests {
 
     #[test]
     fn osc_title_updated_and_reset() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         t.feed(b"\x1b]2;world\x07");
         assert_eq!(t.title(), "world");
         // OSC 104 (reset colors) → ResetTitle not triggered; OSC l (xterm iconName) - skip.
@@ -485,7 +513,7 @@ mod tests {
 
     #[test]
     fn osc7_bel_terminator_updates_cwd() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         assert!(t.cwd().is_none(), "cwd starts empty");
         // Windows-style URI: file://hostname/C:/Users/alice
         t.feed(b"\x1b]7;file://myhost/C:/Users/alice\x07");
@@ -499,7 +527,7 @@ mod tests {
 
     #[test]
     fn osc7_st_terminator_updates_cwd() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         // Use ST (ESC \) as the terminator instead of BEL.
         t.feed(b"\x1b]7;file:///tmp/work\x1b\\");
         let cwd = t.cwd().expect("cwd should be set with ST terminator");
@@ -508,7 +536,7 @@ mod tests {
 
     #[test]
     fn osc7_last_sequence_wins() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         // Two OSC 7 sequences in one chunk; the last one should win.
         t.feed(b"\x1b]7;file:///first\x07\x1b]7;file:///second\x07");
         assert_eq!(t.cwd().as_deref(), Some("/second"));
@@ -516,7 +544,7 @@ mod tests {
 
     #[test]
     fn osc7_percent_decode_in_path() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         // Space encoded as %20.
         t.feed(b"\x1b]7;file:///my%20dir\x07");
         assert_eq!(t.cwd().as_deref(), Some("/my dir"));
@@ -526,7 +554,7 @@ mod tests {
 
     #[test]
     fn bel_byte_registers_bell() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         assert!(!t.take_bell(), "no bell before BEL byte");
         t.feed(b"\x07");
         assert!(t.take_bell(), "bell should be registered after \\x07");
@@ -534,7 +562,7 @@ mod tests {
 
     #[test]
     fn take_bell_clears_flag() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
         t.feed(b"\x07");
         assert!(t.take_bell(), "first take returns true");
         assert!(!t.take_bell(), "second take returns false (consumed)");

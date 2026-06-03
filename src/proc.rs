@@ -10,14 +10,12 @@ pub struct Proc {
 }
 
 /// A snapshot of the process list with a prebuilt parent→children map.
-/// Build once per poll cycle and reuse across all panes (CA-3, RT-14).
-#[allow(dead_code)]
+/// Build once per poll cycle and reuse across all panes (CA-3, RT-14, CA-38).
 pub struct Snapshot {
     procs: Vec<Proc>,
     children: HashMap<u32, Vec<u32>>,
 }
 
-#[allow(dead_code)]
 impl Snapshot {
     /// Capture the current process list and build the children map once.
     pub fn capture() -> Self {
@@ -31,11 +29,6 @@ impl Snapshot {
     pub fn foreground_name(&self, root_pid: u32) -> Option<String> {
         let d = deepest_descendant_with_map(&self.children, root_pid)?;
         name_of(&self.procs, d)
-    }
-
-    /// Expose the raw proc list for callers that need it.
-    pub fn procs(&self) -> &[Proc] {
-        &self.procs
     }
 
     /// Test-only constructor: build a Snapshot from a synthetic Vec<Proc>.
@@ -87,6 +80,12 @@ fn deepest_descendant_with_map(children: &HashMap<u32, Vec<u32>>, root: u32) -> 
 
 /// Deepest descendant of `root` (closest thing to the foreground process).
 /// Returns None when `root` has no children (i.e. just the bare shell).
+///
+/// Test-only wrapper that builds the children map then walks it. Production
+/// reuses the prebuilt map via `Snapshot::foreground_name` (CA-38); this exposes
+/// the same algorithm (including the RT-23 cycle guard) for direct pid-level
+/// assertions in the unit tests below.
+#[cfg(test)]
 pub fn deepest_descendant(procs: &[Proc], root: u32) -> Option<u32> {
     let children = build_children_map(procs);
     deepest_descendant_with_map(&children, root)
@@ -107,6 +106,10 @@ fn strip_exe(name: &str) -> String {
 }
 
 /// Name of the foreground process in the tree rooted at `root_pid`, if any.
+///
+/// Test-only convenience over the pure tree logic; production uses
+/// `Snapshot::foreground_name` (CA-38).
+#[cfg(test)]
 pub fn foreground_name(procs: &[Proc], root_pid: u32) -> Option<String> {
     let d = deepest_descendant(procs, root_pid)?;
     name_of(procs, d)
