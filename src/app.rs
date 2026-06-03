@@ -1277,7 +1277,7 @@ impl Gritty {
         let (w, h) = self.win_size(wi);
         let area = self.content_rect(w, h);
         let cursor = if let Some(tab) = win.tabs.get(win.active) {
-            match tab.tree.divider_at(area, x as usize, y as usize, 5) {
+            match tab.tree.divider_at(area, clamp_pixel(x), clamp_pixel(y), 5) {
                 Some(path) => {
                     let icon = match tab.tree.split_area(&path, area) {
                         Some((crate::layout::Axis::LeftRight, _)) => CursorIcon::ColResize,
@@ -2067,7 +2067,7 @@ impl Gritty {
         let area = self.content_rect(w, h);
         let divider = self
             .active_tab(wi)
-            .and_then(|t| t.tree.divider_at(area, x as usize, y as usize, 5));
+            .and_then(|t| t.tree.divider_at(area, clamp_pixel(x), clamp_pixel(y), 5));
         if let Some(path) = divider {
             if let Some(win) = self.windows.get_mut(wi) {
                 win.dragging = Some(path);
@@ -2544,6 +2544,19 @@ pub(crate) struct MonitorRect {
     pub(crate) y: i32,
     pub(crate) w: i32,
     pub(crate) h: i32,
+}
+
+/// Convert a screen-pixel coordinate to a grid index, clamping a negative
+/// value to 0.
+///
+/// `mouse_pos` is reported in `f64` and can be negative on multi-monitor setups
+/// where a screen sits at negative coordinates: dragging the window onto such a
+/// monitor and hovering/clicking yields `x`/`y` below the window origin. A bare
+/// `x as usize` saturates negatives to 0, but routing every divider hit-test
+/// through this one tested seam keeps the clamp explicit and matches the rest of
+/// the codebase (e.g. the palette hit-test). Pure so the rule is unit-tested.
+pub(crate) fn clamp_pixel(v: f64) -> usize {
+    v.max(0.0) as usize
 }
 
 /// CA-49: place a restored window so it is visible on some monitor.
@@ -3929,6 +3942,45 @@ mod tests {
         let mons = [mon(0, 0, 800, 600)];
         let (x, y) = clamp_to_monitors((9000, 9000), (1200, 1000), &mons);
         assert_eq!((x, y), (0, 0));
+    }
+
+    // --- negative-coordinate divider hit-test clamp --------------------------
+
+    #[test]
+    fn clamp_pixel_floors_negatives_to_zero() {
+        // mouse_pos is f64 and goes negative on monitors at negative coordinates;
+        // the divider hit-test indexes a grid, so a negative pixel must clamp to 0
+        // rather than wrap. Positive values pass through (truncating toward zero).
+        assert_eq!(clamp_pixel(-1.0), 0);
+        assert_eq!(clamp_pixel(-9999.0), 0);
+        assert_eq!(clamp_pixel(-0.5), 0);
+        assert_eq!(clamp_pixel(0.0), 0);
+        assert_eq!(clamp_pixel(7.9), 7);
+        assert_eq!(clamp_pixel(50.0), 50);
+    }
+
+    #[test]
+    fn divider_hit_test_ignores_negative_coords() {
+        use crate::layout::{Axis, Node};
+        // A horizontal split puts the divider at x=50 in a 100-wide area. A mouse
+        // far in the negative-x quadrant (off the bottom-left monitor) must never
+        // be reported as hovering a divider once routed through clamp_pixel.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 60,
+        };
+        let mut tree = Node::Leaf(0);
+        assert!(tree.split_leaf(0, 1, Axis::LeftRight));
+        let (x, y) = (-40.0_f64, -30.0_f64);
+        assert_eq!(
+            tree.divider_at(area, clamp_pixel(x), clamp_pixel(y), 5),
+            None,
+            "a negative mouse position must not grab the x=50 divider"
+        );
+        // Sanity: the divider is still detected when the cursor is actually on it.
+        assert_eq!(tree.divider_at(area, 50, 30, 5), Some(Vec::new()));
     }
 
     // --- CA-50 close-confirm predicate ---------------------------------------
