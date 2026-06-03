@@ -639,7 +639,6 @@ dependencies = [
  "serde",
  "serde_json",
  "softbuffer",
- "toml",
  "unicode-width",
  "windows-sys 0.59.0",
  "winit",

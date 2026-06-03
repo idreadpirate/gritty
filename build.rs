@@ -38,7 +38,7 @@ fn main() {
 
     // (2) Multi-resolution .ico for the executable, aspect-preserved.
     let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
-    for size in [256u32, 64, 48, 32, 16] {
+    for size in [64u32, 48, 32, 16] {
         let sq = fit_square(&img, size);
         let ico_img = ico::IconImage::from_rgba_data(size, size, sq.into_raw());
         dir.add_entry(ico::IconDirEntry::encode(&ico_img).expect("encode ico entry"));
