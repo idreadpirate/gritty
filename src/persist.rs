@@ -640,7 +640,10 @@ struct Obj<'a> {
 
 impl<'a> Obj<'a> {
     fn get(&self, key: &str) -> Option<&'a JsonValue> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        // JSON (RFC 8259) leaves duplicate keys implementation-defined; the de
+        // facto convention (serde_json, JS) is last-value-wins, so scan in
+        // reverse to honor the final occurrence of a duplicated key.
+        self.entries.iter().rfind(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     fn array_of<T>(&self, key: &str, each: impl Fn(&JsonValue) -> Option<T>) -> Option<Vec<T>> {
@@ -1037,6 +1040,16 @@ mod tests {
         let s = SavedSession::from_json(old_json).expect("parse old session");
         assert_eq!(s.win_w, None);
         assert_eq!(s.win_h, None);
+    }
+
+    #[test]
+    fn duplicate_object_keys_use_last_value() {
+        // RFC 8259 leaves duplicates implementation-defined; the de facto
+        // convention (serde_json, JS) is last-value-wins. A hand-edited or
+        // duplicated session must restore the final `active`, not the first.
+        let tampered = r#"{"active":99,"active":0,"tabs":[]}"#;
+        let s = SavedSession::from_json(tampered).expect("parse tampered session");
+        assert_eq!(s.active, 0, "last duplicate key must win");
     }
 
     // --- Multi-window persistence --------------------------------------------
