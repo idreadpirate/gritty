@@ -187,7 +187,10 @@ mod tests {
         let cfg = parse(src).expect("parse");
         assert_eq!(cfg.font_size, 16.0);
         assert_eq!(cfg.scrollback, 10000);
-        assert_eq!(cfg.shell.as_deref(), Some("C:\\Windows\\System32\\pwsh.exe"));
+        assert_eq!(
+            cfg.shell.as_deref(),
+            Some("C:\\Windows\\System32\\pwsh.exe")
+        );
         assert_eq!(cfg.fg, Some(0xF0_F0F0));
         assert_eq!(cfg.bg, Some(0x18_1818));
         assert_eq!(cfg.accent, Some(0xFF_7B00));
