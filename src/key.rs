@@ -78,7 +78,19 @@ fn named_bytes(n: NamedKey, m: u8, shift: bool) -> Option<Vec<u8>> {
             }
         }
         Escape => vec![0x1b],
-        Space => b" ".to_vec(),
+        Space => {
+            // Ctrl+Space → NUL (0x00), like every xterm-class terminal
+            // (readline/Emacs set-mark-command). `m` is the xterm modifier code
+            // (1 + shift + 2·alt + 4·ctrl), so bit 2 = Ctrl. winit delivers the
+            // spacebar as NamedKey::Space, so this is the only place Ctrl reaches
+            // it; plain/Shift/Alt+Space stay a literal space.
+            let ctrl = (m.saturating_sub(1)) & 0b100 != 0;
+            if ctrl {
+                vec![0x00]
+            } else {
+                b" ".to_vec()
+            }
+        }
         ArrowUp => csi(m, b'A'),
         ArrowDown => csi(m, b'B'),
         ArrowRight => csi(m, b'C'),
@@ -263,6 +275,26 @@ mod tests {
         assert_eq!(
             encode(&Key::Named(NamedKey::Backspace), ModifiersState::CONTROL),
             Some(vec![0x08])
+        );
+    }
+
+    #[test]
+    fn ctrl_space_is_nul() {
+        // winit delivers the spacebar as NamedKey::Space, so Ctrl+Space reaches
+        // named_bytes(Space, ...). It must emit NUL (0x00) like every xterm-class
+        // terminal (readline/Emacs set-mark-command), not a literal space.
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Space), ModifiersState::CONTROL),
+            Some(vec![0x00])
+        );
+        // Plain and Shift+Space stay a literal space — only Ctrl changes the byte.
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Space), ModifiersState::empty()),
+            Some(b" ".to_vec())
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Space), mods(true, false, false)),
+            Some(b" ".to_vec())
         );
     }
 
