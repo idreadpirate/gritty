@@ -381,7 +381,12 @@ impl Gritty {
         if win_empty {
             self.windows.remove(wi);
             if self.windows.is_empty() {
-                self.persist_session();
+                // CA-100: do NOT persist here — `self.windows` is already empty,
+                // so `snapshot()` serializes zero windows and overwrites
+                // session.json with `{"windows":[]}`, wiping the saved workspace.
+                // Closing the last pane with Ctrl+Shift+W (or `exit` via
+                // `reap_dead`) must leave the last good session intact, like the
+                // ✕ path which persists the surviving workspace *before* removing.
                 event_loop.exit();
                 return;
             }
@@ -478,6 +483,16 @@ impl Gritty {
 
     /// Remove panes whose shell exited, tabs left empty, and windows left empty.
     pub(crate) fn reap_dead(&mut self, event_loop: &ActiveEventLoop) {
+        // CA-110: tear-off captures a tab by its press-time positional index
+        // (`TabDrag.index`). Reaping a tab mid-drag would shift `win.tabs`, so the
+        // captured index would name a different tab — or run off the end and drop
+        // the gesture — on release. While any window has a tab-drag in flight,
+        // freeze reaping so indices stay stable until the drop resolves; the dead
+        // panes/tabs are reaped on the next `Wake` after the drag ends.
+        let tab_drag_in_flight = self.windows.iter().any(|w| w.tab_drag.is_some());
+        if reaping_is_frozen(tab_drag_in_flight) {
+            return;
+        }
         let mut changed = false;
         let mut wi = 0;
         while wi < self.windows.len() {
@@ -506,6 +521,13 @@ impl Gritty {
                 }
                 if win.tabs[ti].panes.is_empty() {
                     win.tabs.remove(ti);
+                    // RT-73/CA-93: removing a tab shifts every later tab's index
+                    // down by one, but `win.active` is never updated here (unlike
+                    // `close_focus`). Reaping a background tab at or below `active`
+                    // would leave `active` naming a different tab — or, if the
+                    // active tab was last, out of range — so the still-alive
+                    // focused tab renders blank and silently drops keystrokes.
+                    win.active = active_after_tab_removed(win.active, ti, win.tabs.len());
                     changed = true;
                 } else {
                     ti += 1;
@@ -520,7 +542,11 @@ impl Gritty {
         }
         if changed {
             if self.windows.is_empty() {
-                self.persist_session();
+                // CA-100: same as `close_focus` — `self.windows` is empty here, so
+                // persisting would snapshot zero windows and wipe the saved
+                // workspace. `exit` typed into the last shell routes through here;
+                // leave the last good session.json untouched so a relaunch
+                // restores it instead of opening a blank tab.
                 event_loop.exit();
                 return;
             }
@@ -1137,9 +1163,17 @@ impl ApplicationHandler<Wake> for Gritty {
         };
         match event {
             WindowEvent::CloseRequested => {
-                self.persist_session();
+                // CA-113: remove the closing window FIRST, then persist. The old
+                // order snapshotted all windows — including the one being closed —
+                // so session.json still listed it; a kill/crash before the next
+                // persist would resurrect the already-closed window on relaunch.
+                // Persist-after-mutate records only the surviving windows. (The
+                // last-window case persists an empty list — which CA-100 must NOT
+                // do — so skip the save there and leave the last good session.)
                 self.windows.remove(wi);
-                if self.windows.is_empty() {
+                if session_should_persist(self.windows.len()) {
+                    self.persist_session();
+                } else {
                     event_loop.exit();
                     return;
                 }
@@ -1152,7 +1186,14 @@ impl ApplicationHandler<Wake> for Gritty {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    // Keyboard always targets the focused window.
+                    // CA-55: route by the window that RECEIVED the event, not the
+                    // stale `self.focused`. winit only delivers key events to the
+                    // OS-focused window, so `wi` is authoritative. The window-
+                    // removal paths only clamp `focused` when it runs off the end,
+                    // so a background window closing *below* `focused` leaves it
+                    // naming a different surviving window — and no `Focused` event
+                    // fires to re-sync it — misdirecting the keystroke.
+                    self.focused = wi;
                     self.handle_key(event_loop, &event.logical_key);
                 }
             }
@@ -1727,6 +1768,34 @@ pub(crate) fn window_cap_reached(current_windows: usize) -> bool {
     current_windows >= MAX_WINDOWS
 }
 
+/// CA-110: whether `reap_dead` must skip this pass because a tab tear-off drag is
+/// in flight. Reaping shifts `win.tabs`, which would invalidate the press-time
+/// `TabDrag.index` captured for the drop, so reaping is frozen until the drag
+/// ends. Pure so it is unit-tested below.
+pub(crate) fn reaping_is_frozen(tab_drag_in_flight: bool) -> bool {
+    tab_drag_in_flight
+}
+
+/// CA-100/CA-113: whether to persist the session after a teardown that removed a
+/// window. Persist only when at least one window survives — persisting with zero
+/// windows snapshots `{"windows":[]}` and wipes the saved workspace (CA-100). The
+/// removal must happen *before* this check so a closed non-last window isn't
+/// re-saved and later resurrected (CA-113). Pure so it is unit-tested below.
+pub(crate) fn session_should_persist(remaining_windows: usize) -> bool {
+    remaining_windows > 0
+}
+
+/// RT-73/CA-93: the active-tab index after removing the tab at `removed`, given
+/// `remaining` tabs are left. Removing a tab *before* the active one shifts the
+/// active tab's slot down by one (decrement so it keeps naming the same tab);
+/// removing the active tab or one after it leaves the index put, then clamps it
+/// into range so it can never name a missing/out-of-range tab. Mirrors the
+/// clamp `close_focus` already applies. Pure so it is unit-tested below.
+pub(crate) fn active_after_tab_removed(active: usize, removed: usize, remaining: usize) -> usize {
+    let shifted = if removed < active { active - 1 } else { active };
+    shifted.min(remaining.saturating_sub(1))
+}
+
 /// CA-7: Encode an SGR mouse sequence.
 pub(crate) fn encode_sgr_mouse(btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
     let suffix = if press { 'M' } else { 'm' };
@@ -1962,6 +2031,60 @@ mod tests {
         assert!(!window_cap_reached(MAX_WINDOWS - 1));
         assert!(window_cap_reached(MAX_WINDOWS));
         assert!(window_cap_reached(MAX_WINDOWS + 1));
+    }
+
+    // --- RT-73/CA-93 active-tab clamp after a reap ---------------------------
+
+    #[test]
+    fn reap_below_active_decrements_so_same_tab_stays_shown() {
+        // 4 tabs A,B,C,D (idx 0..3), viewing C (active=2). A background tab B
+        // (idx 1, below active) is reaped → survivors A,C,D at idx 0,1,2. Without
+        // the fix `active` stays 2 = D (wrong tab) — it must drop to 1 = C.
+        assert_eq!(active_after_tab_removed(2, 1, 3), 1);
+        // Reaping tab A (idx 0) below active also shifts C down to its new slot.
+        assert_eq!(active_after_tab_removed(2, 0, 3), 1);
+    }
+
+    #[test]
+    fn reap_at_or_after_active_leaves_index_put_but_in_range() {
+        // Reaping a tab *after* the active one doesn't move the active tab.
+        assert_eq!(active_after_tab_removed(1, 2, 3), 1);
+        // Reaping the active tab itself: index stays, clamped into the survivors.
+        assert_eq!(active_after_tab_removed(2, 2, 2), 1);
+    }
+
+    #[test]
+    fn reap_last_active_tab_clamps_into_range() {
+        // Viewing the last tab (active=2 of 3); it (or a tab) is reaped leaving 2.
+        // `active` must clamp to the new last index, never name a missing tab.
+        assert_eq!(active_after_tab_removed(2, 2, 2), 1);
+        // Reaping down to a single tab clamps to 0.
+        assert_eq!(active_after_tab_removed(3, 0, 1), 0);
+        // Degenerate: no tabs left → saturating clamp to 0 (window is dropped).
+        assert_eq!(active_after_tab_removed(0, 0, 0), 0);
+    }
+
+    // --- CA-110 reaping frozen during a tab tear-off drag --------------------
+
+    #[test]
+    fn reaping_frozen_iff_a_tab_drag_is_in_flight() {
+        // A tear-off drag is in flight → reaping must be skipped so the captured
+        // tab index can't go stale; no drag → reaping proceeds normally.
+        assert!(reaping_is_frozen(true));
+        assert!(!reaping_is_frozen(false));
+    }
+
+    // --- CA-100/CA-113 persist-on-close ordering -----------------------------
+
+    #[test]
+    fn persist_only_when_a_window_survives() {
+        // CA-100: closing the LAST window/pane leaves zero windows; persisting then
+        // would snapshot `{"windows":[]}` and wipe the saved workspace, so skip it.
+        assert!(!session_should_persist(0));
+        // CA-113: a non-last close leaves survivors; persist (after removal) so the
+        // closed window isn't re-saved and later resurrected.
+        assert!(session_should_persist(1));
+        assert!(session_should_persist(5));
     }
 
     // --- CA-33 hyperlink scheme sanitizer ------------------------------------
