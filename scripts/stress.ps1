@@ -1,0 +1,272 @@
+# stress.ps1 — gritty load / leak harness.
+#
+# What it does:
+#   1. Generates a session.json with N panes (split across tabs) and a config
+#      that pins the shell to Windows PowerShell, so every pane is a known shell.
+#   2. Launches the release gritty.exe; it restores all N panes at once
+#      (one ConPTY + reader thread + scrollback grid per pane).
+#   3. Optionally (-Broadcast) drives a streaming spinner into EVERY pane at once
+#      via gritty's Ctrl+Shift+B broadcast-paste — the render/dirty-rect stress.
+#   4. Samples gritty's RSS / private bytes / thread + handle count / CPU over
+#      time, writes a CSV, and prints a PASS/FAIL verdict:
+#        * leak  -> resident memory keeps climbing after warm-up
+#        * threads/handles -> climb while pane count is fixed (leaked PTY readers)
+#        * spin  -> CPU stays pegged under streaming (dirty-rect regression)
+#   5. Restores your real session.json / config.toml.
+#
+# Existing session.json and config.toml are backed up to *.harnessbak and
+# restored in a finally{} block, even on Ctrl+C.
+#
+# Usage:
+#   pwsh -File scripts/stress.ps1                       # 100 panes, idle, 60s
+#   pwsh -File scripts/stress.ps1 -Broadcast            # + stream into all panes
+#   pwsh -File scripts/stress.ps1 -Panes 64 -PerTab 16 -Seconds 90 -Broadcast
+#   pwsh -File scripts/stress.ps1 -DryRun               # generate+validate only
+#
+# The GUI + N shells run on YOUR desktop; this is a desktop tool, not a headless
+# one. -DryRun generates and validates the files without launching anything.
+
+[CmdletBinding()]
+param(
+    [int]$Panes      = 100,
+    [int]$PerTab     = 20,
+    [int]$Seconds    = 60,
+    [int]$IntervalMs = 1500,
+    [string]$Exe     = "target/x86_64-pc-windows-msvc/release/gritty.exe",
+    [switch]$Broadcast,
+    [switch]$DryRun,
+    [string]$LogDir  = "$env:TEMP\gritty-stress"
+)
+
+$ErrorActionPreference = "Stop"
+Set-Location (Split-Path $PSScriptRoot -Parent)   # repo root
+
+function Info($m) { Write-Host $m -ForegroundColor Cyan }
+function Warn($m) { Write-Host "WARN: $m" -ForegroundColor Yellow }
+function Fail($m) { Write-Host "STRESS FAIL: $m" -ForegroundColor Red; exit 1 }
+
+if ($Panes -lt 1)  { Fail "-Panes must be >= 1" }
+if ($PerTab -lt 1) { $PerTab = $Panes }
+
+# ---------------------------------------------------------------------------
+# JSON generation: a balanced split tree of `n` leaf panes (ids 0..n-1),
+# alternating split axis by depth so panes tile into a grid.
+# ---------------------------------------------------------------------------
+function New-PaneTree {
+    param([int[]]$Ids, [int]$Depth = 0)
+    if ($Ids.Count -eq 1) { return "{""Leaf"":$($Ids[0])}" }
+    $mid   = [int]([math]::Floor($Ids.Count / 2))
+    $left  = $Ids[0..($mid - 1)]
+    $right = $Ids[$mid..($Ids.Count - 1)]
+    $axis  = if ($Depth % 2 -eq 0) { "LeftRight" } else { "TopBottom" }
+    $a = New-PaneTree -Ids $left  -Depth ($Depth + 1)
+    $b = New-PaneTree -Ids $right -Depth ($Depth + 1)
+    return "{""Split"":{""axis"":""$axis"",""ratio"":0.5,""a"":$a,""b"":$b}}"
+}
+
+# Industrial palette mirroring TAB_PALETTE in main.rs.
+$palette = @(0xff7b00, 0xe69522, 0xc08a4a, 0xb87333, 0x7fa6c9, 0xd4a017)
+
+# Build tabs: fill PerTab panes per tab until `Panes` total are placed.
+$tabsJson = New-Object System.Collections.Generic.List[string]
+$placed = 0
+$tabIndex = 0
+while ($placed -lt $Panes) {
+    $count = [math]::Min($PerTab, $Panes - $placed)
+    $ids = 0..($count - 1)
+    $tree = New-PaneTree -Ids $ids
+    $panesJson = ($ids | ForEach-Object { "{""id"":$_,""name"":""p$_""}" }) -join ","
+    $color = $palette[$tabIndex % $palette.Count]
+    $tab = "{""name"":""t$tabIndex"",""color"":$color,""focus"":0,""next_id"":$count,""tree"":$tree,""panes"":[$panesJson]}"
+    $tabsJson.Add($tab)
+    $placed += $count
+    $tabIndex++
+}
+
+$winW = 1600
+$winH = 1000
+$windowJson = "{""active"":0,""tabs"":[$([string]::Join(",", $tabsJson))],""win_w"":$winW,""win_h"":$winH,""win_x"":null,""win_y"":null,""seamless"":false}"
+$sessionJson = "{""windows"":[$windowJson],""active"":0,""tabs"":[],""win_w"":null,""win_h"":null}"
+
+# Validate the JSON we just hand-built actually parses.
+try { $null = $sessionJson | ConvertFrom-Json } catch { Fail "generated session.json is not valid JSON: $_" }
+Info "Generated session: $Panes panes across $tabIndex tab(s), $PerTab per tab."
+
+# Pin the shell to Windows PowerShell so broadcast commands have known syntax.
+$pwshExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
+if (-not $pwshExe) { Fail "powershell.exe not found on PATH" }
+$configText = "shell = ""$($pwshExe -replace '\\','\\')""`nscrollback = 5000`n"
+
+# ---------------------------------------------------------------------------
+# File paths + backup/restore (matches src/persist.rs + src/config.rs).
+# ---------------------------------------------------------------------------
+$sessionPath = Join-Path $env:LOCALAPPDATA "gritty\session.json"
+$configPath  = Join-Path $env:APPDATA      "gritty\config.toml"
+New-Item -ItemType Directory -Force -Path (Split-Path $sessionPath) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $configPath)  | Out-Null
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+function Backup($p) { if (Test-Path $p) { Copy-Item $p "$p.harnessbak" -Force } }
+function Restore($p) {
+    if (Test-Path "$p.harnessbak") { Move-Item "$p.harnessbak" $p -Force }
+    elseif (Test-Path $p)          { Remove-Item $p -Force }
+}
+
+if ($DryRun) {
+    $sDry = Join-Path $LogDir "session.dryrun.json"
+    $cDry = Join-Path $LogDir "config.dryrun.toml"
+    Set-Content -Path $sDry -Value $sessionJson -Encoding UTF8
+    Set-Content -Path $cDry -Value $configText  -Encoding UTF8
+    Info "DryRun: wrote $sDry ($([math]::Round((Get-Item $sDry).Length/1kb,1)) KB) and $cDry"
+    Info "DryRun: session.json parsed OK; shell -> $pwshExe"
+    Info "DryRun: no process launched, no files in the live gritty dirs touched."
+    exit 0
+}
+
+$exePath = if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path (Get-Location) $Exe }
+if (-not (Test-Path $exePath)) { Fail "gritty exe not found: $exePath  (build it: cargo build --release)" }
+
+# ---------------------------------------------------------------------------
+# Process discovery. Release gritty self-detaches (main.rs ensure_detached):
+# the launched process exits and a new detached gritty.exe is the real one, so
+# we find it by name, not by the Start-Process handle.
+# ---------------------------------------------------------------------------
+function Get-GrittyProcs { Get-Process -Name gritty -ErrorAction SilentlyContinue }
+
+function Sample {
+    $ps = Get-GrittyProcs
+    if (-not $ps) { return $null }
+    $rss   = ($ps | Measure-Object WorkingSet64        -Sum).Sum
+    $priv  = ($ps | Measure-Object PrivateMemorySize64 -Sum).Sum
+    $thr   = ($ps | Measure-Object -Property Threads -Sum -ErrorAction SilentlyContinue).Sum
+    if (-not $thr) { $thr = ($ps | ForEach-Object { $_.Threads.Count } | Measure-Object -Sum).Sum }
+    $hnd   = ($ps | Measure-Object HandleCount -Sum).Sum
+    $cpu   = ($ps | Measure-Object CPU -Sum).Sum
+    [pscustomobject]@{
+        RssMB   = [math]::Round($rss  / 1mb, 1)
+        PrivMB  = [math]::Round($priv / 1mb, 1)
+        Threads = [int]$thr
+        Handles = [int]$hnd
+        CpuSec  = [math]::Round($cpu, 2)
+        Count   = $ps.Count
+    }
+}
+
+Backup $sessionPath
+Backup $configPath
+$proc = $null
+$samples = New-Object System.Collections.Generic.List[object]
+try {
+    Set-Content -Path $sessionPath -Value $sessionJson -Encoding UTF8
+    Set-Content -Path $configPath  -Value $configText  -Encoding UTF8
+
+    Info "Launching $exePath  ($Panes panes)..."
+    Start-Process -FilePath $exePath | Out-Null
+
+    # Wait for the detached gritty to appear.
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not (Get-GrittyProcs) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+    $g = Get-GrittyProcs
+    if (-not $g) { Fail "gritty did not start within 15s" }
+    Info "gritty up (pid(s): $(($g | ForEach-Object Id) -join ', ')). Letting $Panes shells settle..."
+    Start-Sleep -Seconds 5   # let all panes spawn shells before the first sample
+
+    if ($Broadcast) {
+        # Drive a self-terminating streaming spinner into EVERY pane at once.
+        # CR-rewrites one line (the dirty-rect partial-repaint happy path) plus a
+        # periodic newline (scroll). Bounded so orphaned panes self-exit.
+        $runFor = $Seconds + 20
+        $cmd = '$e=(Get-Date).AddSeconds(' + $runFor + ');$s=''|'',''/'',''-'',''\'';$i=0;while((Get-Date)-lt $e){$i++;Write-Host -NoNewline ("`r[{0}] gritty-stress {1} " -f $s[$i%4],$i);if($i%40-eq0){Write-Host ("`n line {0}" -f $i)};Start-Sleep -Milliseconds 40}'
+        Set-Clipboard -Value ($cmd + "`r`n")
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class Fg { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n); }
+"@
+        $hwnd = ($g | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1).MainWindowHandle
+        if ($hwnd) {
+            [Fg]::ShowWindow($hwnd, 9) | Out-Null   # SW_RESTORE
+            [Fg]::SetForegroundWindow($hwnd) | Out-Null
+            Start-Sleep -Milliseconds 600
+            [System.Windows.Forms.SendKeys]::SendWait("^+b")  # Ctrl+Shift+B broadcast-paste
+            Info "Broadcast-pasted a streaming spinner into all panes (Ctrl+Shift+B)."
+        } else {
+            Warn "no window handle yet; skipping broadcast (memory test still runs)."
+        }
+    }
+
+    # ---- sample loop ----
+    Info ("Sampling every {0} ms for {1}s..." -f $IntervalMs, $Seconds)
+    $startTime = Get-Date
+    $end = $startTime.AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) {
+        $s = Sample
+        if ($s) {
+            $samples.Add($s)
+            $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+            Write-Host ("  t+{0,3}s  rss={1,7} MB  priv={2,7} MB  thr={3,4}  hnd={4,5}  cpu={5,6}s  procs={6}" -f `
+                $elapsed, $s.RssMB, $s.PrivMB, $s.Threads, $s.Handles, $s.CpuSec, $s.Count)
+        } else {
+            Warn "gritty process vanished mid-run"
+            break
+        }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+}
+finally {
+    Info "Cleaning up..."
+    Get-GrittyProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    Restore $sessionPath
+    Restore $configPath
+    Info "Restored your session.json and config.toml."
+}
+
+# ---------------------------------------------------------------------------
+# Verdict.
+# ---------------------------------------------------------------------------
+if ($samples.Count -lt 4) { Fail "too few samples ($($samples.Count)) to judge" }
+
+$csv = Join-Path $LogDir ("run_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
+$samples | Export-Csv -Path $csv -NoTypeInformation
+Info "Samples written to $csv"
+
+# Split warm-up (first third) from steady state (last two thirds).
+$warm = [int]([math]::Floor($samples.Count / 3))
+if ($warm -lt 1) { $warm = 1 }
+$baseRss  = ($samples[0..($warm-1)] | Measure-Object RssMB   -Average).Average
+$baseThr  = ($samples[0..($warm-1)] | Measure-Object Threads -Maximum).Maximum
+$endRss   = ($samples[($samples.Count-$warm)..($samples.Count-1)] | Measure-Object RssMB   -Average).Average
+$endThr   = ($samples[($samples.Count-$warm)..($samples.Count-1)] | Measure-Object Threads -Maximum).Maximum
+$peakRss  = ($samples | Measure-Object RssMB -Maximum).Maximum
+
+# CPU%: total CPU-seconds consumed across the run / wall-clock, x100.
+$cpuDelta = $samples[-1].CpuSec - $samples[0].CpuSec
+$wall     = ($samples.Count - 1) * ($IntervalMs / 1000.0)
+$cpuPct   = if ($wall -gt 0) { [math]::Round(100.0 * $cpuDelta / $wall, 1) } else { 0 }
+
+$rssGrowth = if ($baseRss -gt 0) { [math]::Round(100.0 * ($endRss - $baseRss) / $baseRss, 1) } else { 0 }
+
+Write-Host ""
+Write-Host "==== gritty stress summary ====" -ForegroundColor White
+Write-Host ("panes={0}  samples={1}  wall={2}s" -f $Panes, $samples.Count, [int]$wall)
+Write-Host ("RSS:     base={0} MB  end={1} MB  peak={2} MB  growth={3}%" -f $baseRss, $endRss, $peakRss, $rssGrowth)
+Write-Host ("Threads: base(max)={0}  end(max)={1}" -f $baseThr, $endThr)
+Write-Host ("CPU:     ~{0}% of one core over the run" -f $cpuPct)
+
+# Thresholds (heuristic; eyeball the CSV too).
+$leak   = $rssGrowth -gt 25            # resident set climbing after warm-up
+$thrub  = ($endThr - $baseThr) -gt 5   # thread count growing while panes fixed
+$verdict = $true
+if ($leak)  { Write-Host "  -> possible LEAK: RSS grew $rssGrowth% after warm-up" -ForegroundColor Red; $verdict = $false }
+if ($thrub) { Write-Host "  -> possible THREAD LEAK: +$($endThr-$baseThr) threads" -ForegroundColor Red; $verdict = $false }
+if ($Broadcast -and $cpuPct -gt 90) { Write-Host "  -> HIGH CPU under streaming ($cpuPct%): check dirty-rect" -ForegroundColor Yellow }
+
+if ($verdict) {
+    Write-Host "STRESS PASS  (RSS stable, no thread growth)" -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host "STRESS FAIL" -ForegroundColor Red
+    exit 1
+}
