@@ -47,9 +47,12 @@ pub(crate) enum Dir4 {
     Down,
 }
 
-/// Minimum spacing between repaints (~120 fps). Bursty PTY output coalesces into
-/// at most one frame per interval, so 15 noisy panes can't peg a core.
-pub(crate) const FRAME: std::time::Duration = std::time::Duration::from_millis(8);
+/// Minimum spacing between repaints (~60 fps). Rendering is single-threaded
+/// software rasterization, so each frame of a many-pane window is not free;
+/// capping the repaint *rate* keeps bursty PTY output (or many noisy panes) from
+/// pegging the event-loop core. 60 fps is smooth for terminal text; raise this
+/// (e.g. 33ms / 30 fps) for more headroom on very dense layouts.
+pub(crate) const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Paint the OS title bar (the caption that shows "gritty") the same
 /// indigo-charcoal as the app body with steel-grey text, so the icon sits in a

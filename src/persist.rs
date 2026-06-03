@@ -116,11 +116,21 @@ pub fn session_path() -> PathBuf {
 }
 
 pub fn save(session: &SavedSession) -> std::io::Result<()> {
-    let path = session_path();
+    save_to(&session_path(), session)
+}
+
+/// Write `session` to `path` atomically: serialize to a sibling `.tmp` file then
+/// rename it over the target. RT-18: `std::fs::write` straight onto session.json
+/// leaves a truncated file if the process is killed / loses power mid-write, and
+/// the next launch silently loses the whole workspace. A same-volume rename is
+/// atomic on NTFS, so a partial write can never clobber the last good session.
+pub fn save_to(path: &std::path::Path, session: &SavedSession) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, session.to_json())
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, session.to_json())?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Largest session file we will parse. Guards against a crafted/corrupt file
@@ -216,6 +226,26 @@ mod tests {
         std::fs::write(&big, vec![b'x'; (MAX_SESSION_BYTES + 1) as usize]).unwrap();
         assert!(load_from(&big).is_none());
         std::fs::remove_file(&big).ok();
+    }
+
+    #[test]
+    fn save_to_is_atomic_and_roundtrips() {
+        // RT-18: save_to writes via a temp file + rename. The target loads back
+        // identically and no `.tmp` file is left behind after the rename.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("gritty_test_save_{}.json", std::process::id()));
+        let tmp = path.with_extension("json.tmp");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&tmp).ok();
+
+        save_to(&path, &sample()).expect("save");
+        assert_eq!(load_from(&path), Some(sample()));
+        assert!(
+            !tmp.exists(),
+            "temp file must be renamed away, not left behind"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -389,6 +389,7 @@ impl Gritty {
                 ("Ctrl+Shift+R", "Rename pane"),
                 ("Ctrl+Shift+C", "Copy selection"),
                 ("Ctrl+Shift+V", "Paste"),
+                ("Ctrl+Shift+B", "Broadcast-paste clipboard to ALL panes"),
                 ("Ctrl+Tab", "Next tab"),
                 ("Ctrl+1-9", "Switch to tab N"),
                 ("Ctrl+0 / +/-", "Font zoom reset/in/out"),

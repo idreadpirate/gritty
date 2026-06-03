@@ -58,8 +58,16 @@ fn build_children_map(procs: &[Proc]) -> HashMap<u32, Vec<u32>> {
 fn deepest_descendant_with_map(children: &HashMap<u32, Vec<u32>>, root: u32) -> Option<u32> {
     let mut best: Option<u32> = None;
     let mut best_depth = 0usize;
+    // RT-23: a ppid can reference a recycled/foreign PID, so the children map can
+    // contain a cycle (pid == ppid, or two procs each naming the other as parent).
+    // Without a visited guard this DFS pushes forever and hangs the UI thread (the
+    // poll runs on it every 750 ms). Skip any pid we've already expanded.
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut stack = vec![(root, 0usize)];
     while let Some((pid, depth)) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
         if depth > best_depth || (depth == best_depth && depth > 0 && Some(pid) > best) {
             best = Some(pid);
             best_depth = depth;
@@ -256,6 +264,24 @@ mod tests {
         let procs = vec![p(10, 1, "pwsh.exe")];
         let snap = Snapshot::from_procs(procs);
         assert!(snap.foreground_name(10).is_none());
+    }
+
+    #[test]
+    fn two_cycle_parent_map_terminates() {
+        // RT-23: PID reuse can make two live procs each list the other as parent,
+        // forming a cycle in the children map. The walk must terminate (not hang)
+        // and return a bounded descendant rather than looping forever.
+        let procs = vec![p(100, 200, "a.exe"), p(200, 100, "b.exe")];
+        assert_eq!(deepest_descendant(&procs, 100), Some(200));
+        assert_eq!(deepest_descendant(&procs, 200), Some(100));
+    }
+
+    #[test]
+    fn self_parent_terminates_with_no_descendant() {
+        // RT-23: a process whose ppid equals its own pid is a 1-cycle.
+        let procs = vec![p(100, 1, "pwsh.exe"), p(500, 500, "loop.exe")];
+        assert!(deepest_descendant(&procs, 500).is_none());
+        assert!(deepest_descendant(&procs, 100).is_none());
     }
 
     #[test]

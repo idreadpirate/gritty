@@ -1,6 +1,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use winit::application::ApplicationHandler;
@@ -171,20 +172,28 @@ impl Gritty {
     }
 
     /// Refresh each pane's foreground process name across all windows (one OS
-    /// snapshot for all).
-    pub(crate) fn update_procs(&mut self) {
+    /// snapshot for all). Returns `true` only if a name actually changed, so the
+    /// caller can skip a repaint when nothing did — otherwise an idle window full
+    /// of panes would repaint on every poll and burn CPU for no visible change.
+    pub(crate) fn update_procs(&mut self) -> bool {
         let procs = proc::snapshot();
+        let mut changed = false;
         for win in &mut self.windows {
             for tab in &mut win.tabs {
                 for pane in tab.panes.values_mut() {
-                    pane.proc_name = pane
+                    let name = pane
                         .pty
                         .pid()
                         .and_then(|pid| proc::foreground_name(&procs, pid))
                         .unwrap_or_default();
+                    if name != pane.proc_name {
+                        pane.proc_name = name;
+                        changed = true;
+                    }
                 }
             }
         }
+        changed
     }
 
     pub(crate) fn bar_h(&self) -> usize {
@@ -278,11 +287,23 @@ impl Gritty {
                 self.relayout(wi);
             }
             Err(e) => {
-                // No shell is available — show a native error dialog, then exit.
-                show_error_dialog(&format!(
-                    "Gritty could not start a shell.\n\n{e}\n\nThe application will now exit."
-                ));
-                std::process::exit(1);
+                // RT-110: a failed shell spawn is only fatal at cold start, when
+                // there is no live tab anywhere to fall back to. If the user
+                // already has running tabs (interactive Ctrl+Shift+T / palette /
+                // `+` button), a transient spawn miss must NOT tear down every
+                // window — keep the existing work and just report the failure
+                // (mirrors `split_focus`'s graceful skip, cf. CA-53).
+                let any_tabs_alive = self.windows.iter().any(|w| !w.tabs.is_empty());
+                if new_tab_failure_is_fatal(any_tabs_alive) {
+                    show_error_dialog(&format!(
+                        "Gritty could not start a shell.\n\n{e}\n\nThe application will now exit."
+                    ));
+                    std::process::exit(1);
+                } else {
+                    show_error_dialog(&format!(
+                        "Gritty could not start a new shell.\n\n{e}\n\nYour existing tabs are unaffected."
+                    ));
+                }
             }
         }
     }
@@ -516,6 +537,31 @@ impl Gritty {
                 }
             }
         }
+    }
+
+    /// Paste the clipboard into EVERY pane across all tabs and all windows at
+    /// once — dispatch one command to a whole fleet of agents without going
+    /// pane-by-pane. Each pane gets the text wrapped for its own bracketed-paste
+    /// mode. Returns the number of panes written to.
+    pub(crate) fn broadcast_paste_all(&mut self) -> usize {
+        let Some(text) = self.clip.paste() else {
+            return 0;
+        };
+        if text.is_empty() {
+            return 0;
+        }
+        let mut written = 0;
+        for win in &mut self.windows {
+            for tab in &mut win.tabs {
+                for pane in tab.panes.values_mut() {
+                    let data = crate::term::wrap_paste(&text, pane.term.bracketed_paste());
+                    pane.term.scroll_to_bottom();
+                    pane.pty.write(&data);
+                    written += 1;
+                }
+            }
+        }
+        written
     }
 
     /// Capture every window's workspace for persistence.
@@ -817,13 +863,20 @@ impl Gritty {
         let (cw, ch) = (self.font.cell_w, self.font.cell_h);
         let gx = (x as usize).saturating_sub(grid.x);
         let gy = (y as usize).saturating_sub(grid.y);
-        let col = gx / cw.max(1);
-        let row = gy / ch.max(1);
+        // RT-16: clamp the column and bounds-check the line before indexing the VT
+        // grid — `pane_at`/`r.contains` accept the full pane rect, so a click on a
+        // trailing partial column (pane width not a multiple of the cell width) or
+        // far into scrollback would otherwise index out of range and panic, which
+        // under `panic = "abort"` is a silent crash.
+        let vt = pane.term.term.grid();
+        let (cols, screen_lines, total_lines) =
+            (vt.columns(), vt.screen_lines(), vt.total_lines());
+        let history = total_lines.saturating_sub(screen_lines);
         let display_offset = pane.term.display_offset();
-        use alacritty_terminal::index::{Column, Line, Point};
-        let line = Line(row as i32 - display_offset as i32);
-        let point = Point::new(line, Column(col));
-        let cell = pane.term.term.grid()[point].clone();
+        let (line, col) =
+            hyperlink_cell(gx, gy, cw, ch, cols, screen_lines, history, display_offset)?;
+        let point = Point::new(Line(line), Column(col));
+        let cell = vt[point].clone();
         let hyperlink = cell.hyperlink()?;
         Some(hyperlink.uri().to_owned())
     }
@@ -918,11 +971,22 @@ impl ApplicationHandler<Wake> for Gritty {
         // Fresh start, or every saved window failed to restore: open one window
         // with a single tab.
         if self.windows.is_empty() {
-            let win = self
-                .spawn_window(event_loop, (960.0, 600.0), None, false)
-                .expect("create window");
-            self.windows.push(win);
-            self.new_tab(0);
+            // RT-17: degrade gracefully if the OS refuses the first window
+            // (headless/Session-0, exhausted desktop heap, broken GPU/driver)
+            // instead of `.expect()`-aborting silently under `panic = "abort"`.
+            match self.spawn_window(event_loop, (960.0, 600.0), None, false) {
+                Some(win) => {
+                    self.windows.push(win);
+                    self.new_tab(0);
+                }
+                None => {
+                    show_error_dialog(
+                        "Gritty could not create its window.\n\nThe application will now exit.",
+                    );
+                    event_loop.exit();
+                    return;
+                }
+            }
         }
         self.focused = 0;
     }
@@ -932,9 +996,8 @@ impl ApplicationHandler<Wake> for Gritty {
         self.reap_dead(event_loop);
         let mut proc_dirty = false;
         if self.last_proc_poll.elapsed() >= Duration::from_millis(750) {
-            self.update_procs();
+            proc_dirty = self.update_procs(); // repaint only if a header changed
             self.last_proc_poll = Instant::now();
-            proc_dirty = true; // headers may have changed
 
             // Leak probe (debug only): RSS + OS thread count vs. live pane count.
             // RSS climbing → heap leak; os_threads growing while panes flat →

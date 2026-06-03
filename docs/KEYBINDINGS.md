@@ -25,6 +25,7 @@
 |---|---|
 | Copy | `Ctrl+Shift+C` (or drag-select — auto-copies) |
 | Paste | `Ctrl+Shift+V`, or right-click (sanitized, bracketed-paste safe) |
+| Broadcast paste | `Ctrl+Shift+B` — paste the clipboard into **every pane in every window** at once (sanitized, per-pane bracketed-paste safe) |
 | Scroll | Mouse wheel (typing snaps back to the bottom) |
 | Open hyperlink | `Ctrl+Click` an OSC-8 link (http/https/file only) |
 

@@ -6,6 +6,28 @@ use crate::layout::Axis;
 use crate::palette::{Cmd, Palette};
 use crate::Dir4;
 
+/// Max length (in chars) for a rename buffer or palette query. A single
+/// `Key::Character` event can carry a multi-char string (IME composition / some
+/// key-repeat paths), and tab/pane names are persisted to session.json, so the
+/// buffers must not grow without bound. RT-19.
+const MAX_NAME_LEN: usize = 256;
+
+/// Append `s` to a single-line name/query buffer, dropping control characters
+/// and capping total length. CA-51: a literal newline/CR/ESC/tab corrupts the
+/// single-line tab-bar render and is written verbatim into session.json, where
+/// it reloads corrupt. RT-19: cap growth at `MAX_NAME_LEN` chars. Pure so it is
+/// unit-tested below.
+fn push_name_input(buf: &mut String, s: &str) {
+    for c in s.chars() {
+        if buf.chars().count() >= MAX_NAME_LEN {
+            break;
+        }
+        if !c.is_control() {
+            buf.push(c);
+        }
+    }
+}
+
 impl Gritty {
     pub(crate) fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
         // Keyboard always targets the focused window.
@@ -48,12 +70,12 @@ impl Gritty {
                 }
                 Key::Character(s) => {
                     if let Some(buf) = self.windows[wi].rename.as_mut() {
-                        buf.push_str(s);
+                        push_name_input(buf, s);
                     }
                 }
                 Key::Named(NamedKey::Space) => {
                     if let Some(buf) = self.windows[wi].rename.as_mut() {
-                        buf.push(' ');
+                        push_name_input(buf, " ");
                     }
                 }
                 _ => {}
@@ -92,6 +114,15 @@ impl Gritty {
                 match s.to_lowercase().as_str() {
                     "c" => return self.copy_selection(wi),
                     "v" => return self.paste(wi),
+                    // Ctrl+Shift+B: broadcast-paste the clipboard to EVERY pane in
+                    // every tab/window at once (fan one command out to a fleet).
+                    "b" => {
+                        self.broadcast_paste_all();
+                        for w in 0..self.windows.len() {
+                            self.request_redraw(w);
+                        }
+                        return;
+                    }
                     "d" => return self.split_focus(wi, Axis::LeftRight),
                     "e" => return self.split_focus(wi, Axis::TopBottom),
                     "w" => return self.close_focus(wi, event_loop),
@@ -289,11 +320,11 @@ impl Gritty {
                     p.sel = 0;
                 }
                 Key::Named(NamedKey::Space) => {
-                    p.query.push(' ');
+                    push_name_input(&mut p.query, " ");
                     p.sel = 0;
                 }
                 Key::Character(s) => {
-                    p.query.push_str(s);
+                    push_name_input(&mut p.query, s);
                     p.sel = 0;
                 }
                 _ => {}
@@ -367,6 +398,12 @@ impl Gritty {
                     win.broadcast = !win.broadcast;
                 }
             }
+            Cmd::BroadcastPasteAll => {
+                self.broadcast_paste_all();
+                for w in 0..self.windows.len() {
+                    self.request_redraw(w);
+                }
+            }
             Cmd::ToggleSeamless => {
                 if let Some(win) = self.windows.get_mut(wi) {
                     win.seamless = !win.seamless;
@@ -392,6 +429,34 @@ impl Gritty {
 
 #[cfg(test)]
 mod tests {
+    use super::{push_name_input, MAX_NAME_LEN};
+
+    #[test]
+    fn name_input_strips_control_chars() {
+        // CA-51: newline / CR / tab / ESC must not enter a single-line name.
+        let mut buf = String::new();
+        push_name_input(&mut buf, "a\nb\r\tc\x1bd");
+        assert_eq!(buf, "abcd");
+    }
+
+    #[test]
+    fn name_input_keeps_printable_and_space() {
+        let mut buf = String::new();
+        push_name_input(&mut buf, "hi there");
+        assert_eq!(buf, "hi there");
+    }
+
+    #[test]
+    fn name_input_caps_length() {
+        // RT-19: a multi-char Character event can't grow the buffer past the cap,
+        // and once at the cap further appends are a no-op.
+        let mut buf = String::new();
+        push_name_input(&mut buf, &"x".repeat(1000));
+        assert_eq!(buf.chars().count(), MAX_NAME_LEN);
+        push_name_input(&mut buf, "y");
+        assert_eq!(buf.chars().count(), MAX_NAME_LEN);
+    }
+
     // RT-10: tab-switch sites call drain_pty. Validated by reading the
     // implementation — all switch paths call self.drain_pty() immediately after
     // updating the active tab.

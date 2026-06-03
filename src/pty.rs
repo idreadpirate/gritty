@@ -176,6 +176,73 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    #[ignore = "diagnostic: measures a real shell's idle output rate (DSR storm hunt)"]
+    fn idle_shell_output_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // First shell that exists, mirroring session::shell_candidates() order.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        let candidates = [
+            format!(r"{pf}\PowerShell\7\pwsh.exe"),
+            format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            format!(r"{sysroot}\System32\cmd.exe"),
+        ];
+        let shell = candidates
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a shell exists")
+            .clone();
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_w = Arc::clone(&wakes);
+        let pty = Pty::spawn(
+            &shell,
+            &[],
+            24,
+            80,
+            move || {
+                wakes_w.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )
+        .expect("spawn shell");
+
+        // Drain startup output for 1.5s so we measure the steady state, not boot.
+        let settle = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < settle {
+            pty.mark_drained();
+            while pty.rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Measure 3s of IDLE — we send the shell nothing.
+        wakes.store(0, Ordering::Relaxed);
+        let (mut bytes, mut chunks) = (0usize, 0usize);
+        let probe = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < probe {
+            pty.mark_drained();
+            while let Ok(c) = pty.rx.try_recv() {
+                bytes += c.len();
+                chunks += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let shell_name = shell.rsplit('\\').next().unwrap_or(&shell);
+        eprintln!(
+            "\n[idle probe] shell={shell_name}  over 3s idle:  bytes={bytes}  chunks={chunks}  wakes={}",
+            wakes.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "[idle probe] => bytes/s={}  wakes/s={}\n",
+            bytes / 3,
+            wakes.load(Ordering::Relaxed) / 3
+        );
+    }
+
+    #[test]
     fn conpty_echo_roundtrips() {
         let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {}, None)
             .expect("spawn cmd.exe over ConPTY");

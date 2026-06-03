@@ -30,6 +30,15 @@ impl Rect {
 
 /// Split `area` into the two child rectangles for a given axis and ratio.
 pub fn child_areas(axis: Axis, ratio: f32, area: Rect) -> (Rect, Rect) {
+    // RT-80: `ratio` can arrive unvalidated from a restored/crafted session.json
+    // (SavedTab.tree -> Node::Split.ratio is read raw). A NaN rounds to 0 (a pane
+    // silently vanishes); a huge value makes `area.x + wa` overflow. Sanitize at
+    // the boundary so a corrupt file can never produce an out-of-bounds rect.
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     match axis {
         Axis::LeftRight => {
             let wa = ((area.w as f32) * ratio).round() as usize;
@@ -569,6 +578,26 @@ mod tests {
         n.set_ratio(&[], 5.0); // absurd value clamps to 0.95
         let r = rects(&n);
         assert_eq!(r[0].1.w, 95);
+    }
+
+    #[test]
+    fn child_areas_sanitizes_hostile_ratio() {
+        // RT-80: a corrupt session.json can carry NaN / Infinity / out-of-range
+        // ratios. Every case must yield children that partition the parent area
+        // exactly and stay in bounds — no vanish-to-zero overflow, no huge rect.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30, -5.0, 2.0] {
+            let (a, b) = child_areas(Axis::LeftRight, bad, AREA);
+            assert!(a.w <= AREA.w, "ratio {bad}: left width {} > area", a.w);
+            assert_eq!(a.x + a.w, b.x, "ratio {bad}: children must be contiguous");
+            assert_eq!(a.w + b.w, AREA.w, "ratio {bad}: must partition width");
+            assert!(
+                b.x + b.w <= AREA.x + AREA.w,
+                "ratio {bad}: right out of bounds"
+            );
+        }
+        // NaN falls back to the 0.5 midpoint rather than collapsing a pane to 0.
+        let (a, _) = child_areas(Axis::LeftRight, f32::NAN, AREA);
+        assert_eq!(a.w, 50);
     }
 
     #[test]
