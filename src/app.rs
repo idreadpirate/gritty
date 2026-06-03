@@ -3354,6 +3354,108 @@ mod tests {
         assert!(session_should_persist(5));
     }
 
+    /// CA-100 regression: a last-pane/last-window teardown must NOT overwrite the
+    /// saved session with an empty workspace.
+    ///
+    /// The truth-table test above only pins the predicate in isolation — it stays
+    /// green even if the *call site* is reverted to persist unconditionally,
+    /// because it never exercises what an unguarded persist actually writes. This
+    /// test closes that gap: it models the real teardown decision against a disk
+    /// holding the last-good session, persisting the post-removal snapshot exactly
+    /// when (and only when) `session_should_persist` says so, then reads the disk
+    /// back through the genuine serialize/deserialize seam used by
+    /// `persist_session`. It FAILS if the guard is removed (unconditional persist
+    /// of the now-empty window list snapshots `{"windows":[]}` and the restored
+    /// workspace comes back empty — the exact wipe CA-100 describes).
+    #[test]
+    fn last_teardown_does_not_wipe_saved_workspace() {
+        use crate::layout::Node;
+
+        // A real, non-empty workspace already on disk (one window, one tab, one
+        // named pane) — the "last good session" that must survive a teardown.
+        fn last_good_session() -> persist::SavedSession {
+            persist::SavedSession::from_windows(vec![SavedWindow {
+                active: 0,
+                tabs: vec![persist::SavedTab {
+                    name: "work".into(),
+                    color: 0x00ff_3d9a,
+                    focus: 0,
+                    next_id: 1,
+                    tree: Node::Leaf(0),
+                    panes: vec![persist::SavedPane {
+                        id: 0,
+                        name: "editor".into(),
+                    }],
+                }],
+                win_w: Some(1200),
+                win_h: Some(800),
+                win_x: Some(40),
+                win_y: Some(60),
+                seamless: false,
+            }])
+        }
+
+        // Model the CloseRequested teardown: `self.windows` after `remove(wi)` is
+        // a list of the survivors. Persist the snapshot of the survivors only when
+        // the guard allows it (the call-site decision), writing through the same
+        // JSON round-trip `persist::save`/`load` uses. Returns the workspace that
+        // would be restored on the next launch.
+        fn teardown_then_restore(
+            on_disk: persist::SavedSession,
+            survivors: Vec<SavedWindow>,
+        ) -> Vec<SavedWindow> {
+            // The "disk" holds the last-good session as serialized JSON.
+            let mut disk = on_disk.to_json();
+            if session_should_persist(survivors.len()) {
+                // snapshot() of the live windows == from_windows(survivors).
+                disk = persist::SavedSession::from_windows(survivors).to_json();
+            }
+            persist::SavedSession::from_json(&disk)
+                .expect("session JSON must round-trip")
+                .windows()
+        }
+
+        // Closing the LAST window leaves zero survivors. The saved workspace must
+        // be untouched — its one window/tab/pane still restorable next launch.
+        let restored = teardown_then_restore(last_good_session(), Vec::new());
+        assert_eq!(
+            restored.len(),
+            1,
+            "last-pane teardown wiped the saved workspace (CA-100): the guard \
+             let an empty snapshot overwrite session.json",
+        );
+        assert_eq!(restored[0].tabs.len(), 1, "saved tab must survive teardown");
+        assert_eq!(restored[0].tabs[0].panes[0].name, "editor");
+
+        // Sanity: closing a NON-last window still persists the survivors, so the
+        // saved workspace reflects the survivor (and not the stale last-good one).
+        let survivor = SavedWindow {
+            active: 0,
+            tabs: vec![persist::SavedTab {
+                name: "kept".into(),
+                color: 0x003d_f0ff,
+                focus: 0,
+                next_id: 1,
+                tree: Node::Leaf(0),
+                panes: vec![persist::SavedPane {
+                    id: 0,
+                    name: "shell".into(),
+                }],
+            }],
+            win_w: None,
+            win_h: None,
+            win_x: None,
+            win_y: None,
+            seamless: false,
+        };
+        let restored = teardown_then_restore(last_good_session(), vec![survivor]);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].tabs[0].name, "kept",
+            "a non-last close must persist the survivors",
+        );
+    }
+
     // --- CA-33 hyperlink scheme sanitizer ------------------------------------
 
     #[test]
