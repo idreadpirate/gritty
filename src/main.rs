@@ -190,7 +190,75 @@ pub(crate) fn load_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(bytes.to_vec(), 64, 64).ok()
 }
 
+/// RT-22: `%LOCALAPPDATA%\gritty\crash.log` (then `%APPDATA%`, then the temp dir) —
+/// the same precedence as the session file, so the crash log lands beside it.
+/// Release builds use `windows_subsystem = "windows"` (no console) + `panic =
+/// "abort"`, so a field panic otherwise vanishes with no stderr and no trace.
+fn crash_log_path() -> std::path::PathBuf {
+    let mut dir = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.push("gritty");
+    dir.push("crash.log");
+    dir
+}
+
+/// RT-22: Format one crash-log line from a panic's location, message, and a
+/// monotonic-ish timestamp (epoch seconds). Pure + dependency-free so it is
+/// unit-testable; the hook just appends the returned line to `crash.log`.
+fn crash_log_line(epoch_secs: u64, location: &str, message: &str) -> String {
+    // Keep the payload on one line so a multi-line panic message can't forge fake
+    // log entries; the reader can still recover the original via the escapes.
+    let msg = message.replace('\n', "\\n").replace('\r', "\\r");
+    format!("[{epoch_secs}] panic at {location}: {msg}\n")
+}
+
+/// RT-22: Install a panic hook that appends the panic location + payload to
+/// `crash.log` (best-effort) before the default hook runs. Chaining the default
+/// hook preserves the dev-build console backtrace; the appended line gives field
+/// (release, no-console) crashes a durable trace instead of a silent abort.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".into());
+        let line = crash_log_line(epoch_secs, &location, &message);
+        // Best-effort: never panic from inside the panic hook.
+        let path = crash_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+        default(info);
+    }));
+}
+
 fn main() {
+    // RT-22: capture panics to a crash log before anything else can panic — under
+    // release's `windows` subsystem + `panic = "abort"` a crash otherwise leaves
+    // no stderr, dialog, or log, so "it just disappeared" is undiagnosable.
+    install_panic_hook();
+
     // Detach from the launching terminal before doing anything else, so closing
     // that window can't reap us (and so we never create two windows/sessions).
     ensure_detached();
@@ -202,4 +270,33 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = Gritty::new(proxy);
     event_loop.run_app(&mut app).expect("run");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- RT-22 crash-log formatter -------------------------------------------
+
+    #[test]
+    fn crash_log_line_has_timestamp_location_and_message() {
+        let line = crash_log_line(1_717_000_000, "src/app.rs:42:7", "boom");
+        assert_eq!(line, "[1717000000] panic at src/app.rs:42:7: boom\n");
+    }
+
+    #[test]
+    fn crash_log_line_is_single_line_even_with_multiline_message() {
+        // A panic payload with newlines must not forge extra log entries; they are
+        // escaped so each panic stays exactly one line.
+        let line = crash_log_line(0, "loc", "line one\nline two\r\n");
+        assert_eq!(line.matches('\n').count(), 1, "exactly one real newline");
+        assert!(line.ends_with('\n'));
+        assert!(line.contains("line one\\nline two\\r\\n"));
+    }
+
+    #[test]
+    fn crash_log_path_ends_in_gritty_crash_log() {
+        let p = crash_log_path();
+        assert!(p.ends_with("gritty/crash.log") || p.ends_with("gritty\\crash.log"));
+    }
 }

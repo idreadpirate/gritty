@@ -32,8 +32,22 @@ pub(crate) const ZOOM_STEP: f32 = 2.0;
 const MULTI_CLICK_MS: u64 = 500;
 
 /// Cap on simultaneously-restored windows (mirrors the per-window tab cap; guards
-/// against a crafted session mass-spawning OS windows).
+/// against a crafted session mass-spawning OS windows). Also the runtime ceiling
+/// on interactively-created OS windows (RT-137).
 const MAX_WINDOWS: usize = 16;
+/// Cap on tabs per window — enforced both when restoring a saved session and on
+/// the interactive new-tab path (RT-137).
+const MAX_TABS: usize = 64;
+/// Cap on panes (tree leaves) per tab — enforced both when restoring and on the
+/// interactive split path (RT-137).
+const MAX_PANES_PER_TAB: usize = 64;
+/// Aggregate cap on the total number of panes restored across ALL windows in one
+/// `restore_windows` call (RT-26). The per-window/per-tab caps bound each entry
+/// independently, but a crafted `session.json` can still encode their *product*
+/// (16 windows × 64 tabs × 64 leaves ≈ 64k shells); `Tab::from_saved` spawns one
+/// real shell per leaf synchronously on the UI thread, so the product must also
+/// be bounded or startup mass-spawns shells and freezes.
+const MAX_RESTORED_PANES: usize = 256;
 
 /// A tab being dragged on the bar. If released outside the window it tears off
 /// into its own OS window (`armed` flips true once the pointer leaves the bounds).
@@ -269,6 +283,16 @@ impl Gritty {
     }
 
     pub(crate) fn new_tab(&mut self, wi: usize) {
+        // RT-137: refuse new tabs once the window is at the cap so holding
+        // Ctrl+Shift+T (auto-repeat) can't fork-bomb shells/reader threads. The
+        // restore path already enforces MAX_TABS; the interactive path must too.
+        if self
+            .windows
+            .get(wi)
+            .is_some_and(|win| tab_cap_reached(win.tabs.len()))
+        {
+            return;
+        }
         let (w, h) = self.win_size(wi);
         let area = self.content_rect(w, h);
         let (cw, ch) = (self.font.cell_w.max(1), self.font.cell_h.max(1));
@@ -317,6 +341,12 @@ impl Gritty {
         if let Some(win) = self.windows.get_mut(wi) {
             let active = win.active;
             if let Some(tab) = win.tabs.get_mut(active) {
+                // RT-137: refuse the split once the tab is at the pane cap so
+                // holding Ctrl+Shift+D (auto-repeat) can't fork-bomb shells. The
+                // restore path already enforces MAX_PANES_PER_TAB.
+                if pane_cap_reached(tab.panes.len()) {
+                    return;
+                }
                 // On split failure (shell could not spawn) we silently skip the
                 // split rather than crash — the existing pane continues.
                 let _ = tab.split(axis, proxy);
@@ -633,13 +663,26 @@ impl Gritty {
         event_loop: &ActiveEventLoop,
         saved: Vec<SavedWindow>,
     ) {
-        const MAX_TABS: usize = 64;
-        const MAX_PANES_PER_TAB: usize = 64;
+        // RT-26: bound the *aggregate* restored-pane count across all windows, not
+        // just each window/tab independently — a crafted session can encode the
+        // product (16×64×64) under the file-size cap and `Tab::from_saved` spawns
+        // one real shell per leaf synchronously. Once the global budget is spent we
+        // stop restoring further windows.
+        let mut restored_panes = 0usize;
 
         for sw in saved.into_iter().take(MAX_WINDOWS) {
             if sw.tabs.is_empty() || sw.tabs.len() > MAX_TABS {
                 continue;
             }
+            let window_panes: usize = sw
+                .tabs
+                .iter()
+                .map(|st| {
+                    let mut lv = Vec::new();
+                    st.tree.leaves(&mut lv);
+                    lv.len()
+                })
+                .sum();
             let too_many_panes = sw.tabs.iter().any(|st| {
                 let mut lv = Vec::new();
                 st.tree.leaves(&mut lv);
@@ -647,6 +690,12 @@ impl Gritty {
             });
             if too_many_panes {
                 continue;
+            }
+            // RT-26: skip any window that would push the aggregate over budget. We
+            // stop rather than partially restore a window so each restored window is
+            // internally consistent.
+            if restored_panes_over_budget(restored_panes, window_panes) {
+                break;
             }
             let size = match (sw.win_w, sw.win_h) {
                 (Some(w), Some(h)) if w >= 200 && h >= 100 => (w as f64, h as f64),
@@ -680,6 +729,9 @@ impl Gritty {
                 continue;
             }
             win.active = sw.active.min(tabs.len() - 1);
+            // RT-26: count the panes we actually spawned (some leaves may have been
+            // dropped by `Tab::from_saved` on spawn failure) toward the budget.
+            restored_panes += tabs.iter().map(|t| t.panes.len()).sum::<usize>();
             win.tabs = tabs;
             self.windows.push(win);
             let wi = self.windows.len() - 1;
@@ -698,8 +750,20 @@ impl Gritty {
         if windows.is_empty() {
             return;
         }
-        self.windows.clear();
+        // RT-41: don't clear the live windows up front. If every saved window
+        // fails to respawn (resource exhaustion, or shells that won't start),
+        // clearing first would leave gritty with ZERO windows — no RedrawRequested,
+        // no input target, and nothing to call `event_loop.exit()`: an invisible
+        // zombie the user can only kill via Task Manager. Instead restore into a
+        // fresh `self.windows` (the live ones held aside) and only discard the old
+        // ones once at least one new window actually spawned; otherwise put them
+        // back so the workspace is preserved.
+        let previous = std::mem::take(&mut self.windows);
         self.restore_windows(event_loop, windows);
+        if self.windows.is_empty() {
+            // Nothing restored — keep the existing workspace intact.
+            self.windows = previous;
+        }
         if !self.windows.is_empty() {
             self.focused = self.focused.min(self.windows.len() - 1);
         }
@@ -715,6 +779,12 @@ impl Gritty {
         tab_index: usize,
         pos: Option<(i32, i32)>,
     ) {
+        // RT-137: refuse a tear-off once at the window cap so repeated tear-offs /
+        // Ctrl+Shift+N (auto-repeat) can't spawn unbounded OS windows. Checked
+        // before removing the source tab so a refused tear-off loses nothing.
+        if window_cap_reached(self.windows.len()) {
+            return;
+        }
         let (n, size, seamless) = match self.windows.get(wi) {
             Some(win) => {
                 let s = win.window.inner_size();
@@ -1632,6 +1702,31 @@ pub(crate) fn new_tab_failure_is_fatal(any_tabs_alive: bool) -> bool {
     !any_tabs_alive
 }
 
+/// RT-26: true if restoring a window with `window_panes` panes would push the
+/// running aggregate (`restored_so_far`) past `MAX_RESTORED_PANES`. Restoring
+/// stops at the first window that would exceed the budget.
+pub(crate) fn restored_panes_over_budget(restored_so_far: usize, window_panes: usize) -> bool {
+    restored_so_far.saturating_add(window_panes) > MAX_RESTORED_PANES
+}
+
+/// RT-137: true if a window already at `current_tabs` tabs is at the runtime cap
+/// and a new tab must be refused. Mirrors the restore-time `MAX_TABS` bound.
+pub(crate) fn tab_cap_reached(current_tabs: usize) -> bool {
+    current_tabs >= MAX_TABS
+}
+
+/// RT-137: true if a tab already at `current_panes` panes is at the runtime cap
+/// and a split must be refused. Mirrors the restore-time `MAX_PANES_PER_TAB` bound.
+pub(crate) fn pane_cap_reached(current_panes: usize) -> bool {
+    current_panes >= MAX_PANES_PER_TAB
+}
+
+/// RT-137: true if there are already `current_windows` OS windows and a new
+/// window (tear-off / Ctrl+Shift+N) must be refused. Mirrors `MAX_WINDOWS`.
+pub(crate) fn window_cap_reached(current_windows: usize) -> bool {
+    current_windows >= MAX_WINDOWS
+}
+
 /// CA-7: Encode an SGR mouse sequence.
 pub(crate) fn encode_sgr_mouse(btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
     let suffix = if press { 'M' } else { 'm' };
@@ -1812,6 +1907,61 @@ mod tests {
         assert!(!should_tear_off(true, false, 2)); // released inside
         assert!(!should_tear_off(true, true, 1)); // only tab — nothing to split off
         assert!(!should_tear_off(false, false, 1));
+    }
+
+    // --- RT-26 aggregate restored-pane budget --------------------------------
+
+    #[test]
+    fn restore_budget_allows_up_to_cap_and_blocks_overflow() {
+        // Empty start: a window at exactly the cap fits; one over does not.
+        assert!(!restored_panes_over_budget(0, MAX_RESTORED_PANES));
+        assert!(restored_panes_over_budget(0, MAX_RESTORED_PANES + 1));
+    }
+
+    #[test]
+    fn restore_budget_is_aggregate_across_windows() {
+        // A crafted session of many full 64-leaf tabs across windows is bounded by
+        // the *running total*, not each window independently: once the budget is
+        // (nearly) spent, the next window is refused even though it alone is small.
+        let mut restored = 0usize;
+        let mut windows_kept = 0usize;
+        // 16 windows × 64 panes each = 1024 panes; only the first few fit under 256.
+        for _ in 0..MAX_WINDOWS {
+            let window_panes = 64;
+            if restored_panes_over_budget(restored, window_panes) {
+                break;
+            }
+            restored += window_panes;
+            windows_kept += 1;
+        }
+        assert_eq!(windows_kept, MAX_RESTORED_PANES / 64);
+        assert!(restored <= MAX_RESTORED_PANES);
+    }
+
+    // --- RT-137 runtime creation caps ----------------------------------------
+
+    #[test]
+    fn tab_cap_refuses_at_max_tabs() {
+        assert!(!tab_cap_reached(0));
+        assert!(!tab_cap_reached(MAX_TABS - 1));
+        assert!(tab_cap_reached(MAX_TABS));
+        assert!(tab_cap_reached(MAX_TABS + 1));
+    }
+
+    #[test]
+    fn pane_cap_refuses_at_max_panes_per_tab() {
+        assert!(!pane_cap_reached(1));
+        assert!(!pane_cap_reached(MAX_PANES_PER_TAB - 1));
+        assert!(pane_cap_reached(MAX_PANES_PER_TAB));
+        assert!(pane_cap_reached(MAX_PANES_PER_TAB + 5));
+    }
+
+    #[test]
+    fn window_cap_refuses_at_max_windows() {
+        assert!(!window_cap_reached(1));
+        assert!(!window_cap_reached(MAX_WINDOWS - 1));
+        assert!(window_cap_reached(MAX_WINDOWS));
+        assert!(window_cap_reached(MAX_WINDOWS + 1));
     }
 
     // --- CA-33 hyperlink scheme sanitizer ------------------------------------
