@@ -2042,7 +2042,7 @@ impl Gritty {
                 self.request_redraw(wi);
                 return;
             }
-            if let Some(i) = self.tab_at(wi, x as usize) {
+            if let Some(i) = self.tab_at(wi, clamp_pixel(x)) {
                 if let Some(win) = self.windows.get_mut(wi) {
                     if i != win.active {
                         win.broadcast = false;
@@ -3981,6 +3981,25 @@ mod tests {
         );
         // Sanity: the divider is still detected when the cursor is actually on it.
         assert_eq!(tree.divider_at(area, 50, 30, 5), Some(Vec::new()));
+    }
+
+    #[test]
+    fn tab_hit_test_clamps_negative_coords() {
+        // mouse_pos.0 is f64 and goes negative on a monitor at negative
+        // coordinates. The tab-bar click routes it through clamp_pixel before
+        // tab_at (a usize hit-test): a click at a negative x must resolve to the
+        // first tab's slot, not be cast raw. tab 0's slot spans [0, (2+2)*10+10).
+        let cw = 10;
+        let w = 1000;
+        let lens = [2usize, 3];
+        let (x, _y) = (-40.0_f64, 5.0_f64);
+        assert_eq!(
+            layout::tab_at(lens, cw, clamp_pixel(x), w),
+            Some(0),
+            "a negative mouse-x tab click must clamp to the first tab, not wrap"
+        );
+        // Sanity: a positive x still hits the second tab through the same path.
+        assert_eq!(layout::tab_at(lens, cw, clamp_pixel(60.0), w), Some(1));
     }
 
     // --- CA-50 close-confirm predicate ---------------------------------------
