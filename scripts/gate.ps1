@@ -4,7 +4,11 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$MaxBytes = 1300000   # binary ceiling (~1.24 MB) — bloat guard
+$MaxBytes = 1550000   # binary ceiling (~1.48 MB) — bloat guard. Raised from 1.30MB
+                      # after the 2026-06 hardening campaign added real features
+                      # (HiDPI, IME, config.toml wiring, dirty-rect repaint, panic
+                      # crash-log, CJK width via unicode-width). Profile unchanged
+                      # (panic=abort+lto+strip); growth is feature code, not bloat.
 $MaxPkgs  = 290       # Cargo.lock package ceiling — dependency guard
 
 function Fail($m) { Write-Host "GATE FAIL: $m" -ForegroundColor Red; exit 1 }
