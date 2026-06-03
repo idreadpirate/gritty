@@ -1,62 +1,80 @@
-# gritty vs. other multiplexers
+# gritty vs. the field
 
-An honest, evidence-backed comparison. Measured on Windows 11; gritty figures are
-from the release build in this repo.
+An honest, evidence-backed comparison. gritty's numbers are **measured** from the
+release build in this repo; competitor facts are **cited** — and where the data
+couldn't be independently verified, we say so rather than invent it.
 
-## Measured footprint
+## gritty's measured footprint
 
-| | Binary | Idle RAM | GPU driver | Runtime |
+| | Binary | RAM | Rendering | Runtime |
 |---|---|---|---|---|
-| **gritty** | **~1.1 MB** | **~22 MB** | none (CPU) | none |
-| tmux | ~1 MB (C) | ~5–10 MB | n/a (TUI) | **needs a host terminal + POSIX layer on Windows** |
-| wmux (ConPTY + Electron) | ~100–200 MB | ~150–300 MB | Chromium | Node + Chromium |
-| Warp / Electron-class | 100 MB+ | hundreds of MB | GPU | Chromium |
+| **gritty** | **793 KB** — one self-contained `.exe` | **~25 MB per pane** (5000-line scrollback grid each; tunable via `config.toml`) — tens of MB for a typical session | CPU / software (no GPU) | none |
 
-gritty is roughly **100× smaller and ~10× lighter in RAM than Electron-based
-native multiplexers** like wmux, while being a *self-contained GUI* (no host
-terminal, no browser engine, no GPU pipeline).
+A single sub-800 KB exe: no GPU pipeline, no Electron/Chromium, no language
+runtime, no WSL. RAM scales with panes because each pane keeps its own scrollback
+grid — lower `scrollback` in `config.toml` to trade history for memory.
 
-## Where gritty decisively wins
+> **Why no head-to-head RAM/size table for other terminals?** A 2026 research
+> pass found that competitors' RAM and binary-size figures are widely *reported*
+> but rarely *reproducible* — so quoting them as fact would be dishonest. The
+> comparisons below are limited to **independently verifiable, cited** facts.
 
-1. **Native on Windows — tmux isn't.** tmux is Unix-native and requires WSL2,
-   Cygwin, or MSYS2 on Windows because it depends on POSIX features like passing
-   file descriptors over UNIX sockets. gritty speaks **ConPTY** directly: one
-   `.exe`, no Linux layer, runs where WSL is banned (locked-down corporate PCs).
-2. **It's the terminal *and* the multiplexer.** tmux runs *inside* a separate
-   terminal emulator; you configure two programs. gritty is one integrated app.
-3. **True color, zero config.** tmux's 24-bit color is a notorious
-   `TERM`/`terminal-overrides` footgun; gritty renders full RGB out of the box.
-4. **System clipboard that just works.** Native `Ctrl+Shift+C/V`, drag-to-copy,
-   right-click paste — no `set -g @plugin` / OSC52 / `xclip` plumbing.
-5. **GUI-native UX:** mouse drag-to-resize, click-to-switch tabs, per-tab colors,
-   process-aware pane headers, a fuzzy command palette, and seamless mode.
-6. **Engineered for many panes:** coalesced wakes, bounded backpressure, a frame
-   cap, and visible-only repaints keep it responsive and near-0% idle CPU.
+## vs. the native-Windows terminal field
 
-## Where tmux still wins (the honest part)
+| Terminal | Native Windows (no WSL) | Built-in multiplexer | Render | Strongest edge over gritty |
+|---|:--:|:--:|:--:|---|
+| **gritty** | ✅ | ✅ tabs · recursive splits · tab tear-off · session restore | CPU | — |
+| Windows Terminal | ✅ | ✅ (richest pane ops) | GPU | swap / move-pane-between-tabs, per-pane profiles, MS-backed ecosystem |
+| WezTerm | ✅ | ✅ (+ detach/attach, no WSL) | GPU | cross-platform, Lua scripting, **remote/SSH multiplexing** |
+| ConEmu | ✅ | ✅ (recursive grids) | CPU | mature & configurable (but legacy injection, not a single tiny exe) |
+| Alacritty | ✅ | ❌ (needs tmux/zellij) | GPU | raw throughput — but *no* built-in multiplexing |
+| Kitty | ❌ (macOS/Linux) | ✅ | GPU | — (not on Windows) |
+| Ghostty (official) | ❌ (WSL only, needs a GPU) | ✅ | GPU | — (not native on Windows) |
 
-- **Remote & headless.** tmux shines over SSH and on servers; you can detach and
-  reattach a *persistent server-side session* across disconnects. gritty is a
-  local GUI — it restores layout, but does not host detachable remote sessions.
-- **Scriptability & ecosystem.** Decades of plugins, `.tmux.conf`, automation.
-- **Ubiquity.** It's everywhere, battle-tested over 15+ years.
+**Verified facts behind the table:**
 
-## So is it "100× better"?
+- **The two most-hyped GPU terminals don't run natively on Windows.** Ghostty's
+  maintainer: *"I'm not yet committed on Windows working for Ghostty 1.0"*; it
+  requires a real GPU and runs only via WSL. Kitty is macOS/Linux only. Neither
+  can contest gritty's core pitch.
+- **GPU rendering gives little-to-no input-latency advantage on Windows — and CPU
+  terminals win.** A 240 Hz high-speed-camera benchmark measured CPU-rendered
+  conhost at **45.8 ms** and MinTTY at **52.4 ms**, *beating* WezTerm and Windows
+  Terminal (75 ms) and Alacritty (87.5 ms, slowest). So gritty's CPU renderer is
+  not a latency liability on Windows. *(Windows-specific; on Linux, GPU wins.)*
+- **Ghostty needs a GPU and degrades badly on software rendering** (~200% CPU in a
+  VM), whereas gritty's CPU renderer runs fine in **VMs / RDP / locked-down boxes**.
+- **Alacritty has no tabs or splits by design** — it delegates multiplexing to
+  tmux/zellij, so it can't match gritty's multiplexer axis on its own.
 
-For a **local, native Windows GUI workflow**, the honest answer is: in the ways
-that matter day-to-day there — installs as one tiny binary, runs without WSL,
-true color and clipboard with zero config, GUI ergonomics, and provably bounded
-resource use — gritty is in a different category, not a marginal improvement.
+## Where rivals genuinely win (the honest part)
 
-For **remote/server multiplexing**, tmux remains the right tool. We don't claim
-to replace that, and saying otherwise would be dishonest. gritty's mission is to
-be the best *local* multiplexer on Windows — and there, it earns the comparison.
+- **Windows Terminal** — broader in-window pane manipulation (swap panes, move a
+  pane between tabs, per-pane shell profiles) and a Microsoft-backed ecosystem.
+- **WezTerm** — cross-platform, a Lua scripting/config API, and **remote/SSH
+  multiplexing** with detach/attach (works natively on Windows, no WSL).
+- **tmux** — the king of remote/headless server sessions over SSH (detach and
+  reattach a persistent server-side session across disconnects).
+- **GPU terminals** — higher raw throughput on extreme scroll/output.
+
+## So where does gritty win?
+
+Not on any single axis in isolation — on the **intersection**: a sub-800 KB
+single native-Windows `.exe`, **CPU-rendered** (so it works where GPU terminals
+degrade or aren't available), that is *also* a full **multiplexer** (tabs,
+recursive splits, tab tear-off, session restore). No other terminal matches all
+of those at once. gritty's mission is to be the best **local, native-Windows**
+multiplexer — and there it's in a category of its own.
+
+For **remote/server** multiplexing, use tmux or WezTerm. gritty doesn't host
+detachable remote sessions, and we don't pretend it does.
 
 ## Sources
 
-- [tmux on Windows requires WSL/Cygwin/MSYS2 — tmux.app](https://tmux.app/install/windows/)
-- [Native ConPTY multiplexers: psmux](https://zenn.dev/sora_biz/articles/psmux-windows-native-tmux?locale=en),
-  [wmux (ConPTY + Electron)](https://github.com/openwong2kim/wmux)
-- [tmux true-color is config-dependent — issue #622](https://github.com/tmux/tmux/issues/622),
-  [#4300 COLORTERM](https://github.com/tmux/tmux/issues/4300)
-- [tmux native-Windows effort — PR #4086](https://github.com/tmux/tmux/pull/4086)
+- GPU-vs-CPU input latency on Windows (240 Hz camera): https://chadaustin.me/2024/02/windows-terminal-latency/
+- Ghostty: no native Windows support, needs a GPU (maintainer discussion): https://github.com/ghostty-org/ghostty/discussions/2563
+- Windows Terminal pane model (splits / swap / move-pane): https://learn.microsoft.com/en-us/windows/terminal/panes
+- WezTerm multiplexing (unix domains supported on Windows): https://wezterm.org/multiplexing.html
+- Native-Windows ConPTY multiplexer (psmux): https://github.com/psmux/psmux
+- ConEmu recursive split panes: https://conemu.github.io/en/SplitScreen.html
+- tmux on Windows requires WSL/Cygwin/MSYS2: https://tmux.app/install/windows/
