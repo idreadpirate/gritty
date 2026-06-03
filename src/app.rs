@@ -2775,8 +2775,8 @@ fn snap_restored_window(window: &Window) {
     // Fixed, much-smaller-than-full restore size, clamped to always fit the
     // monitor (≤90% each axis). Tune these two constants to taste — e.g. swap to
     // a landscape size if you prefer wide over tall.
-    const RESTORE_W: u32 = 900;
-    const RESTORE_H: u32 = 1300;
+    const RESTORE_W: u32 = 1200;
+    const RESTORE_H: u32 = 820;
     let w = RESTORE_W.min(ms.width * 9 / 10).max(1);
     let h = RESTORE_H.min(ms.height * 9 / 10).max(1);
     let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
