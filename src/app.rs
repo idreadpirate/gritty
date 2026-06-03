@@ -129,6 +129,10 @@ pub(crate) struct Win {
     /// of one ConPTY resize per intermediate size. `None` when no resize is
     /// pending.
     pub(crate) pending_resize: Option<Instant>,
+    /// OS maximize state, tracked so a maximize→restore-down click can snap the
+    /// window to a comfortable, screen-centered size instead of returning to the
+    /// (often near-full-screen) pre-maximize size.
+    pub(crate) was_maximized: bool,
 }
 
 pub(crate) struct Gritty {
@@ -276,6 +280,7 @@ impl Gritty {
             preedit: String::new(),
             // CA-52: no resize pending yet.
             pending_resize: None,
+            was_maximized: false,
         })
     }
 
@@ -1878,6 +1883,15 @@ impl ApplicationHandler<Wake> for Gritty {
                 // `about_to_wait`). The frame itself still repaints now at the new
                 // buffer size, so the window doesn't look frozen mid-drag.
                 if let Some(win) = self.windows.get_mut(wi) {
+                    // Keep the OS maximize button useful: maximize fills the screen,
+                    // but a plain restore-down otherwise returns to the (often near-
+                    // full-screen) pre-maximize size and is hard to shrink. On the
+                    // maximize→restore transition, snap to a comfortable centered size.
+                    let maxed = win.window.is_maximized();
+                    if win.was_maximized && !maxed {
+                        snap_restored_window(&win.window);
+                    }
+                    win.was_maximized = maxed;
                     win.pending_resize = Some(Instant::now());
                 }
                 self.request_redraw(wi);
@@ -2611,6 +2625,28 @@ pub(crate) fn pane_grid_cells(rect: Rect, title_h: usize, cw: usize, ch: usize) 
     let gw = rect.w;
     let gh = rect.h.saturating_sub(title_h);
     (gw / cw, gh / ch)
+}
+
+/// On a maximize→restore-down click, resize the window to a comfortable fraction
+/// of its current monitor and center it there, so "restore" yields a usable,
+/// movable window instead of the near-full-screen pre-maximize size. Monitor-
+/// relative (not a fixed pixel size) so it stays sensible on any display/DPI.
+fn snap_restored_window(window: &Window) {
+    let Some(mon) = window.current_monitor() else {
+        return;
+    };
+    let ms = mon.size();
+    if ms.width == 0 || ms.height == 0 {
+        return;
+    }
+    let w = (ms.width as f64 * 0.62).round() as u32;
+    let h = (ms.height as f64 * 0.68).round() as u32;
+    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+    // Center: monitor origin + half the leftover margin on each axis.
+    let mp = mon.position();
+    let x = mp.x + (ms.width.saturating_sub(w) / 2) as i32;
+    let y = mp.y + (ms.height.saturating_sub(h) / 2) as i32;
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
 }
 
 /// CA-46: whether a tab's BEL will be flashed in real time this frame, i.e. its
