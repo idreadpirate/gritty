@@ -41,8 +41,9 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 ## Features
 
 **Multiplexing** — tabs; recursive split panes (binary layout tree); per-pane
-names; per-tab neon accent colors; **seamless mode** (hide all chrome, just a glow
-on the focused pane).
+names; per-tab neon accent colors; **multi-window tab tear-off** (drag a tab onto
+another monitor — or `Ctrl+Shift+N` — and it becomes its own window, live panes
+and all); **seamless mode** (hide all chrome, just a glow on the focused pane).
 
 **Input & navigation** — full xterm key encoding (F-keys, modified arrows,
 Alt-as-ESC, Ctrl-masking); mouse reporting to TUI apps (vim/htop/fzf get clicks &
@@ -68,9 +69,26 @@ error dialog instead of a silent crash if no shell can spawn.
 ## Resize a pane three ways
 Drag the border · `Ctrl+Alt+Arrows` · `Ctrl+Mouse-wheel`.
 
-## Install / build
+## Install
 
-Rust toolchain (MSVC target) on Windows 10/11:
+**One line, no toolchain** (Windows 10/11, PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/install.ps1 | iex
+```
+
+This downloads the latest released `gritty.exe`, installs it under
+`%LOCALAPPDATA%\Programs\gritty`, and adds Start Menu + Desktop shortcuts and a
+PATH entry — no admin rights. Launch it from the Start Menu, the Desktop, or by
+running `gritty` in any terminal. **Closing that terminal won't close gritty** —
+it detaches from the launching shell on startup, so your panes outlive the
+window you started them from. Uninstall any time:
+
+```powershell
+irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/uninstall.ps1 | iex
+```
+
+**Build from source** — Rust toolchain (MSVC target):
 
 ```sh
 git clone https://github.com/idreadpirate/gritty
@@ -79,7 +97,8 @@ cargo build --release
 ./target/release/gritty.exe
 ```
 
-Output is one self-contained `gritty.exe` (~1.25 MB).
+Output is one self-contained `gritty.exe` (~1.25 MB). Maintainers cut a release
+with `./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
 
 ## Keybindings (essentials)
 
@@ -90,6 +109,7 @@ Output is one self-contained `gritty.exe` (~1.25 MB).
 | Move focus / resize pane | `Ctrl+Shift+Arrows` / `Ctrl+Alt+Arrows` |
 | Rename pane / close pane | `Ctrl+Shift+R` / `Ctrl+Shift+W` |
 | New tab / switch tab | `Ctrl+Shift+T` / `Ctrl+1…9` |
+| Tear tab into new window | `Ctrl+Shift+N` / drag tab off the bar |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | Font zoom | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
 

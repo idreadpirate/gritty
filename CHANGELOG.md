@@ -4,7 +4,24 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Install & lifecycle
+- One-line PowerShell installer (`scripts/install.ps1`): downloads the released
+  exe, installs under `%LOCALAPPDATA%\Programs\gritty`, adds Start Menu + Desktop
+  shortcuts and PATH; matching `uninstall.ps1` and `release.ps1` (gate → build →
+  publish exe + SHA256).
+- Detaches from the launching shell on startup (`DETACHED_PROCESS` +
+  break-away-from-job), so closing the terminal that started gritty no longer
+  kills its panes.
+- Session is now saved on *every* exit path and on rename — tab and pane names
+  persist no matter how gritty is closed, not only via the window close button.
+- Repaint on window re-focus / un-occlude, fixing stale pixels after alt-tab.
+
 ### Multiplexer & UX
+- **Multi-window tab tear-off**: drag a tab off the bar (or `Ctrl+Shift+N`, or the
+  "move tab to new window" command) to pop it into its own OS window — carrying
+  its live panes/PTYs — so tabs can live on different monitors. Each window has
+  independent tabs, focus, and broadcast/seamless state; the session save/restore
+  reopens every window at its screen position.
 - Tabs and recursive split panes (binary layout tree) with per-pane names and
   per-tab accent colors.
 - Command palette (`Ctrl+Shift+P`, fuzzy) and keybinding help overlay (`F1`).

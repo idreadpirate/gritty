@@ -12,31 +12,47 @@ use crate::render::{self, draw_cell, draw_text, fill_rect, stroke_rect, Cell};
 use crate::session;
 
 impl Gritty {
-    pub(crate) fn redraw(&mut self) {
-        let (w, h) = self.win_size();
+    pub(crate) fn redraw(&mut self, wi: usize) {
+        let (w, h) = self.win_size(wi);
         let stride = w;
         let height = h;
 
-        let Some(surface) = self.surface.as_mut() else {
+        if wi >= self.windows.len() {
             return;
-        };
+        }
+        // Split borrows: the glyph atlas is shared across windows, the
+        // surface/state belongs to this window. They are distinct fields of
+        // `self`, so borrowing both at once is sound.
+        let font = &mut self.font;
+        let win = &mut self.windows[wi];
+
+        // Account this frame up-front. The surface/buffer/present steps below may
+        // bail out early ("skip this frame" on a minimized/occluded window or a
+        // transient device-context loss). If we left `redraw_pending` set with a
+        // stale `last_render`, `about_to_wait` would re-request a redraw every
+        // tick — pegging a core at 100% (reads as a freeze). Clearing here means a
+        // skipped frame simply waits for the next real trigger (PTY output,
+        // resize, focus/occlude) to repaint.
+        win.last_render = std::time::Instant::now();
+        win.redraw_pending = false;
+
         // w/h are clamped to >=1 by win_size(), but construct defensively so a
         // future refactor can't turn this into a panic (CA-14).
         let nz_w = NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN);
         let nz_h = NonZeroU32::new(h as u32).unwrap_or(NonZeroU32::MIN);
-        if surface.resize(nz_w, nz_h).is_err() {
+        if win.surface.resize(nz_w, nz_h).is_err() {
             return; // skip this frame instead of crashing
         }
-        let Ok(mut buffer) = surface.buffer_mut() else {
+        let Ok(mut buffer) = win.surface.buffer_mut() else {
             return; // transient device-context loss — skip this frame (CA-1)
         };
 
-        self.background.resize(stride, height);
-        buffer.copy_from_slice(&self.background.px);
+        win.background.resize(stride, height);
+        buffer.copy_from_slice(&win.background.px);
 
-        let (cw, ch) = (self.font.cell_w, self.font.cell_h);
-        let active = self.active;
-        let seamless = self.seamless;
+        let (cw, ch) = (font.cell_w, font.cell_h);
+        let active = win.active;
+        let seamless = win.seamless;
         let th = if seamless { 0 } else { ch };
 
         // Tab bar.
@@ -52,7 +68,7 @@ impl Gritty {
             UI_BAR_BG,
         );
         let mut tx = 0usize;
-        for (i, tab) in self.tabs.iter().enumerate() {
+        for (i, tab) in win.tabs.iter().enumerate() {
             // CA-25: prefix active tab with a glyph marker (not color alone).
             let label = if i == active {
                 format!(" ▸{} ", tab.name)
@@ -86,7 +102,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 tx,
                 0,
                 &label,
@@ -105,7 +121,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 tx + text_w,
                 0,
                 "×",
@@ -128,7 +144,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 tx,
                 0,
                 "+",
@@ -139,10 +155,10 @@ impl Gritty {
             );
         }
 
-        let accent = self.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
+        let accent = win.tabs.get(active).map(|t| t.color).unwrap_or(ACCENT);
 
         // Broadcast indicator at the right of the tab bar.
-        if self.broadcast {
+        if win.broadcast {
             let label = " BROADCAST ";
             let lw = label.chars().count() * cw;
             let r = Rect {
@@ -155,7 +171,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 r.x,
                 0,
                 label,
@@ -187,8 +203,8 @@ impl Gritty {
             h: height.saturating_sub(ch),
         };
         let mut rects = Vec::new();
-        let focus = self.tabs.get(active).map(|t| t.focus).unwrap_or(0);
-        if let Some(tab) = self.tabs.get(active) {
+        let focus = win.tabs.get(active).map(|t| t.focus).unwrap_or(0);
+        if let Some(tab) = win.tabs.get(active) {
             tab.tree.layout(area, &mut rects);
         }
 
@@ -211,7 +227,7 @@ impl Gritty {
                     (UI_DIM, UI_TITLE_BG)
                 };
                 fill_rect(&mut buffer, stride, title_rect, tbg);
-                let header = self
+                let header = win
                     .tabs
                     .get(active)
                     .and_then(|t| t.panes.get(&id))
@@ -237,7 +253,7 @@ impl Gritty {
                 draw_text(
                     &mut buffer,
                     stride,
-                    &mut self.font,
+                    font,
                     rect.x + cw / 2,
                     rect.y,
                     &header,
@@ -255,16 +271,8 @@ impl Gritty {
                 w: rect.w,
                 h: rect.h.saturating_sub(th),
             };
-            if let Some(pane) = self.tabs.get(active).and_then(|t| t.panes.get(&id)) {
-                draw_pane_grid(
-                    &mut buffer,
-                    stride,
-                    &mut self.font,
-                    pane,
-                    grid,
-                    is_focus,
-                    accent,
-                );
+            if let Some(pane) = win.tabs.get(active).and_then(|t| t.panes.get(&id)) {
+                draw_pane_grid(&mut buffer, stride, font, pane, grid, is_focus, accent);
             }
 
             // Focused pane gets the accent glow border; unfocused panes get a
@@ -277,7 +285,7 @@ impl Gritty {
         }
 
         // Command palette overlay.
-        if let Some(p) = self.palette.as_ref() {
+        if let Some(p) = win.palette.as_ref() {
             let (query, sel, matches) = (p.query.clone(), p.sel, p.matches());
             let shown = matches.len().min(8);
             let box_w = (stride * 2 / 3)
@@ -306,7 +314,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 bx + cw,
                 by + ch / 4,
                 &qline,
@@ -333,7 +341,7 @@ impl Gritty {
                 draw_text(
                     &mut buffer,
                     stride,
-                    &mut self.font,
+                    font,
                     bx + cw,
                     iy,
                     label,
@@ -346,7 +354,7 @@ impl Gritty {
         }
 
         // RT-8: broadcast pending-signal confirmation prompt.
-        if self.broadcast && self.broadcast_pending_signal.is_some() {
+        if win.broadcast && win.broadcast_pending_signal.is_some() {
             let label = " [BROADCAST] press again to send signal to all panes ";
             let r = Rect {
                 x: 0,
@@ -358,7 +366,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 0,
                 r.y,
                 label,
@@ -370,7 +378,7 @@ impl Gritty {
         }
 
         // CA-21: keybinding help overlay.
-        if self.show_help {
+        if win.show_help {
             let entries: &[(&str, &str)] = &[
                 ("F1 / Ctrl+Shift+/", "Toggle this help overlay"),
                 ("Ctrl+Shift+T", "New tab"),
@@ -416,7 +424,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 bx + cw,
                 by,
                 "Keybindings  (Esc / F1 to close)",
@@ -443,7 +451,7 @@ impl Gritty {
                 draw_text(
                     &mut buffer,
                     stride,
-                    &mut self.font,
+                    font,
                     bx + cw,
                     iy,
                     binding,
@@ -462,7 +470,7 @@ impl Gritty {
                 draw_text(
                     &mut buffer,
                     stride,
-                    &mut self.font,
+                    font,
                     bx + cw + col_key_w,
                     iy,
                     desc,
@@ -475,8 +483,8 @@ impl Gritty {
         }
 
         // Rename overlay.
-        if let Some(buf_str) = self.rename.clone() {
-            let what = if self.rename_is_tab { "tab" } else { "pane" };
+        if let Some(buf_str) = win.rename.clone() {
+            let what = if win.rename_is_tab { "tab" } else { "pane" };
             let line = format!(" rename {what}: {buf_str}_ ");
             let r = Rect {
                 x: 0,
@@ -488,7 +496,7 @@ impl Gritty {
             draw_text(
                 &mut buffer,
                 stride,
-                &mut self.font,
+                font,
                 0,
                 r.y,
                 &line,
@@ -499,11 +507,10 @@ impl Gritty {
             );
         }
 
-        if buffer.present().is_err() {
-            return; // transient present failure — skip frame, don't crash (CA-1)
-        }
-        self.last_render = std::time::Instant::now();
-        self.redraw_pending = false;
+        // Ignore a transient present failure (device-context loss): skip this
+        // frame rather than crash (CA-1). Frame bookkeeping was already cleared
+        // at the top, so a skipped frame won't busy-spin `about_to_wait`.
+        let _ = buffer.present();
     }
 }
 

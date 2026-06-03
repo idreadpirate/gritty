@@ -89,6 +89,98 @@ pub(crate) fn style_caption(window: &Window) {
 #[cfg(not(windows))]
 pub(crate) fn style_caption(_window: &Window) {}
 
+/// Relaunch gritty fully detached from the terminal/job that started it, then
+/// exit the original process. Without this, closing the PowerShell/cmd window
+/// used to launch gritty takes every pane down with it: the shell's parent job
+/// is reaped on close, and a console-attached child dies with it. We re-exec
+/// ourselves with `DETACHED_PROCESS` (no inherited console) and break away from
+/// the job, so the surviving instance is owned by no terminal.
+///
+/// Guarded by an env marker so the detached child runs normally instead of
+/// relaunching forever, and compiled out of debug builds so `cargo run` keeps
+/// its console (and panic/stderr output) attached during development.
+#[cfg(all(windows, not(debug_assertions)))]
+fn ensure_detached() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    /// Set on the relaunched child so it doesn't detach a second time.
+    const MARKER: &str = "GRITTY_DETACHED";
+
+    if std::env::var_os(MARKER).is_some() {
+        return; // we are the detached child — run normally
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return; // can't find ourselves — fall back to running in place
+    };
+
+    // Quoted, null-terminated UTF-16 command line (the exe path may contain
+    // spaces).
+    let cmdline: Vec<u16> = std::iter::once(u16::from(b'"'))
+        .chain(exe.as_os_str().encode_wide())
+        .chain([u16::from(b'"'), 0])
+        .collect();
+
+    // The child inherits our environment block (null lpEnvironment); set the
+    // marker first so it sees it and skips its own relaunch. We're exiting
+    // momentarily, so mutating our own env is harmless.
+    std::env::set_var(MARKER, "1");
+
+    // Spawn detached with no inherited console. Prefer breaking away from the
+    // launching terminal's job so a kill-on-close job can't reap us; if the job
+    // forbids breakaway, retry without it (still survives a closed console).
+    let spawn = |flags: u32| -> bool {
+        // CreateProcessW may write into lpCommandLine, so hand it a fresh,
+        // owned, mutable copy each attempt.
+        let mut cl = cmdline.clone();
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: cl is a valid, owned, null-terminated UTF-16 buffer; all
+        // optional pointers are null; si/pi are correctly sized and zeroed.
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cl.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0, // bInheritHandles = FALSE
+                flags,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok != 0 {
+            // We don't wait on the child; release the handles immediately.
+            unsafe {
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+            true
+        } else {
+            false
+        }
+    };
+
+    let detached = spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+        || spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+    if detached {
+        std::process::exit(0);
+    }
+    // Relaunch failed entirely — keep running in place rather than refusing to
+    // start; the user can still close gritty's own window to exit.
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn ensure_detached() {}
+
 /// Window/taskbar icon, baked from grittyicon.png at build time (64x64 RGBA).
 pub(crate) fn load_icon() -> Option<winit::window::Icon> {
     let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/icon_rgba.bin"));
@@ -96,6 +188,10 @@ pub(crate) fn load_icon() -> Option<winit::window::Icon> {
 }
 
 fn main() {
+    // Detach from the launching terminal before doing anything else, so closing
+    // that window can't reap us (and so we never create two windows/sessions).
+    ensure_detached();
+
     let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
         .expect("event loop");

@@ -1,2 +1,8 @@
+# Build output
 /target
+
+# Local agent/runtime state — never committed. These are machine-local and are
+# also covered by the maintainer's global gitignore, but listed here so external
+# clones of the public repo don't accidentally commit them.
 /.claude
+/.agentbus

@@ -4,38 +4,65 @@ use winit::keyboard::{Key, NamedKey};
 use crate::app::Gritty;
 use crate::layout::Axis;
 use crate::palette::{Cmd, Palette};
-use crate::persist;
 use crate::Dir4;
 
 impl Gritty {
     pub(crate) fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        // Keyboard always targets the focused window.
+        let wi = self.focused;
+        if wi >= self.windows.len() {
+            return;
+        }
+        let ctrl = self.mods.control_key();
+        let shift = self.mods.shift_key();
+
         // CA-21: help overlay swallows all input; Esc/F1/Ctrl+Shift+/ closes it.
-        if self.show_help {
+        if self.windows[wi].show_help {
             let close = matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F1))
-                || (self.mods.control_key()
-                    && self.mods.shift_key()
-                    && matches!(key, Key::Character(s) if s == "/"));
+                || (ctrl && shift && matches!(key, Key::Character(s) if s == "/"));
             if close {
-                self.show_help = false;
-                self.request_redraw();
+                self.windows[wi].show_help = false;
+                self.request_redraw(wi);
             }
             return;
         }
 
         // Command palette swallows input while open.
-        if self.palette.is_some() {
+        if self.windows[wi].palette.is_some() {
             self.handle_palette_key(event_loop, key);
             return;
         }
 
         // Rename prompt swallows all input while open.
-        if let Some(buf) = self.rename.as_mut() {
+        if self.windows[wi].rename.is_some() {
+            let mut commit: Option<String> = None;
             match key {
                 Key::Named(NamedKey::Enter) => {
-                    let name = std::mem::take(buf);
-                    self.rename = None;
-                    let is_tab = self.rename_is_tab;
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                    commit = self.windows[wi].rename.take();
+                }
+                Key::Named(NamedKey::Escape) => self.windows[wi].rename = None,
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(buf) = self.windows[wi].rename.as_mut() {
+                        buf.pop();
+                    }
+                }
+                Key::Character(s) => {
+                    if let Some(buf) = self.windows[wi].rename.as_mut() {
+                        buf.push_str(s);
+                    }
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(buf) = self.windows[wi].rename.as_mut() {
+                        buf.push(' ');
+                    }
+                }
+                _ => {}
+            }
+            if let Some(name) = commit {
+                let is_tab = self.windows[wi].rename_is_tab;
+                if let Some(win) = self.windows.get_mut(wi) {
+                    let active = win.active;
+                    if let Some(tab) = win.tabs.get_mut(active) {
                         if is_tab {
                             tab.name = name;
                         } else {
@@ -43,64 +70,69 @@ impl Gritty {
                         }
                     }
                 }
-                Key::Named(NamedKey::Escape) => self.rename = None,
-                Key::Named(NamedKey::Backspace) => {
-                    buf.pop();
-                }
-                Key::Character(s) => buf.push_str(s),
-                Key::Named(NamedKey::Space) => buf.push(' '),
-                _ => {}
+                // Persist immediately so the new name survives even an abrupt
+                // close before the next normal save.
+                self.persist_session();
             }
-            self.request_redraw();
+            self.request_redraw(wi);
             return;
         }
-
-        let ctrl = self.mods.control_key();
-        let shift = self.mods.shift_key();
 
         // CA-21: F1 or Ctrl+Shift+/ opens the help overlay.
         if matches!(key, Key::Named(NamedKey::F1))
             || (ctrl && shift && matches!(key, Key::Character(s) if s == "/"))
         {
-            self.show_help = !self.show_help;
-            self.request_redraw();
+            self.windows[wi].show_help = !self.windows[wi].show_help;
+            self.request_redraw(wi);
             return;
         }
 
         if ctrl && shift {
             if let Key::Character(s) = key {
                 match s.to_lowercase().as_str() {
-                    "c" => return self.copy_selection(),
-                    "v" => return self.paste(),
-                    "d" => return self.split_focus(Axis::LeftRight),
-                    "e" => return self.split_focus(Axis::TopBottom),
-                    "w" => return self.close_focus(event_loop),
-                    "t" => return self.new_tab(),
+                    "c" => return self.copy_selection(wi),
+                    "v" => return self.paste(wi),
+                    "d" => return self.split_focus(wi, Axis::LeftRight),
+                    "e" => return self.split_focus(wi, Axis::TopBottom),
+                    "w" => return self.close_focus(wi, event_loop),
+                    "t" => return self.new_tab(wi),
+                    "n" => {
+                        // Tear the active tab into its own window, offset from this one.
+                        let active = self.windows.get(wi).map(|w| w.active).unwrap_or(0);
+                        let pos = self
+                            .windows
+                            .get(wi)
+                            .and_then(|w| w.window.outer_position().ok())
+                            .map(|p| (p.x + 40, p.y + 40));
+                        self.tear_off(event_loop, wi, active, pos);
+                        return;
+                    }
                     "p" => {
-                        self.palette = Some(Palette::new());
-                        self.request_redraw();
+                        self.windows[wi].palette = Some(Palette::new());
+                        self.request_redraw(wi);
                         return;
                     }
                     "r" => {
                         let cur = self
-                            .tabs
-                            .get(self.active)
+                            .windows
+                            .get(wi)
+                            .and_then(|w| w.tabs.get(w.active))
                             .and_then(|t| t.panes.get(&t.focus))
                             .map(|p| p.name.clone())
                             .unwrap_or_default();
-                        self.rename = Some(cur);
-                        self.rename_is_tab = false;
-                        self.request_redraw();
+                        self.windows[wi].rename = Some(cur);
+                        self.windows[wi].rename_is_tab = false;
+                        self.request_redraw(wi);
                         return;
                     }
                     _ => {}
                 }
             }
             match key {
-                Key::Named(NamedKey::ArrowLeft) => return self.focus_and_redraw(Dir4::Left),
-                Key::Named(NamedKey::ArrowRight) => return self.focus_and_redraw(Dir4::Right),
-                Key::Named(NamedKey::ArrowUp) => return self.focus_and_redraw(Dir4::Up),
-                Key::Named(NamedKey::ArrowDown) => return self.focus_and_redraw(Dir4::Down),
+                Key::Named(NamedKey::ArrowLeft) => return self.focus_and_redraw(wi, Dir4::Left),
+                Key::Named(NamedKey::ArrowRight) => return self.focus_and_redraw(wi, Dir4::Right),
+                Key::Named(NamedKey::ArrowUp) => return self.focus_and_redraw(wi, Dir4::Up),
+                Key::Named(NamedKey::ArrowDown) => return self.focus_and_redraw(wi, Dir4::Down),
                 _ => {}
             }
         }
@@ -109,13 +141,17 @@ impl Gritty {
         if ctrl && self.mods.alt_key() {
             match key {
                 Key::Named(NamedKey::ArrowRight) => {
-                    return self.resize_focus(Axis::LeftRight, true)
+                    return self.resize_focus(wi, Axis::LeftRight, true)
                 }
                 Key::Named(NamedKey::ArrowLeft) => {
-                    return self.resize_focus(Axis::LeftRight, false)
+                    return self.resize_focus(wi, Axis::LeftRight, false)
                 }
-                Key::Named(NamedKey::ArrowDown) => return self.resize_focus(Axis::TopBottom, true),
-                Key::Named(NamedKey::ArrowUp) => return self.resize_focus(Axis::TopBottom, false),
+                Key::Named(NamedKey::ArrowDown) => {
+                    return self.resize_focus(wi, Axis::TopBottom, true)
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    return self.resize_focus(wi, Axis::TopBottom, false)
+                }
                 _ => {}
             }
         }
@@ -128,51 +164,52 @@ impl Gritty {
                     self.apply_font_zoom(px);
                     return;
                 }
-
                 // CA-12: Ctrl+'=' or Ctrl+'+' zooms in.
                 if s == "=" || s == "+" {
                     let px = self.font_px + crate::app::ZOOM_STEP;
                     self.apply_font_zoom(px);
                     return;
                 }
-
                 // CA-12: Ctrl+'-' zooms out.
                 if s == "-" {
                     let px = self.font_px - crate::app::ZOOM_STEP;
                     self.apply_font_zoom(px);
                     return;
                 }
-
-                // Ctrl+1-9: switch to tab by index (RT-10: drain PTY after switch).
+                // Ctrl+1-9: switch to tab by index in the focused window.
                 if let Some(d) = s.chars().next().and_then(|c| c.to_digit(10)) {
                     if d >= 1 {
                         let idx = (d as usize) - 1;
-                        if idx < self.tabs.len() {
-                            // RT-8: auto-disable broadcast on tab switch.
-                            if idx != self.active {
-                                self.broadcast = false;
-                                self.broadcast_pending_signal = None;
+                        let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
+                        if idx < len {
+                            if let Some(win) = self.windows.get_mut(wi) {
+                                if idx != win.active {
+                                    win.broadcast = false;
+                                    win.broadcast_pending_signal = None;
+                                }
+                                win.active = idx;
                             }
-                            self.active = idx;
                             self.drain_pty(); // RT-10: flush newly focused tab.
-                            self.relayout();
-                            self.request_redraw();
+                            self.relayout(wi);
+                            self.request_redraw(wi);
                         }
                         return;
                     }
                 }
             }
 
-            // Ctrl+Tab: cycle to the next tab (RT-10: drain PTY after switch).
+            // Ctrl+Tab: cycle to the next tab in the focused window.
             if matches!(key, Key::Named(NamedKey::Tab)) {
-                if !self.tabs.is_empty() {
-                    // RT-8: auto-disable broadcast on tab switch.
-                    self.broadcast = false;
-                    self.broadcast_pending_signal = None;
-                    self.active = (self.active + 1) % self.tabs.len();
+                let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
+                if len > 0 {
+                    if let Some(win) = self.windows.get_mut(wi) {
+                        win.broadcast = false;
+                        win.broadcast_pending_signal = None;
+                        win.active = (win.active + 1) % len;
+                    }
                     self.drain_pty(); // RT-10: flush newly focused tab.
-                    self.relayout();
-                    self.request_redraw();
+                    self.relayout(wi);
+                    self.request_redraw(wi);
                 }
                 return;
             }
@@ -180,34 +217,29 @@ impl Gritty {
 
         // Default: send to the focused pane (or every pane when broadcasting).
         if let Some(bytes) = crate::key::encode(key, self.mods) {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                if self.broadcast {
-                    // RT-8: signal-bearing control bytes require a second-press guard.
-                    let is_signal =
-                        bytes.len() == 1 && crate::app::is_broadcast_signal_byte(bytes[0]);
-                    if is_signal {
-                        let pending = self.broadcast_pending_signal;
-                        if pending == Some(bytes[0]) {
-                            // Second press confirmed — fan out to all panes.
-                            self.broadcast_pending_signal = None;
-                            for pane in tab.panes.values_mut() {
-                                pane.term.scroll_to_bottom();
-                                pane.pty.write(&bytes);
-                            }
-                        } else {
-                            // First press — arm the guard; do NOT send yet.
-                            self.broadcast_pending_signal = Some(bytes[0]);
-                            self.request_redraw();
-                        }
+            let broadcast = self.windows.get(wi).map(|w| w.broadcast).unwrap_or(false);
+            if broadcast {
+                // RT-8: signal-bearing control bytes require a second-press guard.
+                let is_signal = bytes.len() == 1 && crate::app::is_broadcast_signal_byte(bytes[0]);
+                if is_signal {
+                    let pending = self.windows[wi].broadcast_pending_signal;
+                    if pending == Some(bytes[0]) {
+                        // Second press confirmed — fan out to all panes.
+                        self.windows[wi].broadcast_pending_signal = None;
+                        self.broadcast_bytes(wi, &bytes);
                     } else {
-                        // Any non-signal keystroke clears a pending guard.
-                        self.broadcast_pending_signal = None;
-                        for pane in tab.panes.values_mut() {
-                            pane.term.scroll_to_bottom();
-                            pane.pty.write(&bytes);
-                        }
+                        // First press — arm the guard; do NOT send yet.
+                        self.windows[wi].broadcast_pending_signal = Some(bytes[0]);
+                        self.request_redraw(wi);
                     }
                 } else {
+                    // Any non-signal keystroke clears a pending guard.
+                    self.windows[wi].broadcast_pending_signal = None;
+                    self.broadcast_bytes(wi, &bytes);
+                }
+            } else if let Some(win) = self.windows.get_mut(wi) {
+                let active = win.active;
+                if let Some(tab) = win.tabs.get_mut(active) {
                     let f = tab.focus;
                     if let Some(pane) = tab.panes.get_mut(&f) {
                         pane.term.scroll_to_bottom();
@@ -218,111 +250,157 @@ impl Gritty {
         }
     }
 
-    pub(crate) fn handle_palette_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
-        let Some(p) = self.palette.as_mut() else {
-            return;
-        };
-        match key {
-            Key::Named(NamedKey::Escape) => self.palette = None,
-            Key::Named(NamedKey::Enter) => {
-                let cmd = p.selected();
-                self.palette = None;
-                if let Some(cmd) = cmd {
-                    self.run_cmd(cmd, event_loop);
+    /// Write `bytes` to every pane in window `wi`'s active tab (broadcast).
+    fn broadcast_bytes(&mut self, wi: usize, bytes: &[u8]) {
+        if let Some(win) = self.windows.get_mut(wi) {
+            let active = win.active;
+            if let Some(tab) = win.tabs.get_mut(active) {
+                for pane in tab.panes.values_mut() {
+                    pane.term.scroll_to_bottom();
+                    pane.pty.write(bytes);
                 }
             }
-            Key::Named(NamedKey::ArrowDown) => {
-                p.sel += 1;
-                p.clamp_selection();
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                p.sel = p.sel.saturating_sub(1);
-            }
-            Key::Named(NamedKey::Backspace) => {
-                p.query.pop();
-                p.sel = 0;
-            }
-            Key::Named(NamedKey::Space) => {
-                p.query.push(' ');
-                p.sel = 0;
-            }
-            Key::Character(s) => {
-                p.query.push_str(s);
-                p.sel = 0;
-            }
-            _ => {}
         }
-        self.request_redraw();
+    }
+
+    pub(crate) fn handle_palette_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        let wi = self.focused;
+        let mut run: Option<Cmd> = None;
+        let mut close = false;
+        {
+            let Some(p) = self.windows.get_mut(wi).and_then(|w| w.palette.as_mut()) else {
+                return;
+            };
+            match key {
+                Key::Named(NamedKey::Escape) => close = true,
+                Key::Named(NamedKey::Enter) => {
+                    run = p.selected();
+                    close = true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    p.sel += 1;
+                    p.clamp_selection();
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    p.sel = p.sel.saturating_sub(1);
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    p.query.pop();
+                    p.sel = 0;
+                }
+                Key::Named(NamedKey::Space) => {
+                    p.query.push(' ');
+                    p.sel = 0;
+                }
+                Key::Character(s) => {
+                    p.query.push_str(s);
+                    p.sel = 0;
+                }
+                _ => {}
+            }
+        }
+        if close {
+            if let Some(win) = self.windows.get_mut(wi) {
+                win.palette = None;
+            }
+        }
+        if let Some(cmd) = run {
+            self.run_cmd(cmd, event_loop);
+        }
+        self.request_redraw(wi);
     }
 
     pub(crate) fn run_cmd(&mut self, cmd: Cmd, event_loop: &ActiveEventLoop) {
+        let wi = self.focused;
         match cmd {
-            Cmd::SplitRight => self.split_focus(Axis::LeftRight),
-            Cmd::SplitDown => self.split_focus(Axis::TopBottom),
-            Cmd::ClosePane => self.close_focus(event_loop),
-            Cmd::NewTab => self.new_tab(),
+            Cmd::SplitRight => self.split_focus(wi, Axis::LeftRight),
+            Cmd::SplitDown => self.split_focus(wi, Axis::TopBottom),
+            Cmd::ClosePane => self.close_focus(wi, event_loop),
+            Cmd::NewTab => self.new_tab(wi),
             Cmd::NextTab => {
-                if !self.tabs.is_empty() {
-                    self.active = (self.active + 1) % self.tabs.len();
+                let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
+                if len > 0 {
+                    if let Some(win) = self.windows.get_mut(wi) {
+                        win.active = (win.active + 1) % len;
+                    }
                     self.drain_pty(); // RT-10: flush on palette-driven tab switch.
-                    self.relayout();
+                    self.relayout(wi);
                 }
             }
             Cmd::PrevTab => {
-                if !self.tabs.is_empty() {
-                    self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
+                if len > 0 {
+                    if let Some(win) = self.windows.get_mut(wi) {
+                        win.active = (win.active + len - 1) % len;
+                    }
                     self.drain_pty(); // RT-10: flush on palette-driven tab switch.
-                    self.relayout();
+                    self.relayout(wi);
                 }
             }
             Cmd::RenamePane => {
                 let cur = self
-                    .tabs
-                    .get(self.active)
+                    .windows
+                    .get(wi)
+                    .and_then(|w| w.tabs.get(w.active))
                     .and_then(|t| t.panes.get(&t.focus))
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
-                self.rename = Some(cur);
-                self.rename_is_tab = false;
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.rename = Some(cur);
+                    win.rename_is_tab = false;
+                }
             }
             Cmd::RenameTab => {
                 let cur = self
-                    .tabs
-                    .get(self.active)
+                    .windows
+                    .get(wi)
+                    .and_then(|w| w.tabs.get(w.active))
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
-                self.rename = Some(cur);
-                self.rename_is_tab = true;
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.rename = Some(cur);
+                    win.rename_is_tab = true;
+                }
             }
-            Cmd::ToggleBroadcast => self.broadcast = !self.broadcast,
+            Cmd::ToggleBroadcast => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.broadcast = !win.broadcast;
+                }
+            }
             Cmd::ToggleSeamless => {
-                self.seamless = !self.seamless;
-                self.relayout();
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.seamless = !win.seamless;
+                }
+                self.relayout(wi);
             }
-            Cmd::SaveSession => {
-                let _ = persist::save(&self.snapshot());
+            Cmd::MoveTabToNewWindow => {
+                let active = self.windows.get(wi).map(|w| w.active).unwrap_or(0);
+                let pos = self
+                    .windows
+                    .get(wi)
+                    .and_then(|w| w.window.outer_position().ok())
+                    .map(|p| (p.x + 40, p.y + 40));
+                self.tear_off(event_loop, wi, active, pos);
             }
-            Cmd::LoadSession => self.restore_session(),
+            Cmd::SaveSession => self.persist_session(),
+            Cmd::LoadSession => self.restore_session(event_loop),
         }
-        self.request_redraw();
+        let f = self.focused;
+        self.request_redraw(f);
     }
 }
 
 #[cfg(test)]
 mod tests {
     // RT-10: tab-switch sites call drain_pty. Validated by reading the
-    // implementation — all three switch paths (Ctrl+digit, Ctrl+Tab, tab-bar
-    // click) call self.drain_pty() immediately after updating self.active.
-    // A pure unit test would require a full Gritty instance with a live PTY,
-    // which is out of scope here; the integration coverage comes from the
-    // gate's build+test pass.
+    // implementation — all switch paths call self.drain_pty() immediately after
+    // updating the active tab.
 
-    // CA-12: zoom key handling is wired to apply_font_zoom which is tested
-    // at the pure-function level in app.rs. We verify the key strings here.
+    // CA-12: zoom key handling is wired to apply_font_zoom which is tested at
+    // the pure-function level in app.rs. We verify the key strings here.
 
     #[test]
     fn zoom_in_keys_are_plus_and_equals() {
-        // The same physical key produces either "=" (unshifted) or "+" (shifted).
         for s in &["=", "+"] {
             assert!(*s == "=" || *s == "+", "unexpected zoom-in key string: {s}");
         }

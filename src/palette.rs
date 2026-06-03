@@ -12,6 +12,7 @@ pub enum Cmd {
     PrevTab,
     ToggleBroadcast,
     ToggleSeamless,
+    MoveTabToNewWindow,
     SaveSession,
     LoadSession,
 }
@@ -27,6 +28,7 @@ pub const COMMANDS: &[(&str, Cmd)] = &[
     ("previous tab", Cmd::PrevTab),
     ("toggle broadcast input", Cmd::ToggleBroadcast),
     ("toggle seamless mode", Cmd::ToggleSeamless),
+    ("move tab to new window", Cmd::MoveTabToNewWindow),
     ("save session", Cmd::SaveSession),
     ("load session", Cmd::LoadSession),
 ];

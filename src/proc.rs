@@ -144,6 +144,63 @@ pub fn snapshot() -> Vec<Proc> {
     Vec::new()
 }
 
+/// Debug-only self-instrumentation: this process's working-set (RSS) in bytes
+/// and its live OS thread count. Lets us tell a real heap/thread leak apart from
+/// a CPU spin while diagnosing freezes — compare RSS and `os_threads` against the
+/// live pane count over time. Compiled only in debug builds, so it never touches
+/// the size-sensitive release binary.
+#[cfg(all(windows, debug_assertions))]
+pub fn self_stats() -> Option<(u64, usize)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+
+    unsafe {
+        let pid = GetCurrentProcessId();
+
+        // Working-set size (resident memory). GetCurrentProcess() is a pseudo-
+        // handle that must not be closed.
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let rss = if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            pmc.WorkingSetSize as u64
+        } else {
+            0
+        };
+
+        // Count threads owned by this process via a thread snapshot.
+        let mut threads = 0usize;
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap != INVALID_HANDLE_VALUE {
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut te) != 0 {
+                loop {
+                    if te.th32OwnerProcessID == pid {
+                        threads += 1;
+                    }
+                    if Thread32Next(snap, &mut te) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+
+        Some((rss, threads))
+    }
+}
+
+#[cfg(all(not(windows), debug_assertions))]
+pub fn self_stats() -> Option<(u64, usize)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

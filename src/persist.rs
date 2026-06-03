@@ -24,14 +24,39 @@ pub struct SavedTab {
     pub panes: Vec<SavedPane>,
 }
 
+/// One OS window's worth of workspace: its tabs, focused tab, and on-screen
+/// geometry. A session is a list of these (tab tear-off creates multiple).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SavedSession {
+pub struct SavedWindow {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
-    /// CA-32: persisted window width in physical pixels (None = use default).
+    /// Window size in physical pixels (None = use default).
     #[serde(default)]
     pub win_w: Option<u32>,
-    /// CA-32: persisted window height in physical pixels (None = use default).
+    #[serde(default)]
+    pub win_h: Option<u32>,
+    /// Top-left window position in physical pixels (None = let the OS place it).
+    #[serde(default)]
+    pub win_x: Option<i32>,
+    #[serde(default)]
+    pub win_y: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedSession {
+    /// Multi-window workspace (one entry per OS window). Preferred form.
+    #[serde(default)]
+    pub windows: Vec<SavedWindow>,
+
+    // --- Legacy single-window fields (pre-multi-window sessions) -------------
+    // Kept so old `session.json` files still load. `windows()` folds these into
+    // a single window when `windows` is empty.
+    #[serde(default)]
+    pub active: usize,
+    #[serde(default)]
+    pub tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub win_w: Option<u32>,
     #[serde(default)]
     pub win_h: Option<u32>,
 }
@@ -43,6 +68,37 @@ impl SavedSession {
 
     pub fn from_json(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
+    }
+
+    /// Build a multi-window session directly from a window list.
+    pub fn from_windows(windows: Vec<SavedWindow>) -> Self {
+        Self {
+            windows,
+            active: 0,
+            tabs: Vec::new(),
+            win_w: None,
+            win_h: None,
+        }
+    }
+
+    /// The windows to restore: the multi-window list when present, otherwise a
+    /// single window synthesized from the legacy single-window fields. Returns
+    /// empty when there is nothing to restore.
+    pub fn windows(&self) -> Vec<SavedWindow> {
+        if !self.windows.is_empty() {
+            self.windows.clone()
+        } else if !self.tabs.is_empty() {
+            vec![SavedWindow {
+                active: self.active,
+                tabs: self.tabs.clone(),
+                win_w: self.win_w,
+                win_h: self.win_h,
+                win_x: None,
+                win_y: None,
+            }]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -91,6 +147,7 @@ mod tests {
 
     fn sample() -> SavedSession {
         SavedSession {
+            windows: Vec::new(),
             active: 1,
             win_w: None,
             win_h: None,
@@ -187,5 +244,76 @@ mod tests {
         let s = SavedSession::from_json(old_json).expect("parse old session");
         assert_eq!(s.win_w, None);
         assert_eq!(s.win_h, None);
+    }
+
+    // --- Multi-window persistence --------------------------------------------
+
+    fn win_sample(name: &str, x: i32, y: i32) -> SavedWindow {
+        SavedWindow {
+            active: 0,
+            tabs: vec![SavedTab {
+                name: name.into(),
+                color: 0x00ff_7b00,
+                focus: 0,
+                next_id: 1,
+                tree: Node::Leaf(0),
+                panes: vec![SavedPane {
+                    id: 0,
+                    name: "term 1".into(),
+                }],
+            }],
+            win_w: Some(960),
+            win_h: Some(600),
+            win_x: Some(x),
+            win_y: Some(y),
+        }
+    }
+
+    #[test]
+    fn multi_window_roundtrip_preserves_position() {
+        let s =
+            SavedSession::from_windows(vec![win_sample("a", 10, 20), win_sample("b", 1930, 40)]);
+        let back = SavedSession::from_json(&s.to_json()).expect("parse");
+        assert_eq!(s, back);
+        assert_eq!(back.windows.len(), 2);
+        assert_eq!(back.windows[1].win_x, Some(1930));
+        assert_eq!(back.windows[1].win_y, Some(40));
+    }
+
+    #[test]
+    fn windows_prefers_multi_window_list() {
+        let s = SavedSession::from_windows(vec![win_sample("a", 0, 0), win_sample("b", 100, 0)]);
+        let ws = s.windows();
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].tabs[0].name, "a");
+    }
+
+    #[test]
+    fn windows_folds_legacy_single_window() {
+        // A pre-multi-window session (only legacy `tabs`/`active`) becomes one window.
+        let legacy = sample(); // has 2 tabs, active 1, no `windows`
+        assert!(legacy.windows.is_empty());
+        let ws = legacy.windows();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].active, 1);
+        assert_eq!(ws[0].tabs.len(), 2);
+        assert_eq!(ws[0].win_x, None); // legacy files carried no position
+    }
+
+    #[test]
+    fn windows_empty_when_nothing_saved() {
+        let empty = SavedSession::from_windows(Vec::new());
+        assert!(empty.windows().is_empty());
+    }
+
+    #[test]
+    fn legacy_json_without_windows_field_loads() {
+        // Real old file shape: top-level active/tabs, no `windows` key.
+        let old = r#"{"active":0,"tabs":[{"name":"t","color":0,"focus":0,"next_id":1,"tree":{"Leaf":0},"panes":[{"id":0,"name":"term 1"}]}]}"#;
+        let s = SavedSession::from_json(old).expect("parse legacy");
+        assert!(s.windows.is_empty());
+        let ws = s.windows();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].tabs[0].name, "t");
     }
 }
