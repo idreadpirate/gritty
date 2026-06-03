@@ -1,0 +1,10 @@
+# gritty pins nightly + build-std to ship a minimal binary (<800 KB): the std
+# library is rebuilt from source at the release profile's opt-level=z (see
+# .cargo/config.toml), shaving ~85 KB off the prebuilt std. This is a build-only
+# choice — no source or behavior change. build-std uses `std,panic_abort` (NOT
+# panic_immediate_abort), so std::panic::set_hook still fires and the RT-22
+# crash-log keeps working.
+[toolchain]
+channel = "nightly-2026-05-28"   # pinned: freezes the clippy lint set + build-std behavior
+components = ["rust-src", "clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-msvc"]

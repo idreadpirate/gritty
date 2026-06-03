@@ -59,7 +59,7 @@ impl Palette {
                 crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *cmd))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|t| core::cmp::Reverse(t.0));
         scored.into_iter().map(|(_, l, c)| (l, c)).collect()
     }
 

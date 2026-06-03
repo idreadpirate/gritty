@@ -56,11 +56,8 @@ fn hex_digit(b: u8) -> Option<u8> {
 fn osc7_uri_to_path(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     // Skip the (possibly empty) host component up to the first `/`.
-    let path_part = if let Some(slash) = rest.find('/') {
-        &rest[slash..] // includes the leading '/'
-    } else {
-        return None; // no path at all
-    };
+    let slash = rest.find('/')?; // no '/' → no path at all
+    let path_part = &rest[slash..]; // includes the leading '/'
     let decoded = percent_decode(path_part);
 
     // On Windows the URI path looks like `/C:/Users/foo`.
