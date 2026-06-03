@@ -15,6 +15,10 @@ pub struct Pane {
     pub name: String,
     /// Foreground process running in the pane (e.g. "nvim"), updated periodically.
     pub proc_name: String,
+    /// CA-40: set the first time `reap_dead` sees this pane's shell as exited, so
+    /// the pane survives one extra cycle and its final drained line (an exit/
+    /// farewell message) is painted once before the pane is reaped.
+    pub dead_seen: bool,
 }
 
 /// User-tunable knobs that affect how a pane's shell is spawned (CA-37). Derived
@@ -136,6 +140,7 @@ impl Pane {
             pty,
             name,
             proc_name: String::new(),
+            dead_seen: false,
         })
     }
 

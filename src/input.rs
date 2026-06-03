@@ -48,6 +48,27 @@ fn clamp_sel_visible(sel: usize, len: usize, max: usize) -> usize {
     }
 }
 
+/// CA-48: where an IME-committed string is routed, given which UI overlay (if
+/// any) is open. Mirrors the typed-character dispatch order: a rename prompt
+/// captures first, then the command palette, else the focused pane. Pure so the
+/// routing precedence is unit-tested without a live window/IME.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommitTarget {
+    Rename,
+    Palette,
+    Pane,
+}
+
+pub(crate) fn ime_commit_target(rename_open: bool, palette_open: bool) -> CommitTarget {
+    if rename_open {
+        CommitTarget::Rename
+    } else if palette_open {
+        CommitTarget::Palette
+    } else {
+        CommitTarget::Pane
+    }
+}
+
 /// Broadcast/active-tab state after switching a window's active tab to `idx`.
 /// Mirrors the keyboard tab-switch invariant (RT-8/CA-63): changing the active
 /// tab disarms broadcast and clears any pending signal-byte guard, since
@@ -319,6 +340,52 @@ impl Gritty {
         }
     }
 
+    /// CA-48: route IME-committed `text` to the right destination, mirroring how
+    /// a `Key::Character` is dispatched: an open rename prompt or command palette
+    /// captures it into its buffer (control chars stripped, length capped via
+    /// `push_name_input`); otherwise it is written to the focused pane (or every
+    /// pane when broadcasting), so CJK/dead-key composition reaches the shell.
+    /// An empty commit is a no-op.
+    pub(crate) fn commit_text(&mut self, wi: usize, text: &str) {
+        if text.is_empty() || wi >= self.windows.len() {
+            return;
+        }
+        let rename_open = self.windows[wi].rename.is_some();
+        let palette_open = self.windows[wi].palette.is_some();
+        match ime_commit_target(rename_open, palette_open) {
+            // Rename prompt: append to its single-line buffer.
+            CommitTarget::Rename => {
+                if let Some(buf) = self.windows[wi].rename.as_mut() {
+                    push_name_input(buf, text);
+                }
+            }
+            // Command palette: append to the query and reset the selection.
+            CommitTarget::Palette => {
+                if let Some(p) = self.windows.get_mut(wi).and_then(|w| w.palette.as_mut()) {
+                    push_name_input(&mut p.query, text);
+                    p.sel = 0;
+                }
+            }
+            // Otherwise send the committed text to the pane(s) as UTF-8 bytes.
+            CommitTarget::Pane => {
+                let bytes = text.as_bytes().to_vec();
+                let broadcast = self.windows.get(wi).map(|w| w.broadcast).unwrap_or(false);
+                if broadcast {
+                    self.broadcast_bytes(wi, &bytes);
+                } else if let Some(win) = self.windows.get_mut(wi) {
+                    let active = win.active;
+                    if let Some(tab) = win.tabs.get_mut(active) {
+                        let f = tab.focus;
+                        if let Some(pane) = tab.panes.get_mut(&f) {
+                            pane.term.scroll_to_bottom();
+                            pane.pty.write(&bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Write `bytes` to every pane in window `wi`'s active tab (broadcast).
     fn broadcast_bytes(&mut self, wi: usize, bytes: &[u8]) {
         if let Some(win) = self.windows.get_mut(wi) {
@@ -495,8 +562,8 @@ impl Gritty {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_sel_visible, next_tab_switch_state, push_name_input, MAX_NAME_LEN,
-        PALETTE_VISIBLE_ROWS,
+        clamp_sel_visible, ime_commit_target, next_tab_switch_state, push_name_input, CommitTarget,
+        MAX_NAME_LEN, PALETTE_VISIBLE_ROWS,
     };
 
     #[test]
@@ -612,5 +679,30 @@ mod tests {
         assert_eq!(active, 2);
         assert!(broadcast);
         assert_eq!(pending, Some(0x04));
+    }
+
+    // CA-48: IME-committed text must route exactly like a typed character — into
+    // an open rename prompt first, then the command palette, else the focused
+    // pane. (Before the fix there was no Ime arm at all, so composition never
+    // reached any of these.)
+
+    #[test]
+    fn ime_commit_prefers_rename_then_palette_then_pane() {
+        // Rename prompt open (even if palette also open) → the rename buffer wins.
+        assert_eq!(ime_commit_target(true, false), CommitTarget::Rename);
+        assert_eq!(ime_commit_target(true, true), CommitTarget::Rename);
+        // No rename but palette open → the palette query.
+        assert_eq!(ime_commit_target(false, true), CommitTarget::Palette);
+        // Neither overlay → the focused pane.
+        assert_eq!(ime_commit_target(false, false), CommitTarget::Pane);
+    }
+
+    #[test]
+    fn ime_commit_into_a_buffer_strips_control_chars() {
+        // Composed text routed into a name buffer goes through push_name_input, so
+        // a stray control char in the commit can't corrupt the single-line render.
+        let mut buf = String::new();
+        push_name_input(&mut buf, "啊\n不");
+        assert_eq!(buf, "啊不");
     }
 }

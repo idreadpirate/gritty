@@ -31,6 +31,12 @@ pub(crate) const ZOOM_STEP: f32 = 2.0;
 /// Maximum time between clicks to be counted as a multi-click (ms).
 const MULTI_CLICK_MS: u64 = 500;
 
+/// CA-52: how long the stream of window-resize events must pause before the new
+/// geometry is pushed to the children. A drag of the OS window edge fires
+/// `Resized` continuously; coalescing on this debounce collapses the burst into
+/// a single ConPTY resize once the user settles on a size.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
+
 /// CA-54: how often to refresh per-pane foreground process names. The poll is a
 /// full process-table snapshot, so it only runs this often and only while a
 /// window is visible.
@@ -113,6 +119,16 @@ pub(crate) struct Win {
     /// CA-39: the OS caption currently set on this window, so `set_title` only
     /// fires when the focused pane's OSC 0/2 title actually changes.
     pub(crate) title: String,
+    /// CA-48: the in-progress IME composition string (preedit). Non-empty only
+    /// while the user is composing (CJK / dead-key accents); shown so the user
+    /// sees what they're typing, cleared on commit or when composition ends.
+    pub(crate) preedit: String,
+    /// CA-52: the last `Resized` instant and the latest pending physical size.
+    /// A window-resize storm (dragging the OS edge) is coalesced: the size is
+    /// recorded here and pushed to the panes/PTYs once the events settle, instead
+    /// of one ConPTY resize per intermediate size. `None` when no resize is
+    /// pending.
+    pub(crate) pending_resize: Option<Instant>,
 }
 
 pub(crate) struct Gritty {
@@ -197,6 +213,10 @@ impl Gritty {
         }
         let window = Rc::new(event_loop.create_window(attrs).ok()?);
         crate::style_caption(&window);
+        // CA-48: enable IME so CJK composition and dead-key accents reach the
+        // `WindowEvent::Ime` arm; without this winit never delivers Preedit/Commit
+        // and international input is impossible.
+        window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone()).ok()?;
         let surface = softbuffer::Surface::new(&context, window.clone()).ok()?;
         Some(Win {
@@ -229,6 +249,10 @@ impl Gritty {
             os_focused: true,
             // CA-39: matches the `with_title("gritty")` attr set above.
             title: "gritty".to_string(),
+            // CA-48: no composition in progress on a fresh window.
+            preedit: String::new(),
+            // CA-52: no resize pending yet.
+            pending_resize: None,
         })
     }
 
@@ -477,7 +501,43 @@ impl Gritty {
         self.relayout(wi);
     }
 
+    /// Foreground process name of the focused pane in window `wi`'s active tab
+    /// (empty if none / a bare shell). Used to gate destructive-close confirms
+    /// (CA-50).
+    fn focused_proc_name(&self, wi: usize) -> String {
+        self.windows
+            .get(wi)
+            .and_then(|w| w.tabs.get(w.active))
+            .and_then(|t| t.panes.get(&t.focus))
+            .map(|p| p.proc_name.clone())
+            .unwrap_or_default()
+    }
+
+    /// CA-50: the first non-shell foreground program found across every pane of
+    /// every tab in window `wi`, if any. Used to confirm before the window ✕
+    /// kills the whole window.
+    fn window_live_program(&self, wi: usize) -> Option<String> {
+        self.windows.get(wi).and_then(|w| {
+            w.tabs
+                .iter()
+                .flat_map(|t| t.panes.values())
+                .map(|p| p.proc_name.clone())
+                .find(|n| close_needs_confirm(n))
+        })
+    }
+
     pub(crate) fn close_focus(&mut self, wi: usize, event_loop: &ActiveEventLoop) {
+        // CA-50: a pane running a live non-shell foreground process (an editor, a
+        // build, an SSH session) is killed on close — confirm first so a stray
+        // Ctrl+Shift+W can't silently drop unsaved work.
+        if close_needs_confirm(&self.focused_proc_name(wi))
+            && !confirm_dialog(&format!(
+                "A program (\"{}\") is still running in this pane.\n\nClose it anyway?",
+                self.focused_proc_name(wi).trim()
+            ))
+        {
+            return;
+        }
         let win_empty = {
             let Some(win) = self.windows.get_mut(wi) else {
                 return;
@@ -531,6 +591,23 @@ impl Gritty {
     /// tab index is re-resolved with the shared `active_after_tab_removed` so
     /// closing a background tab doesn't shift which tab is shown.
     pub(crate) fn close_tab(&mut self, wi: usize, ti: usize, event_loop: &ActiveEventLoop) {
+        // CA-50: the tab-strip `×` drops every pane in the tab at once. If its
+        // focused pane runs a live non-shell program, confirm before killing it.
+        let tab_proc = self
+            .windows
+            .get(wi)
+            .and_then(|w| w.tabs.get(ti))
+            .and_then(|t| t.panes.get(&t.focus))
+            .map(|p| p.proc_name.clone())
+            .unwrap_or_default();
+        if close_needs_confirm(&tab_proc)
+            && !confirm_dialog(&format!(
+                "A program (\"{}\") is still running in this tab.\n\nClose it anyway?",
+                tab_proc.trim()
+            ))
+        {
+            return;
+        }
         let win_empty = {
             let Some(win) = self.windows.get_mut(wi) else {
                 return;
@@ -662,7 +739,13 @@ impl Gritty {
     }
 
     /// Remove panes whose shell exited, tabs left empty, and windows left empty.
-    pub(crate) fn reap_dead(&mut self, event_loop: &ActiveEventLoop) {
+    ///
+    /// CA-40: a pane is reaped one cycle *after* its shell is first seen dead, not
+    /// in the same cycle — its final drained line (the shell's exit/farewell
+    /// output) is fed by `drain_pty` this cycle and must be painted once before
+    /// removal. Returns `true` if any pane was newly flagged dead this pass, so
+    /// the caller re-wakes to reap it on the next cycle.
+    pub(crate) fn reap_dead(&mut self, event_loop: &ActiveEventLoop) -> bool {
         // CA-110: tear-off captures a tab by its press-time positional index
         // (`TabDrag.index`). Reaping a tab mid-drag would shift `win.tabs`, so the
         // captured index would name a different tab — or run off the end and drop
@@ -671,20 +754,29 @@ impl Gritty {
         // panes/tabs are reaped on the next `Wake` after the drag ends.
         let tab_drag_in_flight = self.windows.iter().any(|w| w.tab_drag.is_some());
         if reaping_is_frozen(tab_drag_in_flight) {
-            return;
+            return false;
         }
         let mut changed = false;
+        let mut deferred = false;
         let mut wi = 0;
         while wi < self.windows.len() {
             let win = &mut self.windows[wi];
             let mut ti = 0;
             while ti < win.tabs.len() {
-                let dead: Vec<usize> = win.tabs[ti]
-                    .panes
-                    .iter()
-                    .filter(|(_, p)| !p.pty.is_alive())
-                    .map(|(id, _)| *id)
-                    .collect();
+                // CA-40: flag any newly-dead pane (keep it one more cycle so its
+                // final line paints), and only reap panes already seen dead.
+                let mut dead: Vec<usize> = Vec::new();
+                for (id, p) in win.tabs[ti].panes.iter_mut() {
+                    if p.pty.is_alive() {
+                        continue;
+                    }
+                    if should_reap_dead_pane(p.dead_seen) {
+                        dead.push(*id);
+                    } else {
+                        p.dead_seen = true;
+                        deferred = true;
+                    }
+                }
                 for id in dead {
                     changed = true;
                     let tab = &mut win.tabs[ti];
@@ -728,7 +820,7 @@ impl Gritty {
                 // leave the last good session.json untouched so a relaunch
                 // restores it instead of opening a blank tab.
                 event_loop.exit();
-                return;
+                return false;
             }
             if self.focused >= self.windows.len() {
                 self.focused = self.windows.len() - 1;
@@ -738,6 +830,7 @@ impl Gritty {
                 self.request_redraw(wi);
             }
         }
+        deferred
     }
 
     // --- clipboard, scoped to the focused pane of window `wi`'s active tab ----
@@ -876,6 +969,23 @@ impl Gritty {
         // stop restoring further windows.
         let mut restored_panes = 0usize;
 
+        // CA-49: the currently-attached monitors' rectangles (physical px), so a
+        // window saved on a since-unplugged display is clamped back onto a visible
+        // screen instead of opening off every monitor (invisible and unreachable).
+        let monitors: Vec<MonitorRect> = event_loop
+            .available_monitors()
+            .map(|m| {
+                let p = m.position();
+                let s = m.size();
+                MonitorRect {
+                    x: p.x,
+                    y: p.y,
+                    w: s.width as i32,
+                    h: s.height as i32,
+                }
+            })
+            .collect();
+
         for sw in saved.into_iter().take(MAX_WINDOWS) {
             if sw.tabs.is_empty() || sw.tabs.len() > MAX_TABS {
                 continue;
@@ -908,7 +1018,15 @@ impl Gritty {
                 _ => (960.0, 600.0),
             };
             let pos = match (sw.win_x, sw.win_y) {
-                (Some(x), Some(y)) => Some((x, y)),
+                // CA-49: clamp the saved top-left onto a currently-visible monitor
+                // so a window saved on a now-removed display doesn't open off
+                // every screen. With no monitors reported we keep the saved
+                // position and let the OS place it.
+                (Some(x), Some(y)) => Some(clamp_to_monitors(
+                    (x, y),
+                    (size.0 as u32, size.1 as u32),
+                    &monitors,
+                )),
                 _ => None,
             };
             let Some(mut win) = self.spawn_window(event_loop, size, pos, sw.seamless) else {
@@ -1403,7 +1521,11 @@ impl ApplicationHandler<Wake> for Gritty {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         let dirty = self.drain_pty();
-        self.reap_dead(event_loop);
+        // CA-40: `reap_dead` defers a just-died pane by one cycle so its final
+        // drained line paints first. When it did defer, paint now (the final
+        // frame) and re-wake so the deferred pane is reaped next cycle — the
+        // dead reader thread emits no further wake of its own.
+        let deferred_reap = self.reap_dead(event_loop);
         // CA-39: the OSC 0/2 title may have changed in the bytes we just drained;
         // push it to the OS caption (no-op when unchanged).
         self.update_titles();
@@ -1440,14 +1562,43 @@ impl ApplicationHandler<Wake> for Gritty {
         }
         // reap_dead may have removed windows (shifting indices); when anything
         // changed, just schedule all live windows — they're few and frame-capped.
-        if proc_dirty || !dirty.is_empty() {
+        // CA-40: a deferred reap also forces a paint so the dying pane's final
+        // line lands before it's removed next cycle.
+        if proc_dirty || !dirty.is_empty() || deferred_reap {
             for wi in 0..self.windows.len() {
                 self.schedule_redraw(wi, event_loop);
             }
         }
+        // CA-40: kick the next cycle so the deferred dead pane is actually reaped
+        // (its exited reader thread will not wake us again).
+        if deferred_reap {
+            let _ = self.proxy.send_event(Wake);
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // CA-52: apply any window-resize that has settled, pushing the new
+        // geometry to ALL of its tabs (CA-140) as a single ConPTY resize instead
+        // of one per intermediate drag size. A resize still settling is left for
+        // a later tick (the soonest remaining debounce is re-armed below).
+        let mut soonest_resize: Option<Duration> = None;
+        for wi in 0..self.windows.len() {
+            let Some(since) = self.windows[wi].pending_resize.map(|t| t.elapsed()) else {
+                continue;
+            };
+            if resize_settled(since, RESIZE_DEBOUNCE) {
+                self.windows[wi].pending_resize = None;
+                self.relayout_all(wi);
+                self.request_redraw(wi);
+            } else {
+                let remaining = RESIZE_DEBOUNCE - since;
+                soonest_resize = Some(match soonest_resize {
+                    Some(d) => d.min(remaining),
+                    None => remaining,
+                });
+            }
+        }
+
         // Windows already past their frame cooldown can paint now.
         for win in &self.windows {
             if win.redraw_pending && win.last_render.elapsed() >= FRAME {
@@ -1466,7 +1617,16 @@ impl ApplicationHandler<Wake> for Gritty {
             .windows
             .iter()
             .map(|w| (w.redraw_pending, w.last_render.elapsed()));
-        if let Some(remaining) = next_deferred_wait(pending, FRAME) {
+        // CA-52: a resize still settling must also re-arm a wake, or during the
+        // quiet period after the last `Resized` event `about_to_wait` wouldn't run
+        // again and the deferred relayout would never fire. Take the soonest of
+        // the deferred-frame wake and the resize-debounce wake.
+        let frame_wait = next_deferred_wait(pending, FRAME);
+        let wait = match (frame_wait, soonest_resize) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(remaining) = wait {
             let until = Instant::now() + remaining;
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(until));
         }
@@ -1478,6 +1638,17 @@ impl ApplicationHandler<Wake> for Gritty {
         };
         match event {
             WindowEvent::CloseRequested => {
+                // CA-50: the window ✕ kills every pane in every tab. If any pane
+                // runs a live non-shell program, confirm before tearing the whole
+                // window down.
+                if let Some(name) = self.window_live_program(wi) {
+                    if !confirm_dialog(&format!(
+                        "A program (\"{}\") is still running in this window.\n\nClose it anyway?",
+                        name.trim()
+                    )) {
+                        return;
+                    }
+                }
                 // CA-113: remove the closing window FIRST, then persist. The old
                 // order snapshotted all windows — including the one being closed —
                 // so session.json still listed it; a kill/crash before the next
@@ -1498,6 +1669,35 @@ impl ApplicationHandler<Wake> for Gritty {
             }
 
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+
+            // CA-48: IME composition. A Preedit is the in-progress (not yet
+            // committed) string — shown so the user sees what they're typing; a
+            // Commit is the finished text, routed exactly like typed characters
+            // (into the open rename/palette buffer, else to the focused pane).
+            WindowEvent::Ime(ime) => {
+                self.focused = wi;
+                match ime {
+                    winit::event::Ime::Preedit(text, _) => {
+                        if let Some(win) = self.windows.get_mut(wi) {
+                            win.preedit = text;
+                        }
+                        self.request_redraw(wi);
+                    }
+                    winit::event::Ime::Commit(text) => {
+                        if let Some(win) = self.windows.get_mut(wi) {
+                            win.preedit.clear();
+                        }
+                        self.commit_text(wi, &text);
+                        self.request_redraw(wi);
+                    }
+                    // Enabled/Disabled: just clear any stale preedit.
+                    winit::event::Ime::Enabled | winit::event::Ime::Disabled => {
+                        if let Some(win) = self.windows.get_mut(wi) {
+                            win.preedit.clear();
+                        }
+                    }
+                }
+            }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
@@ -1700,10 +1900,16 @@ impl ApplicationHandler<Wake> for Gritty {
             }
 
             WindowEvent::Resized(_) => {
-                // CA-140: push the new geometry to ALL tabs in the window, so a
-                // backgrounded shell gets the resize (SIGWINCH-equivalent) instead
-                // of staying at stale dimensions until it's brought forward.
-                self.relayout_all(wi);
+                // CA-52: dragging the OS window edge fires a continuous stream of
+                // `Resized` events. Pushing every intermediate size straight to the
+                // children spams ConPTY resizes (SIGWINCH-equivalent) and makes some
+                // TUIs visibly thrash. Instead record the latest resize time and
+                // defer the grid/PTY relayout until the events settle (handled in
+                // `about_to_wait`). The frame itself still repaints now at the new
+                // buffer size, so the window doesn't look frozen mid-drag.
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.pending_resize = Some(Instant::now());
+                }
                 self.request_redraw(wi);
             }
 
@@ -1990,6 +2196,44 @@ pub(crate) fn show_error_dialog(message: &str) {
     eprintln!("Fatal error: {message}");
 }
 
+// --- Confirm dialog (CA-50) --------------------------------------------------
+
+/// CA-50: ask the user to confirm a destructive close (a pane/window running a
+/// live non-shell foreground process). Returns `true` if the user chose to
+/// proceed. A native Yes/No MessageBox on Windows; off-Windows there is no
+/// modal UI, so we proceed (the close paths there are test/dev only).
+#[cfg(windows)]
+pub(crate) fn confirm_dialog(message: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO,
+    };
+
+    let title: Vec<u16> = "Gritty — Confirm close"
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    let body: Vec<u16> = message
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    // SAFETY: both pointers are valid null-terminated UTF-16 buffers; a null
+    // owner is valid for an app-modal box.
+    let ret = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    ret == IDYES
+}
+
+#[cfg(not(windows))]
+pub(crate) fn confirm_dialog(_message: &str) -> bool {
+    true
+}
+
 // --- Pure helper functions (unit-testable) ----------------------------------
 
 /// CA-28: Result of a tab-strip button hit-test.
@@ -2230,6 +2474,122 @@ pub(crate) fn session_should_persist(remaining_windows: usize) -> bool {
 pub(crate) fn active_after_tab_removed(active: usize, removed: usize, remaining: usize) -> usize {
     let shifted = if removed < active { active - 1 } else { active };
     shifted.min(remaining.saturating_sub(1))
+}
+
+/// CA-49: a monitor's usable rectangle in physical screen pixels: top-left
+/// `(x, y)` and `(w, h)`. winit 0.30 only exposes a monitor's full bounds
+/// (`MonitorHandle::position`/`size`), so `restore_windows` builds these from
+/// every available monitor; the clamp keeps a restored window on one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MonitorRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) w: i32,
+    pub(crate) h: i32,
+}
+
+/// CA-49: place a restored window so it is visible on some monitor.
+///
+/// A session saved on a monitor that has since been unplugged replays
+/// coordinates that fall off every screen — the window opens invisible and
+/// unreachable (no keybind recenters it). Given the saved top-left `pos`, the
+/// window `size`, and the work rectangles of the currently-attached monitors:
+///
+/// - `None` monitors (headless / none reported) → keep the saved position; we
+///   can't reason about screens, and the OS may still place it sanely.
+/// - the saved rect overlaps some monitor → keep it verbatim (the common case;
+///   never nudge a window that's already visible).
+/// - otherwise clamp the top-left into the nearest monitor (by squared distance
+///   between rect centers) so the window's title bar lands on-screen, leaving at
+///   least a sliver grabbable. Pure so the placement rule is unit-tested without
+///   a display.
+pub(crate) fn clamp_to_monitors(
+    pos: (i32, i32),
+    size: (u32, u32),
+    monitors: &[MonitorRect],
+) -> (i32, i32) {
+    if monitors.is_empty() {
+        return pos;
+    }
+    let (px, py) = pos;
+    let (w, h) = (size.0 as i64, size.1 as i64);
+    let overlaps = |m: &MonitorRect| {
+        let (mx, my) = (m.x as i64, m.y as i64);
+        let (mw, mh) = (m.w.max(0) as i64, m.h.max(0) as i64);
+        let (rx, ry) = (px as i64, py as i64);
+        rx < mx + mw && rx + w > mx && ry < my + mh && ry + h > my
+    };
+    if monitors.iter().any(overlaps) {
+        return pos;
+    }
+    // Off every monitor: pick the nearest one by center-to-center distance and
+    // clamp the top-left so the whole window fits inside it where possible (a
+    // window larger than the monitor pins to the top-left corner).
+    let rect_cx = px as i64 + w / 2;
+    let rect_cy = py as i64 + h / 2;
+    let nearest = monitors
+        .iter()
+        .min_by_key(|m| {
+            let mcx = m.x as i64 + m.w.max(0) as i64 / 2;
+            let mcy = m.y as i64 + m.h.max(0) as i64 / 2;
+            let dx = mcx - rect_cx;
+            let dy = mcy - rect_cy;
+            dx * dx + dy * dy
+        })
+        .copied()
+        .unwrap_or(monitors[0]);
+    let max_x = (nearest.x as i64 + nearest.w.max(0) as i64 - w).max(nearest.x as i64);
+    let max_y = (nearest.y as i64 + nearest.h.max(0) as i64 - h).max(nearest.y as i64);
+    let cx = (px as i64).clamp(nearest.x as i64, max_x);
+    let cy = (py as i64).clamp(nearest.y as i64, max_y);
+    (cx as i32, cy as i32)
+}
+
+/// CA-50: whether closing a pane/tab/window needs a confirmation prompt because
+/// its focused pane is running a non-shell foreground process (an editor, a
+/// build, an SSH session). `proc_name` is the periodically-polled foreground
+/// name; an empty name (a bare prompt) or a known interactive shell closes
+/// silently. Pure so the shell allowlist is unit-tested.
+pub(crate) fn close_needs_confirm(proc_name: &str) -> bool {
+    let name = proc_name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    const SHELLS: &[&str] = &[
+        "pwsh",
+        "powershell",
+        "cmd",
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "nu",
+    ];
+    let lower = name.to_ascii_lowercase();
+    !SHELLS.contains(&lower.as_str())
+}
+
+/// CA-52: whether a pending window-resize has settled long enough to push to the
+/// children. Dragging the OS window edge fires a continuous stream of
+/// `Resized` events; applying each synchronously pushes every intermediate size
+/// to the child as a separate ConPTY resize (SIGWINCH-equivalent), so some TUIs
+/// visibly thrash mid-drag. We instead record the latest size and apply it once
+/// the events have paused for `debounce`. Pure so the timing rule is unit-tested.
+pub(crate) fn resize_settled(since_last_resize: Duration, debounce: Duration) -> bool {
+    since_last_resize >= debounce
+}
+
+/// CA-40: whether a pane whose shell just exited should be reaped THIS cycle.
+///
+/// The dying shell's farewell/exit line is fed into the grid by `drain_pty`,
+/// but if `reap_dead` removes the pane in the same cycle — before the scheduled
+/// redraw paints it — that last line is never shown. So a pane is held for one
+/// extra cycle: the first time it is seen dead it is flagged (`already_seen ==
+/// false`) and kept so the final frame paints; only on the next pass
+/// (`already_seen == true`) is it actually reaped. Pure so the one-cycle defer
+/// is unit-tested.
+pub(crate) fn should_reap_dead_pane(already_seen: bool) -> bool {
+    already_seen
 }
 
 /// CA-7: Encode an SGR mouse sequence.
@@ -3017,5 +3377,128 @@ mod tests {
         assert!(!is_broadcast_signal_byte(0x0d));
         assert!(!is_broadcast_signal_byte(0x09));
         assert!(!is_broadcast_signal_byte(0x1b));
+    }
+
+    // --- CA-49 restored-window monitor clamp ---------------------------------
+
+    fn mon(x: i32, y: i32, w: i32, h: i32) -> MonitorRect {
+        MonitorRect { x, y, w, h }
+    }
+
+    #[test]
+    fn clamp_keeps_a_window_already_on_a_monitor() {
+        // A window fully inside the primary monitor is never nudged.
+        let mons = [mon(0, 0, 1920, 1080)];
+        assert_eq!(clamp_to_monitors((100, 100), (960, 600), &mons), (100, 100));
+        // Even a window only partially overlapping a monitor stays put (still
+        // grabbable), so we don't fight the OS over a deliberately off-edge window.
+        assert_eq!(clamp_to_monitors((-50, -20), (960, 600), &mons), (-50, -20));
+    }
+
+    #[test]
+    fn clamp_pulls_an_offscreen_window_onto_the_nearest_monitor() {
+        // CA-49: a window saved at (3000, 200) on a now-unplugged second monitor
+        // lands off the only remaining 1920x1080 screen — clamp it back so the
+        // whole window fits (top-left at 1920-960 = 960, y stays 200).
+        let mons = [mon(0, 0, 1920, 1080)];
+        let (x, y) = clamp_to_monitors((3000, 200), (960, 600), &mons);
+        assert_eq!((x, y), (960, 200));
+        // The clamped rect is fully inside the monitor.
+        assert!(x >= 0 && x + 960 <= 1920 && y >= 0 && y + 600 <= 1080);
+    }
+
+    #[test]
+    fn clamp_picks_the_nearest_of_several_monitors() {
+        // Two monitors: primary at origin, a second to the right. A window saved
+        // far to the right of the second monitor clamps onto the second, not the
+        // primary (nearest by center distance).
+        let mons = [mon(0, 0, 1920, 1080), mon(1920, 0, 1920, 1080)];
+        let (x, _y) = clamp_to_monitors((5000, 100), (800, 600), &mons);
+        assert!(
+            x >= 1920,
+            "should clamp onto the right-hand monitor, got x={x}"
+        );
+    }
+
+    #[test]
+    fn clamp_with_no_monitors_keeps_the_saved_position() {
+        // Headless / no monitors reported: we can't reason about screens, so keep
+        // the saved position and let the OS place it.
+        assert_eq!(
+            clamp_to_monitors((4000, 4000), (960, 600), &[]),
+            (4000, 4000)
+        );
+    }
+
+    #[test]
+    fn clamp_oversized_window_pins_to_monitor_top_left() {
+        // A window larger than the only monitor can't fit; it pins to the
+        // monitor's top-left rather than producing a negative coordinate.
+        let mons = [mon(0, 0, 800, 600)];
+        let (x, y) = clamp_to_monitors((9000, 9000), (1200, 1000), &mons);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    // --- CA-50 close-confirm predicate ---------------------------------------
+
+    #[test]
+    fn close_confirm_skips_bare_shells_and_empty() {
+        // A bare prompt (empty name) or a known interactive shell closes silently.
+        assert!(!close_needs_confirm(""));
+        assert!(!close_needs_confirm("   "));
+        for sh in [
+            "pwsh",
+            "powershell",
+            "cmd",
+            "bash",
+            "zsh",
+            "fish",
+            "nu",
+            "PWSH",
+        ] {
+            assert!(!close_needs_confirm(sh), "{sh} is a shell — no confirm");
+        }
+    }
+
+    #[test]
+    fn close_confirm_fires_for_a_live_program() {
+        // A non-shell foreground program (editor / build / SSH) must confirm.
+        for prog in ["nvim", "vim", "ssh", "cargo", "python", "htop"] {
+            assert!(close_needs_confirm(prog), "{prog} should confirm");
+        }
+        // Surrounding whitespace doesn't fool the check.
+        assert!(close_needs_confirm("  nvim  "));
+    }
+
+    // --- CA-52 resize-storm debounce -----------------------------------------
+
+    #[test]
+    fn resize_applies_only_after_the_storm_settles() {
+        let debounce = RESIZE_DEBOUNCE;
+        // Still inside the debounce window → don't push the resize yet (coalesce).
+        assert!(!resize_settled(Duration::from_millis(0), debounce));
+        assert!(!resize_settled(
+            debounce - Duration::from_millis(1),
+            debounce
+        ));
+        // The events have paused for the full debounce → apply once.
+        assert!(resize_settled(debounce, debounce));
+        assert!(resize_settled(debounce + Duration::from_secs(1), debounce));
+    }
+
+    // --- CA-40 dying-pane one-cycle reap defer -------------------------------
+
+    #[test]
+    fn dead_pane_is_held_one_cycle_then_reaped() {
+        // CA-40: the first time a dead pane is seen it is NOT reaped (its final
+        // line must paint once); only after it's been seen dead is it removed.
+        assert!(
+            !should_reap_dead_pane(false),
+            "a newly-dead pane is held one cycle so its last line paints"
+        );
+        assert!(
+            should_reap_dead_pane(true),
+            "a pane already seen dead is reaped"
+        );
     }
 }

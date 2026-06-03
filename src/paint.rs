@@ -547,6 +547,33 @@ impl Gritty {
             );
         }
 
+        // CA-48: IME composition (preedit) overlay. While the user is composing
+        // CJK / dead-key accents, winit delivers the in-progress string before the
+        // final Commit. Show it on a status line so the user sees what they're
+        // typing; it clears on commit or when composition ends.
+        if !win.preedit.is_empty() {
+            let line = format!(" compose: {} ", win.preedit);
+            let r = Rect {
+                x: 0,
+                y: height.saturating_sub(ch),
+                w: stride,
+                h: ch,
+            };
+            fill_rect(&mut buffer, stride, r, accent);
+            draw_text(
+                &mut buffer,
+                stride,
+                font,
+                0,
+                r.y,
+                &line,
+                color::bg(),
+                accent,
+                true,
+                r,
+            );
+        }
+
         // Ignore a transient present failure (device-context loss): skip this
         // frame rather than crash (CA-1). Frame bookkeeping was already cleared
         // at the top, so a skipped frame won't busy-spin `about_to_wait`.
