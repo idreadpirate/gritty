@@ -4,6 +4,20 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Rendering & performance
+- **Dirty-rect rendering** — fixed a CPU spin (~87 % of a core, which read as a
+  freeze/"can't close") under a continuously updating pane (agent spinner,
+  streaming log). Each window keeps a persistent backbuffer and a structural
+  render signature; a frame is a *full* repaint only on the first frame, a
+  resize, or a structural change (chrome, layout, focus, titles, overlays,
+  theme, live selection, scrollback view, bell) — otherwise only the
+  VT-damaged grid rows are repainted (via alacritty's per-line damage). A
+  one-line spinner now repaints ~one line instead of the whole grid.
+- `scripts/stress.ps1` — many-pane (default 100) load/leak harness: writes a
+  session, launches gritty, samples RSS / threads / handles / CPU over time and
+  flags a leak (RSS climbing), a thread leak, or render spin; `-Broadcast`
+  streams a spinner into every pane at once.
+
 ### Footprint & build
 - **Self-contained `gritty.exe` is now under 800 KB** (was ~1.25 MB): release
   profile `opt-level=z` + `codegen-units=1`; hand-rolled `config.toml` and
@@ -58,6 +72,7 @@ All notable changes to gritty.
 
 ### Terminal fidelity
 - Full xterm key encoding: F-keys, modified arrows, Alt-as-ESC, Ctrl-masking.
+  `Ctrl+Space` emits NUL (`0x00`) like xterm/readline/Emacs (not a space).
 - SGR attributes: reverse, bold, dim, hidden, underline; wide CJK/emoji glyphs.
 - Mouse reporting to applications (vim/htop/fzf); OSC-8 Ctrl-click hyperlinks;
   OSC-0/2 title capture; OSC-7 cwd inheritance on split; visual bell.
@@ -71,6 +86,8 @@ All notable changes to gritty.
 - Paste sanitization (control/escape injection, bracketed-paste end-marker).
 - Absolute, existence-checked shell paths (no PATH hijack).
 - Session-restore caps + tree/pane/focus reconciliation (no mass-spawn / freeze).
+- Restored window size is clamped to sane bounds (≤ 16384 per dimension), so a
+  crafted `session.json` can't request a degenerate `u32::MAX` window.
 - `Pane::new -> Result` with a native error dialog instead of a silent abort.
 - Embedded fallback font + no-panic glyph path; graceful surface device-loss.
 - Bounded PTY backpressure; coalesced wakes; ~120 fps frame cap; glyph-cache cap.
