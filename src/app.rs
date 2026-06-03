@@ -2324,26 +2324,40 @@ fn cursor_pos() -> Option<(i32, i32)> {
 
 // --- Error dialog ------------------------------------------------------------
 
-/// Show a native Windows MessageBox with an error icon, then return.
+/// Run a native `MessageBoxW` on a dedicated worker thread and block on its
+/// result. See `confirm_dialog` for *why* the box must not be pumped on the
+/// winit UI thread (it storms winit's timer/wake servicing and freezes the app).
+/// A NULL owner is mandatory — an owner on the blocked, non-pumping UI thread
+/// would deadlock `MessageBoxW`'s internal cross-thread `SendMessage`. Returns
+/// the raw `MessageBoxW` code, or 0 if the worker couldn't be spawned/joined.
 #[cfg(windows)]
-pub(crate) fn show_error_dialog(message: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-
-    let title: Vec<u16> = "Gritty — Fatal Error"
-        .encode_utf16()
-        .chain(std::iter::once(0u16))
-        .collect();
+fn message_box_off_thread(title: &str, message: &str, flags: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0u16)).collect();
     let body: Vec<u16> = message
         .encode_utf16()
         .chain(std::iter::once(0u16))
         .collect();
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
+    // SAFETY: both pointers are valid null-terminated UTF-16 buffers owned by the
+    // closure for the call's duration; a null owner is valid for `MessageBoxW`.
+    std::thread::Builder::new()
+        .spawn(move || unsafe {
+            MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), flags)
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or(0)
+}
+
+/// Show a native Windows MessageBox with an error icon, then return once the
+/// user dismisses it (callers show it right before exiting, so it must block
+/// until read). A failed spawn falls back to stderr so the message is never
+/// silently lost.
+#[cfg(windows)]
+pub(crate) fn show_error_dialog(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
+    if message_box_off_thread("Gritty — Fatal Error", message, MB_OK | MB_ICONERROR) == 0 {
+        eprintln!("Fatal error: {message}");
     }
 }
 
@@ -2358,44 +2372,27 @@ pub(crate) fn show_error_dialog(message: &str) {
 /// live non-shell foreground process). Returns `true` if the user chose to
 /// proceed. A native Yes/No MessageBox on Windows; off-Windows there is no
 /// modal UI, so we proceed (the close paths there are test/dev only).
+///
+/// The box runs on a dedicated worker thread, NOT inline on the winit UI thread.
+/// A `MessageBoxW` pumps its own nested modal message loop; when that loop runs
+/// on the winit thread it must also service winit's `WaitUntil` timer and
+/// proxy-wake machinery, which degenerates into a message storm — the UI thread
+/// pegs one core at ~100% (measured ~94% kernel) and the app freezes with the
+/// dialog stuck up (the recurring "froze, can't close"). Hosting the box on its
+/// own thread isolates its pump from winit; the UI thread just blocks on the
+/// result, which is a clean wait (no message pump → no storm). A NULL owner is
+/// required here: an owner living on the now-blocked, non-pumping winit thread
+/// would deadlock `MessageBoxW`'s internal cross-thread `SendMessage`.
+/// `MB_TOPMOST | MB_SETFOREGROUND` keep the box surfaced in front.
 #[cfg(windows)]
-pub(crate) fn confirm_dialog(owner: &Window, message: &str) -> bool {
+pub(crate) fn confirm_dialog(_owner: &Window, message: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+        IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     };
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    // Own the box to the gritty window so it's modal *to that window* and drawn
-    // in front. A null-owner box can land behind/off-screen yet still block the
-    // UI thread in its own message pump — the close then looks frozen and the
-    // window can't be dismissed. TOPMOST + SETFOREGROUND make sure it surfaces.
-    let owner_hwnd = owner
-        .window_handle()
-        .ok()
-        .and_then(|h| match h.as_raw() {
-            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut core::ffi::c_void),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let title: Vec<u16> = "Gritty — Confirm close"
-        .encode_utf16()
-        .chain(std::iter::once(0u16))
-        .collect();
-    let body: Vec<u16> = message
-        .encode_utf16()
-        .chain(std::iter::once(0u16))
-        .collect();
-    // SAFETY: both string pointers are valid null-terminated UTF-16 buffers;
-    // owner_hwnd is a live window handle or null (both valid for MessageBoxW).
-    let ret = unsafe {
-        MessageBoxW(
-            owner_hwnd,
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
-        )
-    };
-    ret == IDYES
+    // A spawn/join failure yields 0 (!= IDYES) → "don't proceed", mirroring the
+    // old `MessageBoxW`-failed case: never destroy a live program without a "Yes".
+    let flags = MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND;
+    message_box_off_thread("Gritty — Confirm close", message, flags) == IDYES
 }
 
 #[cfg(not(windows))]
