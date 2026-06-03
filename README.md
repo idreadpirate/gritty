@@ -27,8 +27,9 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 - **Brutally lightweight, by construction.** CPU software rendering (no GPU
   pipeline, no driver surface); a **sub-800 KB** binary (`opt-level=z` + `lto` +
   `strip` + `panic=abort`, hand-rolled config/session parsers instead of
-  `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); ~22 MB idle
-  RAM; near-0% CPU when idle (event-driven repaint with a frame cap + wake
+  `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); **~25 MB RAM
+  per pane** (a 5000-line scrollback grid each — tunable via `config.toml`);
+  near-0% CPU when idle (event-driven repaint with a frame cap + wake
   coalescing). 20 busy panes can't peg a core.
 - **Stands on giants, reinvents nothing risky.** It extracts the proven cores —
   WezTerm's `portable-pty` for ConPTY and Alacritty's `alacritty_terminal` VT
