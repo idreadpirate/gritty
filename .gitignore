@@ -6,3 +6,4 @@
 # clones of the public repo don't accidentally commit them.
 /.claude
 /.agentbus
+/target-gate

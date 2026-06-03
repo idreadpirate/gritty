@@ -28,6 +28,44 @@ fn push_name_input(buf: &mut String, s: &str) {
     }
 }
 
+/// Max command-palette rows the renderer actually draws (`paint.rs` takes the
+/// first `matches.len().min(8)` matches). The selection must stay inside this
+/// window or it lands on a never-drawn row: no highlight, yet Enter runs an
+/// unseen command (CA-56).
+const PALETTE_VISIBLE_ROWS: usize = 8;
+
+/// Clamp a palette selection index so it stays within the visible, *rendered*
+/// window. `len` is the match count, `max` the number of rows the renderer
+/// draws. The result is `< len.min(max)` (so it is both a real match and a drawn
+/// row), or `0` when there are no matches. Pure so it is unit-tested below
+/// (CA-56).
+fn clamp_sel_visible(sel: usize, len: usize, max: usize) -> usize {
+    let window = len.min(max);
+    if window == 0 {
+        0
+    } else {
+        sel.min(window - 1)
+    }
+}
+
+/// Broadcast/active-tab state after switching a window's active tab to `idx`.
+/// Mirrors the keyboard tab-switch invariant (RT-8/CA-63): changing the active
+/// tab disarms broadcast and clears any pending signal-byte guard, since
+/// broadcast is scoped to the active tab's panes; a no-op switch leaves state
+/// untouched. Pure so the invariant is unit-tested without a live window.
+fn next_tab_switch_state(
+    active: usize,
+    broadcast: bool,
+    pending: Option<u8>,
+    idx: usize,
+) -> (usize, bool, Option<u8>) {
+    if idx != active {
+        (idx, false, None)
+    } else {
+        (idx, broadcast, pending)
+    }
+}
+
 impl Gritty {
     pub(crate) fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
         // Keyboard always targets the focused window.
@@ -311,6 +349,11 @@ impl Gritty {
                 Key::Named(NamedKey::ArrowDown) => {
                     p.sel += 1;
                     p.clamp_selection();
+                    // CA-56: paint.rs only draws the first `matches.len().min(8)`
+                    // rows, so additionally pin the selection inside that rendered
+                    // window — otherwise `sel` reaches a never-drawn row (no
+                    // highlight) yet Enter runs the unseen command there.
+                    p.sel = clamp_sel_visible(p.sel, p.matches().len(), PALETTE_VISIBLE_ROWS);
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     p.sel = p.sel.saturating_sub(1);
@@ -341,6 +384,22 @@ impl Gritty {
         self.request_redraw(wi);
     }
 
+    /// Switch window `wi`'s active tab to `idx`, disarming broadcast like every
+    /// keyboard tab-switch does (Ctrl+Tab / Ctrl+1-9 / tab-bar click). CA-63:
+    /// broadcast is scoped to the *active tab's* panes (RT-8), so changing the
+    /// active tab without clearing it silently fans the next keystrokes out to a
+    /// tab the user didn't mean to. Centralising the invariant here keeps the
+    /// palette switch arms from drifting from the keyboard ones again.
+    fn switch_active_tab(&mut self, wi: usize, idx: usize) {
+        if let Some(win) = self.windows.get_mut(wi) {
+            let (active, broadcast, pending) =
+                next_tab_switch_state(win.active, win.broadcast, win.broadcast_pending_signal, idx);
+            win.active = active;
+            win.broadcast = broadcast;
+            win.broadcast_pending_signal = pending;
+        }
+    }
+
     pub(crate) fn run_cmd(&mut self, cmd: Cmd, event_loop: &ActiveEventLoop) {
         let wi = self.focused;
         match cmd {
@@ -351,9 +410,8 @@ impl Gritty {
             Cmd::NextTab => {
                 let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
                 if len > 0 {
-                    if let Some(win) = self.windows.get_mut(wi) {
-                        win.active = (win.active + 1) % len;
-                    }
+                    let next = (self.windows[wi].active + 1) % len;
+                    self.switch_active_tab(wi, next); // CA-63: also disarms broadcast.
                     self.drain_pty(); // RT-10: flush on palette-driven tab switch.
                     self.relayout(wi);
                 }
@@ -361,9 +419,8 @@ impl Gritty {
             Cmd::PrevTab => {
                 let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
                 if len > 0 {
-                    if let Some(win) = self.windows.get_mut(wi) {
-                        win.active = (win.active + len - 1) % len;
-                    }
+                    let prev = (self.windows[wi].active + len - 1) % len;
+                    self.switch_active_tab(wi, prev); // CA-63: also disarms broadcast.
                     self.drain_pty(); // RT-10: flush on palette-driven tab switch.
                     self.relayout(wi);
                 }
@@ -417,6 +474,14 @@ impl Gritty {
                     .get(wi)
                     .and_then(|w| w.window.outer_position().ok())
                     .map(|p| (p.x + 40, p.y + 40));
+                // CA-63: tearing off the active tab changes which tab is active
+                // in the source window, so disarm its broadcast like every other
+                // tab switch (otherwise the next keystrokes fan out to a tab the
+                // user didn't choose).
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.broadcast = false;
+                    win.broadcast_pending_signal = None;
+                }
                 self.tear_off(event_loop, wi, active, pos);
             }
             Cmd::SaveSession => self.persist_session(),
@@ -429,7 +494,10 @@ impl Gritty {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_name_input, MAX_NAME_LEN};
+    use super::{
+        clamp_sel_visible, next_tab_switch_state, push_name_input, MAX_NAME_LEN,
+        PALETTE_VISIBLE_ROWS,
+    };
 
     #[test]
     fn name_input_strips_control_chars() {
@@ -479,5 +547,70 @@ mod tests {
     #[test]
     fn zoom_reset_key_is_zero() {
         assert_eq!("0", "0");
+    }
+
+    // CA-56: the palette renders only the first 8 match rows, but ArrowDown used
+    // to clamp `sel` to matches.len()-1, so it could land on a never-drawn row
+    // (no highlight, yet Enter ran an unseen command). `clamp_sel_visible` keeps
+    // the selection inside the rendered window.
+
+    #[test]
+    fn palette_sel_cannot_leave_visible_window() {
+        // 13 commands, 8 visible rows: arrowing down past row 7 must stop at 7,
+        // never reaching the never-drawn rows 8..12 (the CA-56 bug).
+        let len = 13;
+        let mut sel = 0;
+        for _ in 0..20 {
+            sel = clamp_sel_visible(sel + 1, len, PALETTE_VISIBLE_ROWS);
+        }
+        assert_eq!(
+            sel,
+            PALETTE_VISIBLE_ROWS - 1,
+            "sel escaped the drawn window"
+        );
+        assert!(sel < PALETTE_VISIBLE_ROWS, "sel on a never-drawn row");
+    }
+
+    #[test]
+    fn palette_sel_clamps_to_matches_when_fewer_than_window() {
+        // With only 3 matches the selection clamps to the last match, not the
+        // 8-row window.
+        let mut sel = 0;
+        for _ in 0..10 {
+            sel = clamp_sel_visible(sel + 1, 3, PALETTE_VISIBLE_ROWS);
+        }
+        assert_eq!(sel, 2);
+    }
+
+    #[test]
+    fn palette_sel_is_zero_with_no_matches() {
+        assert_eq!(clamp_sel_visible(5, 0, PALETTE_VISIBLE_ROWS), 0);
+    }
+
+    // CA-63: palette tab switches (NextTab/PrevTab/MoveTabToNewWindow) must
+    // disarm broadcast like every keyboard switch, so keystrokes don't silently
+    // fan out to a tab the user didn't choose.
+
+    #[test]
+    fn palette_tab_switch_disarms_broadcast() {
+        // broadcast on + a pending signal-byte guard; switching to a different
+        // tab clears both (the RT-8 safety intent).
+        let (active, broadcast, pending) = next_tab_switch_state(0, true, Some(0x03), 1);
+        assert_eq!(active, 1);
+        assert!(
+            !broadcast,
+            "broadcast left armed across a palette tab switch"
+        );
+        assert_eq!(pending, None, "pending signal-byte survived a tab switch");
+    }
+
+    #[test]
+    fn no_op_tab_switch_keeps_broadcast() {
+        // Switching to the already-active tab is a no-op and must not toggle a
+        // user's deliberately-armed broadcast off.
+        let (active, broadcast, pending) = next_tab_switch_state(2, true, Some(0x04), 2);
+        assert_eq!(active, 2);
+        assert!(broadcast);
+        assert_eq!(pending, Some(0x04));
     }
 }

@@ -295,6 +295,12 @@ impl Terminal {
     }
 }
 
+/// RT-20: hard cap on a single paste's payload (post-sanitization bytes). Guards
+/// availability — a huge clipboard would otherwise be copied into a `String`,
+/// then a `Vec`, then handed to one `write_all`, spiking memory and blocking the
+/// UI thread. 4 MiB is far above any real paste.
+const MAX_PASTE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Build the byte stream for pasting `text`.
 ///
 /// Security (RT-4, RT-5b): clipboard content is untrusted — it may carry escape
@@ -304,9 +310,15 @@ impl Terminal {
 /// Dropping ESC (0x1B) neutralizes all escape injection, including any embedded
 /// `\x1b[201~`, so the markers we add ourselves are the only ones present.
 pub fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let mut cleaned = String::with_capacity(text.len());
+    let mut cleaned = String::with_capacity(text.len().min(MAX_PASTE_BYTES));
     let mut prev_cr = false;
     for ch in text.chars() {
+        // RT-20: cap the paste so a multi-hundred-MB clipboard can't spike RSS or
+        // stall the UI thread during the copy + single `write_all`. A genuine
+        // paste is far smaller; an oversize one is almost always accidental.
+        if cleaned.len() >= MAX_PASTE_BYTES {
+            break;
+        }
         match ch {
             '\r' => {
                 cleaned.push('\r');
@@ -340,6 +352,19 @@ pub fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_paste_caps_oversize_input() {
+        // RT-20: a giant clipboard is truncated rather than copied wholesale.
+        let big = "a".repeat(MAX_PASTE_BYTES + 1024);
+        let out = wrap_paste(&big, false);
+        assert!(
+            out.len() <= MAX_PASTE_BYTES,
+            "paste not capped: {}",
+            out.len()
+        );
+        assert!(!out.is_empty());
+    }
 
     #[test]
     fn wrap_paste_plain_normalizes_newlines() {

@@ -42,20 +42,7 @@ impl FontAtlas {
                     .expect("embedded fallback font must be valid")
             });
 
-        let lm = font
-            .horizontal_line_metrics(px)
-            .unwrap_or_else(|| fontdue::LineMetrics {
-                ascent: px * 0.8,
-                descent: -(px * 0.2),
-                line_gap: 0.0,
-                new_line_size: px,
-            });
-        let ascent = lm.ascent;
-        let cell_h = (lm.ascent - lm.descent + lm.line_gap).ceil().max(1.0) as usize;
-
-        // Monospace advance width from a representative glyph.
-        let (m, _) = font.rasterize('M', px);
-        let cell_w = m.advance_width.ceil().max(1.0) as usize;
+        let (cell_w, cell_h, ascent) = metrics_for(&font, px);
 
         Self {
             font,
@@ -67,6 +54,24 @@ impl FontAtlas {
         }
     }
 
+    /// CA-103: re-derive size-dependent metrics for a new pixel size, reusing the
+    /// already-parsed font face. Clears the glyph cache (rasterization is
+    /// px-specific) but does NOT re-read or re-parse the font file from disk — so
+    /// repeated font-zoom keystrokes no longer hammer disk I/O + fontdue parsing.
+    pub fn set_px(&mut self, px: f32) {
+        // Exact bit compare avoids a needless cache clear and the float-equality
+        // lint; zoom uses discrete px steps so this is a true no-op guard.
+        if px.to_bits() == self.px.to_bits() {
+            return;
+        }
+        let (cell_w, cell_h, ascent) = metrics_for(&self.font, px);
+        self.px = px;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.ascent = ascent;
+        self.cache.clear();
+    }
+
     /// Rasterized coverage bitmap for `ch`, cached.
     ///
     /// For glyphs absent from the loaded font fontdue returns a zero-size
@@ -75,13 +80,18 @@ impl FontAtlas {
     /// blit, advance by `cell_w`).  The method never panics.
     pub fn glyph(&mut self, ch: char) -> &(Metrics, Vec<u8>) {
         // Bound the cache so hostile/long output emitting many distinct
-        // codepoints can't grow it without limit (RT-12). ASCII fits easily;
-        // when the dynamic tail overflows, drop it wholesale (cheap, rare).
+        // codepoints can't grow it without limit (RT-12). The hot ASCII working
+        // set is kept permanently; only the dynamic (non-ASCII) tail is evicted
+        // when the cap is hit (CA-122).
         if self.cache.contains_key(&ch) {
             return &self.cache[&ch];
         }
         if self.cache.len() >= GLYPH_CACHE_CAP {
-            self.cache.clear();
+            // CA-122: don't `clear()` the whole cache — that drops the ASCII
+            // working set too, forcing a re-rasterize of every visible ASCII
+            // glyph on the next frame (clear→refill→clear thrash under a Unicode
+            // flood). Retain ASCII; evict only the dynamic tail.
+            self.cache.retain(|k, _| k.is_ascii());
         }
         let g = self.font.rasterize(ch, self.px);
         self.cache.insert(ch, g);
@@ -93,6 +103,26 @@ impl FontAtlas {
 /// Max distinct glyphs kept rasterized. ~4k covers ASCII + a working set of
 /// CJK/symbols; beyond it we reset rather than grow toward all of Unicode.
 const GLYPH_CACHE_CAP: usize = 4096;
+
+/// Size-dependent monospace cell metrics — advance width, line height, and
+/// ascent — for `font` at `px`. Shared by `FontAtlas::new` and `set_px`
+/// (CA-103) so the two paths can never derive metrics differently.
+fn metrics_for(font: &Font, px: f32) -> (usize, usize, f32) {
+    let lm = font
+        .horizontal_line_metrics(px)
+        .unwrap_or_else(|| fontdue::LineMetrics {
+            ascent: px * 0.8,
+            descent: -(px * 0.2),
+            line_gap: 0.0,
+            new_line_size: px,
+        });
+    let ascent = lm.ascent;
+    let cell_h = (lm.ascent - lm.descent + lm.line_gap).ceil().max(1.0) as usize;
+    // Monospace advance width from a representative glyph.
+    let (m, _) = font.rasterize('M', px);
+    let cell_w = m.advance_width.ceil().max(1.0) as usize;
+    (cell_w, cell_h, ascent)
+}
 
 /// Returns font bytes, preferring system fonts for quality; embedded VT323
 /// as the guaranteed last resort (CA-2: no panic on missing system font).
@@ -131,6 +161,27 @@ mod tests {
             "cache {} exceeded cap {}",
             atlas.cache.len(),
             GLYPH_CACHE_CAP
+        );
+    }
+
+    /// CA-122: overflowing the cache with non-ASCII glyphs must NOT evict the
+    /// hot ASCII working set — otherwise every overflow re-rasterizes visible
+    /// ASCII (clear→refill thrash). An ASCII glyph cached before a Unicode flood
+    /// must still be present afterward, and the cache must stay bounded.
+    #[test]
+    fn ascii_glyph_survives_cache_overflow() {
+        let mut atlas = FontAtlas::new(18.0);
+        let _ = atlas.glyph('A');
+        assert!(atlas.cache.contains_key(&'A'), "prime failed");
+        for cp in 0x4E00u32..0x4E00 + (GLYPH_CACHE_CAP as u32 + 2000) {
+            if let Some(c) = char::from_u32(cp) {
+                let _ = atlas.glyph(c);
+            }
+        }
+        assert!(atlas.cache.len() <= GLYPH_CACHE_CAP, "must stay bounded");
+        assert!(
+            atlas.cache.contains_key(&'A'),
+            "ASCII 'A' must survive a non-ASCII cache overflow"
         );
     }
 
@@ -178,5 +229,38 @@ mod tests {
             let (metrics, _) = atlas.glyph(c);
             assert!(metrics.advance_width >= 0.0);
         }
+    }
+
+    /// CA-103: `set_px` must re-derive metrics for a new size and clear the
+    /// px-specific glyph cache, reusing the already-parsed face (no disk
+    /// reload). A repeat to the same size is a no-op that keeps the cache.
+    #[test]
+    fn set_px_rescales_metrics_and_clears_cache() {
+        let mut atlas = FontAtlas::new(16.0);
+        let (w0, h0) = (atlas.cell_w, atlas.cell_h);
+        let _ = atlas.glyph('A');
+        assert!(atlas.cache.contains_key(&'A'), "prime failed");
+
+        atlas.set_px(32.0);
+        assert!(
+            atlas.cell_w > w0 && atlas.cell_h > h0,
+            "metrics must scale up with px ({}x{} !> {}x{})",
+            atlas.cell_w,
+            atlas.cell_h,
+            w0,
+            h0
+        );
+        assert!(
+            atlas.cache.is_empty(),
+            "glyph cache must clear on a size change"
+        );
+
+        // Re-priming then setting the SAME size must not clear the cache.
+        let _ = atlas.glyph('A');
+        atlas.set_px(32.0);
+        assert!(
+            atlas.cache.contains_key(&'A'),
+            "set_px to the same size must be a no-op (cache retained)"
+        );
     }
 }

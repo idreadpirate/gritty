@@ -15,12 +15,85 @@ const QUEUE_DEPTH: usize = 256;
 use anyhow::Result;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
-/// Returns true when `data` contains an ANSI DSR cursor-position query (ESC [ 6 n).
-/// portable-pty ≥ 0.9 enables PSUEDOCONSOLE_INHERIT_CURSOR, which causes the
-/// ConPTY layer to emit this sequence at startup; the child process blocks until
-/// it receives a CPR reply (ESC [ row ; col R).
-fn contains_dsr(data: &[u8]) -> bool {
-    data.windows(4).any(|w| w == b"\x1b[6n")
+/// The ANSI DSR cursor-position query (ESC [ 6 n). portable-pty ≥ 0.9 enables
+/// PSUEDOCONSOLE_INHERIT_CURSOR, which causes the ConPTY layer to emit this
+/// sequence at startup; the child process blocks until it receives a CPR reply
+/// (ESC [ row ; col R).
+const DSR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Scans the PTY output stream for the startup DSR cursor-position query,
+/// carrying a small tail across read-chunk boundaries so a query split across
+/// two `read` calls is still detected (RT-24). The query is only 4 bytes, so a
+/// carry of at most `DSR_QUERY.len() - 1` bytes is enough: any real match either
+/// lies wholly inside one chunk or straddles the join, and the join window is
+/// fully covered by `carry || chunk`.
+///
+/// CA-44: the scanner also owns the one-shot reply decision. Only the *first*
+/// probe — the ConPTY `PSEUDOCONSOLE_INHERIT_CURSOR` startup query that the child
+/// blocks on — should be auto-answered with a synthetic `ESC[1;1R`. Any later CPR
+/// query (readline/zsh/pwsh prompt reflow, progress UIs, TUIs) must NOT get a
+/// hardcoded `1;1`, which would corrupt the program's wrap/redraw math. Folding
+/// both behaviours into one type keeps the carry and the one-shot flag in lockstep
+/// and makes the whole decision unit-testable.
+#[derive(Default)]
+struct DsrScanner {
+    /// Trailing bytes of the previous chunk that could be the prefix of a
+    /// boundary-straddling query. Never longer than `DSR_QUERY.len() - 1`.
+    carry: Vec<u8>,
+    /// Set once the startup probe has been answered; no further probe is replied
+    /// to (CA-44). Scanning also stops once this is true.
+    answered: bool,
+}
+
+impl DsrScanner {
+    /// Feed the next read chunk and decide whether to send the one-shot startup
+    /// CPR reply. Returns `true` exactly once — for the first chunk in which a
+    /// complete `ESC [ 6 n` (possibly straddling a read boundary, RT-24) is
+    /// detected — and `false` for every chunk thereafter (CA-44), even if it
+    /// contains another probe. Once answered, the carry is dropped and no further
+    /// scanning is performed.
+    fn should_reply(&mut self, chunk: &[u8]) -> bool {
+        if self.answered {
+            return false;
+        }
+        if self.scan(chunk) {
+            self.answered = true;
+            self.carry.clear(); // no longer scanning; release the tail
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Feed the next read chunk; returns true if a complete `ESC [ 6 n` is
+    /// present in `carry ++ chunk`. Updates the carry for the next call.
+    fn scan(&mut self, chunk: &[u8]) -> bool {
+        let tail = DSR_QUERY.len() - 1;
+        // Join only the carry with the chunk's leading bytes to test the seam;
+        // the chunk's interior is tested directly to avoid a full copy per read.
+        let found = if self.carry.is_empty() {
+            chunk.windows(DSR_QUERY.len()).any(|w| w == DSR_QUERY)
+        } else {
+            let mut joined = Vec::with_capacity(self.carry.len() + chunk.len().min(tail));
+            joined.extend_from_slice(&self.carry);
+            joined.extend_from_slice(&chunk[..chunk.len().min(tail)]);
+            let in_seam = joined.windows(DSR_QUERY.len()).any(|w| w == DSR_QUERY);
+            in_seam || chunk.windows(DSR_QUERY.len()).any(|w| w == DSR_QUERY)
+        };
+        // Remember the last `tail` bytes (across the carry+chunk concatenation,
+        // so a query that spans three+ reads of 1 byte each is still caught).
+        if chunk.len() >= tail {
+            self.carry.clear();
+            self.carry.extend_from_slice(&chunk[chunk.len() - tail..]);
+        } else {
+            self.carry.extend_from_slice(chunk);
+            let overflow = self.carry.len().saturating_sub(tail);
+            if overflow > 0 {
+                self.carry.drain(..overflow);
+            }
+        }
+        found
+    }
 }
 
 pub struct Pty {
@@ -91,15 +164,22 @@ impl Pty {
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            // Owns both the RT-24 boundary-straddle carry and the CA-44 one-shot
+            // reply flag: it answers only the first startup probe, then stops.
+            let mut dsr = DsrScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
-                        // Auto-reply to cursor-position DSR (ESC [ 6 n) so that
-                        // the child shell does not block waiting for a position
-                        // report from the terminal emulator.
-                        if contains_dsr(chunk) {
+                        // Auto-reply ONCE to the startup cursor-position DSR
+                        // (ESC [ 6 n) so the child shell does not block waiting
+                        // for a position report before the UI is live. RT-24: the
+                        // scanner carries a tail across reads so a query split
+                        // across two chunks is still detected. CA-44: only the
+                        // first probe is answered; later CPR queries flow through
+                        // to the term engine untouched.
+                        if dsr.should_reply(chunk) {
                             if let Ok(mut w) = writer_for_dsr.lock() {
                                 let _ = w.write_all(b"\x1b[1;1R");
                                 let _ = w.flush();
@@ -174,6 +254,114 @@ impl Drop for Pty {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dsr_detected_within_a_single_chunk() {
+        let mut s = DsrScanner::default();
+        assert!(s.scan(b"hello\x1b[6nworld"));
+    }
+
+    #[test]
+    fn no_dsr_in_plain_data() {
+        let mut s = DsrScanner::default();
+        assert!(!s.scan(b"just some output\r\n"));
+        assert!(!s.scan(b"more output without a query"));
+    }
+
+    #[test]
+    fn dsr_split_across_a_read_boundary_is_detected() {
+        // RT-24: ESC[6 ends one read, n begins the next. A per-chunk scan would
+        // miss this; the carry must bridge the seam.
+        let mut s = DsrScanner::default();
+        assert!(!s.scan(b"prompt\x1b[6"));
+        assert!(s.scan(b"npwd"));
+    }
+
+    #[test]
+    fn dsr_split_with_esc_alone_at_boundary() {
+        // The seam can fall anywhere inside the 4-byte query.
+        let mut s = DsrScanner::default();
+        assert!(!s.scan(b"abc\x1b"));
+        assert!(s.scan(b"[6ndef"));
+    }
+
+    #[test]
+    fn dsr_split_one_byte_per_read() {
+        // RT-24 worst case: the query dribbles in one byte at a time across
+        // four separate reads. The carry must accumulate the prefix.
+        let mut s = DsrScanner::default();
+        assert!(!s.scan(b"\x1b"));
+        assert!(!s.scan(b"["));
+        assert!(!s.scan(b"6"));
+        assert!(s.scan(b"n"));
+    }
+
+    #[test]
+    fn partial_prefix_then_unrelated_data_does_not_false_match() {
+        // A near-miss prefix that is never completed must not trigger a reply.
+        let mut s = DsrScanner::default();
+        assert!(!s.scan(b"\x1b[6"));
+        assert!(!s.scan(b"X")); // not 'n' — no query
+        assert!(!s.scan(b"more"));
+    }
+
+    #[test]
+    fn only_the_first_probe_is_answered() {
+        // CA-44: the synthetic ESC[1;1R reply is for the ConPTY startup probe
+        // only. A second/third CPR query (a prompt or TUI re-querying the cursor
+        // mid-session) must NOT be answered with a bogus 1;1 — it has to reach the
+        // term engine so the real cursor is reported.
+        let mut s = DsrScanner::default();
+        assert!(s.should_reply(b"boot\x1b[6n"), "first probe is answered");
+        assert!(
+            !s.should_reply(b"\x1b[6n"),
+            "a later mid-session CPR must NOT be answered"
+        );
+        assert!(
+            !s.should_reply(b"more\x1b[6noutput"),
+            "still not answered after the first"
+        );
+    }
+
+    #[test]
+    fn first_probe_answered_even_when_split_across_reads() {
+        // CA-44 + RT-24 together: the one-shot reply still fires when the first
+        // probe straddles a read boundary, and stays off afterwards.
+        let mut s = DsrScanner::default();
+        assert!(!s.should_reply(b"hello\x1b[6"), "incomplete: no reply yet");
+        assert!(s.should_reply(b"n"), "completed at the seam: answered once");
+        assert!(
+            !s.should_reply(b"\x1b[6n"),
+            "subsequent probe is not answered"
+        );
+    }
+
+    #[test]
+    fn no_reply_until_a_complete_probe_arrives() {
+        // Plain output must never trigger the one-shot reply.
+        let mut s = DsrScanner::default();
+        assert!(!s.should_reply(b"just output\r\n"));
+        assert!(!s.should_reply(b"still nothing useful"));
+        // The reply is still available for a genuine probe later.
+        assert!(s.should_reply(b"\x1b[6n"));
+    }
+
+    #[test]
+    fn carry_never_exceeds_query_len_minus_one() {
+        // Invariant guarding RT-24's bounded memory: the carry holds at most
+        // DSR_QUERY.len()-1 bytes regardless of chunk size.
+        let mut s = DsrScanner::default();
+        for _ in 0..50 {
+            let _ = s.scan(b"a very long chunk of plain terminal output bytes");
+            assert!(s.carry.len() < DSR_QUERY.len());
+        }
+        // Also after tiny sub-tail chunks.
+        let mut s2 = DsrScanner::default();
+        for _ in 0..50 {
+            let _ = s2.scan(b"x");
+            assert!(s2.carry.len() < DSR_QUERY.len());
+        }
+    }
 
     #[test]
     #[ignore = "diagnostic: measures a real shell's idle output rate (DSR storm hunt)"]

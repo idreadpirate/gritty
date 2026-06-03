@@ -40,6 +40,11 @@ pub struct SavedWindow {
     pub win_x: Option<i32>,
     #[serde(default)]
     pub win_y: Option<i32>,
+    /// Seamless mode (no per-pane title bars). CA-57: previously not persisted, so
+    /// a window saved in seamless mode came back with title bars on the next launch.
+    /// `#[serde(default)]` keeps pre-CA-57 session files loading (as `false`).
+    #[serde(default)]
+    pub seamless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +100,7 @@ impl SavedSession {
                 win_h: self.win_h,
                 win_x: None,
                 win_y: None,
+                seamless: false,
             }]
         } else {
             Vec::new()
@@ -296,6 +302,7 @@ mod tests {
             win_h: Some(600),
             win_x: Some(x),
             win_y: Some(y),
+            seamless: false,
         }
     }
 
@@ -345,5 +352,22 @@ mod tests {
         let ws = s.windows();
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].tabs[0].name, "t");
+    }
+
+    #[test]
+    fn seamless_persists_and_defaults_false() {
+        // CA-57: seamless is per-window state; it must survive a save/restore.
+        let mut w = win_sample("seamless", 0, 0);
+        w.seamless = true;
+        let s = SavedSession::from_windows(vec![w]);
+        let back = SavedSession::from_json(&s.to_json()).expect("parse");
+        assert!(back.windows[0].seamless, "seamless flag must round-trip");
+        // A pre-CA-57 session.json has no `seamless` key → must default to false.
+        let old = r#"{"windows":[{"active":0,"tabs":[]}]}"#;
+        let s2 = SavedSession::from_json(old).expect("parse old");
+        assert!(
+            !s2.windows[0].seamless,
+            "missing seamless must default to false"
+        );
     }
 }

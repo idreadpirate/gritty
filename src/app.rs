@@ -73,6 +73,9 @@ pub(crate) struct Win {
     pub(crate) last_click: Option<Instant>,
     /// Consecutive click count at the same location (CA-18).
     pub(crate) click_count: u32,
+    /// CA-62/CA-82: pixel position of the last left press, so a multi-click is
+    /// only counted when the pointer stayed at (about) the same cell.
+    pub(crate) last_click_pos: Option<(f64, f64)>,
 }
 
 pub(crate) struct Gritty {
@@ -153,6 +156,7 @@ impl Gritty {
             redraw_pending: false,
             last_click: None,
             click_count: 0,
+            last_click_pos: None,
         })
     }
 
@@ -510,7 +514,9 @@ impl Gritty {
             .and_then(|t| t.panes.get(&t.focus))
             .and_then(|p| p.term.term.selection_to_string());
         if let Some(text) = text {
-            if !text.is_empty() {
+            // CA-42: a whitespace-only (or empty) drag must not clobber the
+            // clipboard the user may have copied from elsewhere.
+            if selection_is_copyable(&text) {
                 self.clip.copy(&text);
             }
         }
@@ -604,6 +610,7 @@ impl Gritty {
                     win_h: Some(inner.height),
                     win_x: pos.map(|p| p.x),
                     win_y: pos.map(|p| p.y),
+                    seamless: win.seamless,
                 }
             })
             .collect();
@@ -649,7 +656,7 @@ impl Gritty {
                 (Some(x), Some(y)) => Some((x, y)),
                 _ => None,
             };
-            let Some(mut win) = self.spawn_window(event_loop, size, pos, false) else {
+            let Some(mut win) = self.spawn_window(event_loop, size, pos, sw.seamless) else {
                 continue;
             };
             let inner = win.window.inner_size();
@@ -659,9 +666,11 @@ impl Gritty {
                 inner.height.max(1) as usize,
                 self.bar_h(),
             );
-            // Title bar present (seamless off) → subtract one cell row.
+            // A pane title bar (one cell row) is reserved only when NOT seamless
+            // (CA-57: a restored seamless window has no per-pane title bars).
             let cols = (area.w / cw).max(1);
-            let rows = (area.h.saturating_sub(self.font.cell_h) / ch).max(1);
+            let title_px = if sw.seamless { 0 } else { self.font.cell_h };
+            let rows = (area.h.saturating_sub(title_px) / ch).max(1);
             let tabs: Vec<Tab> = sw
                 .tabs
                 .iter()
@@ -816,7 +825,9 @@ impl Gritty {
             return;
         }
         self.font_px = px;
-        self.font = FontAtlas::new(px);
+        // CA-103: re-derive metrics at the new size in place — keep the parsed
+        // font face, don't re-read + re-parse the TTF from disk on every zoom key.
+        self.font.set_px(px);
         for wi in 0..self.windows.len() {
             self.relayout(wi);
             self.request_redraw(wi);
@@ -869,8 +880,7 @@ impl Gritty {
         // far into scrollback would otherwise index out of range and panic, which
         // under `panic = "abort"` is a silent crash.
         let vt = pane.term.term.grid();
-        let (cols, screen_lines, total_lines) =
-            (vt.columns(), vt.screen_lines(), vt.total_lines());
+        let (cols, screen_lines, total_lines) = (vt.columns(), vt.screen_lines(), vt.total_lines());
         let history = total_lines.saturating_sub(screen_lines);
         let display_offset = pane.term.display_offset();
         let (line, col) =
@@ -884,6 +894,10 @@ impl Gritty {
     /// CA-18: classify click count for window `wi` based on timing.
     pub(crate) fn classify_click(&mut self, wi: usize) -> u32 {
         let now = Instant::now();
+        let (cw, ch) = (
+            self.font.cell_w.max(1) as f64,
+            self.font.cell_h.max(1) as f64,
+        );
         let Some(win) = self.windows.get_mut(wi) else {
             return 1;
         };
@@ -891,8 +905,18 @@ impl Gritty {
             Some(prev) => now.duration_since(prev).as_millis() as u64,
             None => u64::MAX,
         };
-        let count = next_click_count(elapsed_ms, win.click_count);
+        // CA-62/CA-82: a double/triple click must be at (about) the same cell, not
+        // merely within the time window — otherwise two quick clicks in different
+        // cells/panes mis-fire a word/line selection. Reset when the pointer moved
+        // more than ~1 cell from the previous press.
+        let (mx, my) = win.mouse_pos;
+        let moved_far = match win.last_click_pos {
+            Some((px, py)) => (mx - px).abs() > cw || (my - py).abs() > ch,
+            None => true,
+        };
+        let count = next_click_count(elapsed_ms, moved_far, win.click_count);
         win.last_click = Some(now);
+        win.last_click_pos = Some((mx, my));
         win.click_count = count;
         count
     }
@@ -1516,9 +1540,18 @@ pub(crate) fn is_broadcast_signal_byte(b: u8) -> bool {
 }
 
 /// CA-33: Return `true` iff `uri` has a scheme safe to hand to the OS opener.
+///
+/// RT-25/RT-40: `http`/`https` only — `file://` is deliberately rejected.
+/// `open_hyperlink` passes the URI to `ShellExecuteW`'s `open` verb, which
+/// *executes* a `file://` target (a local or UNC `.exe`/`.bat`/`.ps1`/`.lnk`/…).
+/// OSC-8 lets the visible link text differ from the target, so a hostile byte
+/// stream (a `cat`'d file, an SSH session, a build log) could render benign text
+/// over a `file://` path and a single Ctrl+click would launch attacker-chosen
+/// code. Browser schemes route through the default browser and are safe; the
+/// local-file program launcher is not.
 pub(crate) fn is_safe_hyperlink_scheme(uri: &str) -> bool {
     let lower = uri.to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file://")
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// CA-33: Open `uri` with the OS default handler via `ShellExecuteW`, detached.
@@ -1561,15 +1594,62 @@ fn open_hyperlink(uri: &str) {
     }
 }
 
+/// RT-16: Map a pane-local pixel `(gx, gy)` to an in-bounds VT grid
+/// `(line, column)`, or `None` if it falls outside the grid. The column is
+/// clamped to the last cell (a trailing partial column of a non-cell-multiple
+/// pane width must never index `cols`), and the line is rejected when it falls
+/// outside the scrollback (`-history`) / screen (`screen_lines - 1`) range, so
+/// indexing `grid()[point]` can never panic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hyperlink_cell(
+    gx: usize,
+    gy: usize,
+    cw: usize,
+    ch: usize,
+    cols: usize,
+    screen_lines: usize,
+    history: usize,
+    display_offset: usize,
+) -> Option<(i32, usize)> {
+    if cols == 0 || screen_lines == 0 {
+        return None;
+    }
+    let col = (gx / cw.max(1)).min(cols - 1);
+    let row = (gy / ch.max(1)) as i32;
+    let line = row - display_offset as i32;
+    let min_line = -(history as i32);
+    let max_line = screen_lines as i32 - 1;
+    if line < min_line || line > max_line {
+        return None;
+    }
+    Some((line, col))
+}
+
+/// RT-110: A failed `new_tab` shell spawn is fatal only when no tab is alive
+/// anywhere (the genuine cold-start case). With other tabs running, the failure
+/// is transient and must not exit the process.
+pub(crate) fn new_tab_failure_is_fatal(any_tabs_alive: bool) -> bool {
+    !any_tabs_alive
+}
+
 /// CA-7: Encode an SGR mouse sequence.
 pub(crate) fn encode_sgr_mouse(btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
     let suffix = if press { 'M' } else { 'm' };
     format!("\x1b[<{};{};{}{}", btn, col, row, suffix).into_bytes()
 }
 
-/// CA-18: Classify a click into single/double/triple based on elapsed time.
-pub(crate) fn next_click_count(elapsed_ms: u64, prev_count: u32) -> u32 {
-    if elapsed_ms <= MULTI_CLICK_MS {
+/// CA-42: a selection is worth copying only when it has a non-whitespace
+/// character; a whitespace-only drag must not clobber the clipboard.
+pub(crate) fn selection_is_copyable(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+/// CA-18 / CA-62 / CA-82: classify a click into single/double/triple. A multi-
+/// click requires both a short interval (`elapsed_ms <= MULTI_CLICK_MS`) AND that
+/// the pointer did not move far from the previous press (`!moved_far`); otherwise
+/// the run resets to a fresh single click.
+pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32) -> u32 {
+    if elapsed_ms <= MULTI_CLICK_MS && !moved_far {
         (prev_count + 1).min(3)
     } else {
         1
@@ -1616,37 +1696,60 @@ mod tests {
 
     #[test]
     fn first_click_is_always_single() {
-        assert_eq!(next_click_count(u64::MAX, 0), 1);
+        assert_eq!(next_click_count(u64::MAX, false, 0), 1);
     }
 
     #[test]
     fn rapid_second_click_is_double() {
-        assert_eq!(next_click_count(100, 1), 2);
+        assert_eq!(next_click_count(100, false, 1), 2);
     }
 
     #[test]
     fn rapid_third_click_is_triple() {
-        assert_eq!(next_click_count(200, 2), 3);
+        assert_eq!(next_click_count(200, false, 2), 3);
     }
 
     #[test]
     fn fourth_rapid_click_stays_at_three() {
-        assert_eq!(next_click_count(50, 3), 3);
+        assert_eq!(next_click_count(50, false, 3), 3);
     }
 
     #[test]
     fn slow_click_resets_to_single() {
-        assert_eq!(next_click_count(600, 2), 1);
+        assert_eq!(next_click_count(600, false, 2), 1);
     }
 
     #[test]
     fn click_at_exactly_threshold_counts() {
-        assert_eq!(next_click_count(MULTI_CLICK_MS, 1), 2);
+        assert_eq!(next_click_count(MULTI_CLICK_MS, false, 1), 2);
     }
 
     #[test]
     fn click_just_over_threshold_resets() {
-        assert_eq!(next_click_count(MULTI_CLICK_MS + 1, 1), 1);
+        assert_eq!(next_click_count(MULTI_CLICK_MS + 1, false, 1), 1);
+    }
+
+    #[test]
+    fn click_far_from_previous_resets_even_when_fast() {
+        // CA-62/CA-82: a fast second click in a different cell is a fresh single
+        // click, not a double/triple.
+        assert_eq!(next_click_count(50, true, 1), 1);
+        assert_eq!(next_click_count(50, true, 2), 1);
+    }
+
+    #[test]
+    fn click_same_spot_and_fast_advances() {
+        assert_eq!(next_click_count(50, false, 1), 2);
+    }
+
+    #[test]
+    fn selection_copyable_ignores_whitespace_only() {
+        // CA-42: only a selection with a non-whitespace char may hit the clipboard.
+        assert!(selection_is_copyable("x"));
+        assert!(selection_is_copyable("  a  "));
+        assert!(!selection_is_copyable(""));
+        assert!(!selection_is_copyable("   "));
+        assert!(!selection_is_copyable("\t\r\n  "));
     }
 
     // --- CA-28 tab button hit-test -------------------------------------------
@@ -1714,11 +1817,9 @@ mod tests {
     // --- CA-33 hyperlink scheme sanitizer ------------------------------------
 
     #[test]
-    fn hyperlink_scheme_allows_http_https_file() {
+    fn hyperlink_scheme_allows_only_http_https() {
         assert!(is_safe_hyperlink_scheme("http://example.com"));
         assert!(is_safe_hyperlink_scheme("https://example.com/path?q=1"));
-        assert!(is_safe_hyperlink_scheme("file:///C:/Users/foo/bar.txt"));
-        assert!(is_safe_hyperlink_scheme("file:///tmp/report.html"));
     }
 
     #[test]
@@ -1733,11 +1834,66 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_scheme_rejects_file_urls() {
+        // RT-25/RT-40: `file://` reaches ShellExecuteW's `open` verb, which
+        // *executes* the target. A local exe/script or a UNC share (no
+        // pre-existing local file needed) must never be Ctrl-click launchable.
+        assert!(!is_safe_hyperlink_scheme("file:///C:/Users/foo/bar.txt"));
+        assert!(!is_safe_hyperlink_scheme(
+            "file:///C:/Windows/System32/calc.exe"
+        ));
+        assert!(!is_safe_hyperlink_scheme(
+            "file://attacker-host/share/payload.exe"
+        ));
+        assert!(!is_safe_hyperlink_scheme("file:///tmp/report.html"));
+    }
+
+    #[test]
     fn hyperlink_scheme_case_insensitive() {
         assert!(is_safe_hyperlink_scheme("HTTP://example.com"));
         assert!(is_safe_hyperlink_scheme("HTTPS://example.com"));
-        assert!(is_safe_hyperlink_scheme("FILE:///tmp/foo"));
+        assert!(!is_safe_hyperlink_scheme("FILE:///tmp/foo"));
         assert!(!is_safe_hyperlink_scheme("FTP://example.com"));
+    }
+
+    // --- RT-16 hyperlink cell clamp/bounds -----------------------------------
+
+    #[test]
+    fn hyperlink_cell_clamps_trailing_partial_column() {
+        // 83px wide pane, 10px cells, 8 cols (80px) → the trailing 3px partial
+        // column would compute col 8 (== cols), which must clamp to 7, not panic.
+        let (line, col) = hyperlink_cell(82, 0, 10, 20, 8, 24, 0, 0).expect("in bounds");
+        assert_eq!(col, 7);
+        assert_eq!(line, 0);
+    }
+
+    #[test]
+    fn hyperlink_cell_maps_interior_pixel() {
+        let (line, col) = hyperlink_cell(25, 40, 10, 20, 80, 24, 0, 0).expect("in bounds");
+        assert_eq!((line, col), (2, 2));
+    }
+
+    #[test]
+    fn hyperlink_cell_rejects_line_past_history() {
+        // Scrolled up by 10 with only 3 lines of history: row 0 → line -10, which
+        // is past the -3 history bound, so the cell must be rejected (no panic).
+        assert!(hyperlink_cell(0, 0, 10, 20, 80, 24, 3, 10).is_none());
+        // Within history (offset 3 ≤ history 3) it maps fine.
+        assert_eq!(hyperlink_cell(0, 0, 10, 20, 80, 24, 3, 3), Some((-3, 0)));
+    }
+
+    #[test]
+    fn hyperlink_cell_empty_grid_is_none() {
+        assert!(hyperlink_cell(0, 0, 10, 20, 0, 24, 0, 0).is_none());
+        assert!(hyperlink_cell(0, 0, 10, 20, 80, 0, 0, 0).is_none());
+    }
+
+    // --- RT-110 new-tab failure fatality -------------------------------------
+
+    #[test]
+    fn new_tab_failure_fatal_only_at_cold_start() {
+        assert!(new_tab_failure_is_fatal(false)); // no tab alive → cold start → exit
+        assert!(!new_tab_failure_is_fatal(true)); // tabs alive → keep them, non-fatal
     }
 
     // --- RT-8 control-byte predicate -----------------------------------------

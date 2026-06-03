@@ -196,6 +196,17 @@ pub fn draw_text(
 /// blend in linear light, then re-encode.  No new dependencies, table is
 /// computed once at first call via a `static`.
 fn blend(fg: u32, bg: u32, cov: u8) -> u32 {
+    // CA-106/CA-120: fully-opaque and fully-transparent coverage are the common
+    // case in dense text; return the endpoint colour directly and skip all table
+    // work. At full coverage the result is exactly `fg` (no gamma round-trip
+    // error); at zero coverage it is exactly `bg`.
+    if cov == 255 {
+        return fg & 0x00ff_ffff;
+    }
+    if cov == 0 {
+        return bg & 0x00ff_ffff;
+    }
+
     // Linear table: TO_LINEAR[v] = (v/255)^2.2 * 1023, stored as u16.
     // Using *1023 (10-bit) keeps integer arithmetic precise enough.
     static TO_LINEAR: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
@@ -217,20 +228,28 @@ fn blend(fg: u32, bg: u32, cov: u8) -> u32 {
     // Gamma-expand one channel.
     let expand = |c: u32, sh: u32| lin[((c >> sh) & 0xff) as usize] as u32;
 
-    // Re-encode: linear (0..=1023) → sRGB (0..=255).
-    // Approximation: v^(1/2.2) via integer sqrt of a scaled value is one option;
-    // a small inverse-table is another.  We use a compact formula:
-    //   out = round(((v/1023)^(1/2.4) * 1.055 - 0.055) * 255)
-    // implemented entirely in f32 to stay allocation-free.
-    let compress = |lin_val: u32| -> u32 {
-        let f = lin_val as f32 / 1023.0;
-        let s = if f <= 0.0031308 {
-            f * 12.92
-        } else {
-            1.055 * f.powf(1.0 / 2.4) - 0.055
-        };
-        (s * 255.0 + 0.5) as u32
-    };
+    // Re-encode: linear (0..=1023) → sRGB (0..=255) via a precomputed inverse
+    // table. CA-106/CA-120: the forward direction was already a LUT, but the
+    // reverse ran `1.055 * f.powf(1.0/2.4) - 0.055` once per channel per covered
+    // pixel — 3 `powf` per blended pixel, every frame, the dominant per-pixel cost
+    // in the software-raster hot path. FROM_LINEAR is built once and indexed by
+    // the 10-bit linear value; its entries are that same f32 formula, memoized,
+    // so the output is bit-identical to the old per-pixel computation.
+    static FROM_LINEAR: std::sync::OnceLock<[u8; 1024]> = std::sync::OnceLock::new();
+    let from_lin = FROM_LINEAR.get_or_init(|| {
+        let mut t = [0u8; 1024];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let f = i as f32 / 1023.0;
+            let s = if f <= 0.0031308 {
+                f * 12.92
+            } else {
+                1.055 * f.powf(1.0 / 2.4) - 0.055
+            };
+            *slot = (s * 255.0 + 0.5) as u8;
+        }
+        t
+    });
+    let compress = |lin_val: u32| -> u32 { from_lin[lin_val as usize] as u32 };
 
     let a = cov as u32;
     let inv = 255 - a;
@@ -281,6 +300,57 @@ mod tests {
             r > 127,
             "gamma blend at 50% coverage should be > 127 (sRGB), got {r}"
         );
+    }
+
+    #[test]
+    fn blend_inverse_lut_matches_reference() {
+        // CA-106/CA-120: the inverse-sRGB step is now a 1024-entry table instead
+        // of a per-pixel `powf`. Opaque coverage must return exactly `fg` (no
+        // gamma round-trip), zero coverage exactly `bg`, and partial coverage must
+        // match the reference encode of the linear-light blend within ±1.
+        let encode = |lin_val: u32| -> u32 {
+            let f = lin_val as f32 / 1023.0;
+            let s = if f <= 0.0031308 {
+                f * 12.92
+            } else {
+                1.055 * f.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0 + 0.5) as u32
+        };
+        let to_lin = |c: u32, sh: u32| -> u32 {
+            let s = ((c >> sh) & 0xff) as f32 / 255.0;
+            let l = if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            (l * 1023.0 + 0.5) as u32
+        };
+
+        for fg in [0x0000_0000u32, 0x0080_8080, 0x0012_3456, 0x00ff_ffff] {
+            assert_eq!(blend(fg, 0x0033_4455, 255), fg, "opaque must be fg exactly");
+        }
+        assert_eq!(
+            blend(0x00ff_ffff, 0x0033_4455, 0),
+            0x0033_4455,
+            "zero cov = bg"
+        );
+
+        for &(fg, bg, cov) in &[
+            (0x00ff_ff00u32, 0x0000_00ffu32, 64u8),
+            (0x0080_4020, 0x0010_2030, 200),
+        ] {
+            let (a, inv) = (cov as u32, 255 - cov as u32);
+            let got = blend(fg, bg, cov);
+            for sh in [16u32, 8, 0] {
+                let blended = (to_lin(fg, sh) * a + to_lin(bg, sh) * inv) / 255;
+                let (g, e) = ((got >> sh) & 0xff, encode(blended));
+                assert!(
+                    (g as i32 - e as i32).abs() <= 1,
+                    "channel {sh}: lut {g} vs ref {e}"
+                );
+            }
+        }
     }
 
     #[test]

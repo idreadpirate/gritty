@@ -97,18 +97,23 @@ pub fn grid_rect(rect: Rect, title: usize) -> Rect {
     }
 }
 
-/// Index of the tab whose label sits under pixel `x` on the tab bar.
-/// `name_lens` yields each tab name's character count; a label is `(len + 2)`
-/// cells wide (one pad cell each side) followed by a half-cell gap. Mirrors the
-/// render layout so clicks land on the tab they appear over.
+/// Index of the tab whose slot sits under pixel `x` on the tab bar.
+/// `name_lens` yields each tab name's character count. The renderer
+/// (`paint::redraw`) draws each tab as a slot of `(len + 2)` label cells plus
+/// one close-button (`×`) cell, then advances by a half-cell gap — i.e. the
+/// stride is `(len + 2) * cw + cw + cw / 2`. Mirror that exactly (CA-111) so a
+/// plain tab-switch click lands on the tab it appears over from the 2nd tab on.
+/// (The close-button cell is hit-tested first by `app::tab_button_at`, so
+/// including it in the slot here is correct: a tab-switch click anywhere in the
+/// drawn slot resolves to that tab.)
 pub fn tab_at(name_lens: impl IntoIterator<Item = usize>, cw: usize, x: usize) -> Option<usize> {
     let mut tx = 0usize;
     for (i, len) in name_lens.into_iter().enumerate() {
-        let tw = (len + 2) * cw;
-        if x >= tx && x < tx + tw {
+        let slot_w = (len + 2) * cw + cw;
+        if x >= tx && x < tx + slot_w {
             return Some(i);
         }
-        tx += tw + cw / 2;
+        tx += slot_w + cw / 2;
     }
     None
 }
@@ -637,14 +642,18 @@ mod tests {
 
     #[test]
     fn tab_at_maps_pixels_to_tabs() {
+        // CA-111: the slot stride must include the close-button (`×`) cell, so it
+        // matches the renderer (paint::redraw) and the close hit-test
+        // (app::tab_button_at): slot = (len + 2) * cw + cw, then a cw/2 gap.
         let cw = 10;
-        // "ab"(2) -> width (2+2)*10 = 40, gap 5; "cde"(3) -> width 50.
+        // "ab"(2) -> slot (2+2)*10 + 10 = 50, gap 5; "cde"(3) -> slot (3+2)*10 + 10 = 60.
         let lens = [2usize, 3];
         assert_eq!(tab_at(lens, cw, 0), Some(0));
-        assert_eq!(tab_at(lens, cw, 39), Some(0));
-        assert_eq!(tab_at(lens, cw, 42), None); // in the gap between tabs
-        assert_eq!(tab_at(lens, cw, 45), Some(1)); // first tab 40 + gap 5
-        assert_eq!(tab_at(lens, cw, 94), Some(1)); // 45 + 50 - 1
+        assert_eq!(tab_at(lens, cw, 49), Some(0)); // last pixel of tab 0's slot
+        assert_eq!(tab_at(lens, cw, 52), None); // in the gap between tabs [50, 55)
+        assert_eq!(tab_at(lens, cw, 55), Some(1)); // first tab slot 50 + gap 5
+        assert_eq!(tab_at(lens, cw, 114), Some(1)); // 55 + 60 - 1, last pixel of tab 1
+        assert_eq!(tab_at(lens, cw, 115), None); // first pixel past tab 1's slot
         assert_eq!(tab_at(lens, cw, 1000), None); // past the last tab
     }
 

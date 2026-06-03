@@ -54,7 +54,22 @@ fn named_bytes(n: NamedKey, m: u8, shift: bool) -> Option<Vec<u8>> {
     use NamedKey::*;
     let bytes = match n {
         Enter => b"\r".to_vec(),
-        Backspace => vec![0x7f],
+        Backspace => {
+            // CA-121: route modifiers through Backspace so readline/zsh/pwsh
+            // word-erase works. Alt+Backspace → ESC DEL (delete previous word);
+            // Ctrl+Backspace → BS (0x08); plain Backspace → DEL (0x7f). `m` is the
+            // xterm modifier code (1 + shift + 2·alt + 4·ctrl), so bit 1 = Alt and
+            // bit 2 = Ctrl.
+            let alt = (m.saturating_sub(1)) & 0b010 != 0;
+            let ctrl = (m.saturating_sub(1)) & 0b100 != 0;
+            if alt {
+                vec![0x1b, 0x7f]
+            } else if ctrl {
+                vec![0x08]
+            } else {
+                vec![0x7f]
+            }
+        }
         Tab => {
             if shift {
                 b"\x1b[Z".to_vec() // back-tab
@@ -230,6 +245,38 @@ mod tests {
         assert_eq!(
             encode(&Key::Named(NamedKey::Space), none),
             Some(b" ".to_vec())
+        );
+    }
+
+    #[test]
+    fn alt_backspace_deletes_previous_word() {
+        // CA-121: Alt+Backspace → ESC DEL (readline/zsh/pwsh word-erase).
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), mods(false, true, false)),
+            Some(vec![0x1b, 0x7f])
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_is_bs() {
+        // CA-121: Ctrl+Backspace → BS (0x08).
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), ModifiersState::CONTROL),
+            Some(vec![0x08])
+        );
+    }
+
+    #[test]
+    fn plain_and_shift_backspace_stay_del() {
+        // Plain Backspace and Shift+Backspace both emit DEL (0x7f) — only
+        // Alt/Ctrl change the byte (CA-121).
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), ModifiersState::empty()),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), mods(true, false, false)),
+            Some(vec![0x7f])
         );
     }
 
