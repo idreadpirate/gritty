@@ -1138,10 +1138,7 @@ impl Gritty {
             if restored_panes_over_budget(restored_panes, window_panes) {
                 break;
             }
-            let size = match (sw.win_w, sw.win_h) {
-                (Some(w), Some(h)) if w >= 200 && h >= 100 => (w as f64, h as f64),
-                _ => (960.0, 600.0),
-            };
+            let size = restored_win_size(sw.win_w, sw.win_h);
             let pos = match (sw.win_x, sw.win_y) {
                 // CA-49: clamp the saved top-left onto a currently-visible monitor
                 // so a window saved on a now-removed display doesn't open off
@@ -2554,6 +2551,25 @@ pub(crate) fn restored_panes_over_budget(restored_so_far: usize, window_panes: u
     restored_so_far.saturating_add(window_panes) > MAX_RESTORED_PANES
 }
 
+/// Restored window size in physical pixels: a saved size is honored only within
+/// sane per-dimension bounds; anything missing or out of range falls back to the
+/// default. The minimum keeps a tiny saved window usable; the maximum upper-bounds
+/// a crafted/corrupt `session.json` that requests absurd dimensions (e.g.
+/// `u32::MAX`) — defense-in-depth matching the `MAX_WINDOWS`/`MAX_TABS` caps. The
+/// OS clamps the actual window to the desktop regardless; this just avoids ever
+/// asking for a degenerate size.
+pub(crate) fn restored_win_size(win_w: Option<u32>, win_h: Option<u32>) -> (f64, f64) {
+    const MIN_W: u32 = 200;
+    const MIN_H: u32 = 100;
+    const MAX_DIM: u32 = 16384; // covers any real multi-monitor span; bounds the rest
+    match (win_w, win_h) {
+        (Some(w), Some(h)) if (MIN_W..=MAX_DIM).contains(&w) && (MIN_H..=MAX_DIM).contains(&h) => {
+            (w as f64, h as f64)
+        }
+        _ => (960.0, 600.0),
+    }
+}
+
 /// RT-137: true if a window already at `current_tabs` tabs is at the runtime cap
 /// and a new tab must be refused. Mirrors the restore-time `MAX_TABS` bound.
 pub(crate) fn tab_cap_reached(current_tabs: usize) -> bool {
@@ -2965,6 +2981,29 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_win_size_honors_sane_and_rejects_out_of_range() {
+        // A normal saved size is honored verbatim.
+        assert_eq!(restored_win_size(Some(1280), Some(800)), (1280.0, 800.0));
+        // A crafted/corrupt session requesting absurd dimensions falls back to
+        // the default instead of asking the OS for a u32::MAX-sized window.
+        assert_eq!(
+            restored_win_size(Some(u32::MAX), Some(u32::MAX)),
+            (960.0, 600.0)
+        );
+        assert_eq!(restored_win_size(Some(100_000), Some(800)), (960.0, 600.0));
+        // Too-small dimensions also fall back (a sub-usable window).
+        assert_eq!(restored_win_size(Some(10), Some(10)), (960.0, 600.0));
+        // A missing dimension falls back (legacy/partial files).
+        assert_eq!(restored_win_size(None, Some(800)), (960.0, 600.0));
+        // Boundary values are inclusive.
+        assert_eq!(
+            restored_win_size(Some(16384), Some(16384)),
+            (16384.0, 16384.0)
+        );
+        assert_eq!(restored_win_size(Some(200), Some(100)), (200.0, 100.0));
+    }
 
     #[test]
     fn palette_hit_maps_click_to_row_chrome_or_outside() {
