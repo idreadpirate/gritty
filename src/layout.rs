@@ -629,6 +629,59 @@ mod tests {
     }
 
     #[test]
+    fn child_areas_pins_sanitized_split_geometry() {
+        // RT-80 (core logic): the guard in `child_areas` rewrites a hostile ratio
+        // to an exact, in-bounds value before any pixel math. Pin the resulting
+        // geometry to the EXACT expected split — not just "in bounds" — across both
+        // axes, so reverting the guard (which yields wa=0 for NaN/±inf/negatives or a
+        // saturated-`usize::MAX` width for >1 ratios) breaks this test on every case.
+        //
+        //   non-finite (NaN / ±Infinity)  -> 0.5  midpoint
+        //   out of [0,1] high (1e30, 2.0) -> 1.0  (whole area to the first child)
+        //   out of [0,1] low  (-5.0)      -> 0.0  (whole area to the second child)
+        // AREA is 100 wide x 60 tall, anchored at (0, 0).
+        let cases: [(f32, usize, usize); 6] = [
+            (f32::NAN, 50, 30),          // -> 0.5
+            (f32::INFINITY, 50, 30),     // non-finite -> 0.5, NOT clamp-to-1
+            (f32::NEG_INFINITY, 50, 30), // non-finite -> 0.5, NOT clamp-to-0
+            (1e30, 100, 60),             // finite but >1 -> clamp to 1.0
+            (2.0, 100, 60),              // finite but >1 -> clamp to 1.0
+            (-5.0, 0, 0),                // finite but <0 -> clamp to 0.0
+        ];
+        for (bad, want_w, want_h) in cases {
+            let (la, lb) = child_areas(Axis::LeftRight, bad, AREA);
+            assert_eq!(la.w, want_w, "LeftRight ratio {bad}: first-child width");
+            assert_eq!(la.x, AREA.x, "LeftRight ratio {bad}: first child anchored");
+            assert_eq!(la.x + la.w, lb.x, "LeftRight ratio {bad}: contiguous");
+            assert_eq!(
+                la.w + lb.w,
+                AREA.w,
+                "LeftRight ratio {bad}: partitions width"
+            );
+            assert_eq!(
+                lb.w,
+                AREA.w - want_w,
+                "LeftRight ratio {bad}: second-child width"
+            );
+
+            let (ta, tb) = child_areas(Axis::TopBottom, bad, AREA);
+            assert_eq!(ta.h, want_h, "TopBottom ratio {bad}: first-child height");
+            assert_eq!(ta.y, AREA.y, "TopBottom ratio {bad}: first child anchored");
+            assert_eq!(ta.y + ta.h, tb.y, "TopBottom ratio {bad}: contiguous");
+            assert_eq!(
+                ta.h + tb.h,
+                AREA.h,
+                "TopBottom ratio {bad}: partitions height"
+            );
+            assert_eq!(
+                tb.h,
+                AREA.h - want_h,
+                "TopBottom ratio {bad}: second-child height"
+            );
+        }
+    }
+
+    #[test]
     fn content_rect_subtracts_bar() {
         assert_eq!(
             content_rect(800, 600, 20),
