@@ -141,14 +141,11 @@ impl Gritty {
             }
             if let Some(name) = commit {
                 let is_tab = self.windows[wi].rename_is_tab;
-                if let Some(win) = self.windows.get_mut(wi) {
-                    let active = win.active;
-                    if let Some(tab) = win.tabs.get_mut(active) {
-                        if is_tab {
-                            tab.name = name;
-                        } else {
-                            tab.rename_focus(name);
-                        }
+                if let Some(tab) = self.active_tab_mut(wi) {
+                    if is_tab {
+                        tab.name = name;
+                    } else {
+                        tab.rename_focus(name);
                     }
                 }
                 // Persist immediately so the new name survives even an abrupt
@@ -204,10 +201,7 @@ impl Gritty {
                     }
                     "r" => {
                         let cur = self
-                            .windows
-                            .get(wi)
-                            .and_then(|w| w.tabs.get(w.active))
-                            .and_then(|t| t.panes.get(&t.focus))
+                            .focused_pane(wi)
                             .map(|p| p.name.clone())
                             .unwrap_or_default();
                         self.windows[wi].rename = Some(cur);
@@ -327,15 +321,9 @@ impl Gritty {
                     self.windows[wi].broadcast_pending_signal = None;
                     self.broadcast_bytes(wi, &bytes);
                 }
-            } else if let Some(win) = self.windows.get_mut(wi) {
-                let active = win.active;
-                if let Some(tab) = win.tabs.get_mut(active) {
-                    let f = tab.focus;
-                    if let Some(pane) = tab.panes.get_mut(&f) {
-                        pane.term.scroll_to_bottom();
-                        pane.pty.write(&bytes);
-                    }
-                }
+            } else if let Some(pane) = self.focused_pane_mut(wi) {
+                pane.term.scroll_to_bottom();
+                pane.pty.write(&bytes);
             }
         }
     }
@@ -372,15 +360,9 @@ impl Gritty {
                 let broadcast = self.windows.get(wi).map(|w| w.broadcast).unwrap_or(false);
                 if broadcast {
                     self.broadcast_bytes(wi, &bytes);
-                } else if let Some(win) = self.windows.get_mut(wi) {
-                    let active = win.active;
-                    if let Some(tab) = win.tabs.get_mut(active) {
-                        let f = tab.focus;
-                        if let Some(pane) = tab.panes.get_mut(&f) {
-                            pane.term.scroll_to_bottom();
-                            pane.pty.write(&bytes);
-                        }
-                    }
+                } else if let Some(pane) = self.focused_pane_mut(wi) {
+                    pane.term.scroll_to_bottom();
+                    pane.pty.write(&bytes);
                 }
             }
         }
@@ -388,13 +370,10 @@ impl Gritty {
 
     /// Write `bytes` to every pane in window `wi`'s active tab (broadcast).
     fn broadcast_bytes(&mut self, wi: usize, bytes: &[u8]) {
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                for pane in tab.panes.values_mut() {
-                    pane.term.scroll_to_bottom();
-                    pane.pty.write(bytes);
-                }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for pane in tab.panes.values_mut() {
+                pane.term.scroll_to_bottom();
+                pane.pty.write(bytes);
             }
         }
     }
@@ -494,10 +473,7 @@ impl Gritty {
             }
             Cmd::RenamePane => {
                 let cur = self
-                    .windows
-                    .get(wi)
-                    .and_then(|w| w.tabs.get(w.active))
-                    .and_then(|t| t.panes.get(&t.focus))
+                    .focused_pane(wi)
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
                 if let Some(win) = self.windows.get_mut(wi) {
@@ -507,9 +483,7 @@ impl Gritty {
             }
             Cmd::RenameTab => {
                 let cur = self
-                    .windows
-                    .get(wi)
-                    .and_then(|w| w.tabs.get(w.active))
+                    .active_tab(wi)
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
                 if let Some(win) = self.windows.get_mut(wi) {

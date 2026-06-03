@@ -16,7 +16,7 @@ use crate::layout::{self, Axis, Rect};
 use crate::palette::Palette;
 use crate::persist::{self, SavedWindow};
 use crate::proc;
-use crate::session::{SpawnCfg, Tab};
+use crate::session::{Pane, SpawnCfg, Tab};
 use crate::{Dir4, Wake, FRAME, TAB_PALETTE};
 
 /// Default font size in pixels.
@@ -191,6 +191,29 @@ impl Gritty {
         self.windows.iter().position(|w| w.window.id() == id)
     }
 
+    /// The active tab of window `wi`, if any.
+    pub(crate) fn active_tab(&self, wi: usize) -> Option<&Tab> {
+        self.windows.get(wi).and_then(|w| w.tabs.get(w.active))
+    }
+
+    /// The active tab of window `wi`, mutably.
+    pub(crate) fn active_tab_mut(&mut self, wi: usize) -> Option<&mut Tab> {
+        self.windows
+            .get_mut(wi)
+            .and_then(|w| w.tabs.get_mut(w.active))
+    }
+
+    /// The focused pane of window `wi`'s active tab, if any.
+    pub(crate) fn focused_pane(&self, wi: usize) -> Option<&Pane> {
+        self.active_tab(wi).and_then(|t| t.panes.get(&t.focus))
+    }
+
+    /// The focused pane of window `wi`'s active tab, mutably.
+    pub(crate) fn focused_pane_mut(&mut self, wi: usize) -> Option<&mut Pane> {
+        self.active_tab_mut(wi)
+            .and_then(|t| t.panes.get_mut(&t.focus))
+    }
+
     /// Create a fresh OS window (no tabs yet) with our icon and dark caption.
     /// `size` is physical pixels; `pos` places the top-left if given.
     /// Returns `None` if the OS refuses to create the window (tear-off stays
@@ -352,10 +375,8 @@ impl Gritty {
     pub(crate) fn pane_rects(&self, wi: usize, w: usize, h: usize) -> Vec<(usize, Rect)> {
         let area = self.content_rect(w, h);
         let mut v = Vec::new();
-        if let Some(win) = self.windows.get(wi) {
-            if let Some(tab) = win.tabs.get(win.active) {
-                tab.tree.layout(area, &mut v);
-            }
+        if let Some(tab) = self.active_tab(wi) {
+            tab.tree.layout(area, &mut v);
         }
         v
     }
@@ -371,14 +392,11 @@ impl Gritty {
         let rects = self.pane_rects(wi, w, h);
         let (cw, ch) = (self.font.cell_w.max(1), self.font.cell_h.max(1));
         let th = self.title_h(wi);
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                for (id, rect) in rects {
-                    if let Some(pane) = tab.panes.get_mut(&id) {
-                        let (cols, rows) = pane_grid_cells(rect, th, cw, ch);
-                        pane.resize(cols, rows);
-                    }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for (id, rect) in rects {
+                if let Some(pane) = tab.panes.get_mut(&id) {
+                    let (cols, rows) = pane_grid_cells(rect, th, cw, ch);
+                    pane.resize(cols, rows);
                 }
             }
         }
@@ -475,22 +493,19 @@ impl Gritty {
         // CA-37: clone the spawn knobs before the `&mut self.windows` borrow below.
         let spawn_cfg = self.spawn_cfg.clone();
         let mut spawn_err: Option<String> = None;
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                // RT-137: refuse the split once the tab is at the pane cap so
-                // holding Ctrl+Shift+D (auto-repeat) can't fork-bomb shells. The
-                // restore path already enforces MAX_PANES_PER_TAB.
-                if pane_cap_reached(tab.panes.len()) {
-                    return;
-                }
-                // CA-53: a failed split (shell could not spawn) leaves the
-                // existing pane intact — but report it instead of swallowing it
-                // silently, mirroring `new_tab`'s non-fatal feedback. `split`
-                // already rolled back its tree on failure, so the tab is fine.
-                if let Err(e) = tab.split(axis, proxy, &spawn_cfg) {
-                    spawn_err = Some(e);
-                }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            // RT-137: refuse the split once the tab is at the pane cap so
+            // holding Ctrl+Shift+D (auto-repeat) can't fork-bomb shells. The
+            // restore path already enforces MAX_PANES_PER_TAB.
+            if pane_cap_reached(tab.panes.len()) {
+                return;
+            }
+            // CA-53: a failed split (shell could not spawn) leaves the
+            // existing pane intact — but report it instead of swallowing it
+            // silently, mirroring `new_tab`'s non-fatal feedback. `split`
+            // already rolled back its tree on failure, so the tab is fine.
+            if let Err(e) = tab.split(axis, proxy, &spawn_cfg) {
+                spawn_err = Some(e);
             }
         }
         if let Some(e) = spawn_err {
@@ -505,10 +520,7 @@ impl Gritty {
     /// (empty if none / a bare shell). Used to gate destructive-close confirms
     /// (CA-50).
     fn focused_proc_name(&self, wi: usize) -> String {
-        self.windows
-            .get(wi)
-            .and_then(|w| w.tabs.get(w.active))
-            .and_then(|t| t.panes.get(&t.focus))
+        self.focused_pane(wi)
             .map(|p| p.proc_name.clone())
             .unwrap_or_default()
     }
@@ -646,11 +658,7 @@ impl Gritty {
     pub(crate) fn move_focus(&mut self, wi: usize, dir: Dir4) {
         let (w, h) = self.win_size(wi);
         let rects = self.pane_rects(wi, w, h);
-        let focus = match self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-        {
+        let focus = match self.active_tab(wi) {
             Some(t) => t.focus,
             None => return,
         };
@@ -682,8 +690,8 @@ impl Gritty {
                 best = Some(*id);
             }
         }
-        if let (Some(id), Some(win)) = (best, self.windows.get_mut(wi)) {
-            if let Some(tab) = win.tabs.get_mut(win.active) {
+        if let Some(id) = best {
+            if let Some(tab) = self.active_tab_mut(wi) {
                 tab.focus = id;
             }
         }
@@ -837,10 +845,7 @@ impl Gritty {
 
     pub(crate) fn copy_selection(&mut self, wi: usize) {
         let text = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-            .and_then(|t| t.panes.get(&t.focus))
+            .focused_pane(wi)
             .and_then(|p| p.term.term.selection_to_string());
         if let Some(text) = text {
             // CA-42: a whitespace-only (or empty) drag must not clobber the
@@ -856,21 +861,12 @@ impl Gritty {
             return;
         };
         let bracketed = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-            .and_then(|t| t.panes.get(&t.focus))
+            .focused_pane(wi)
             .is_some_and(|p| p.term.bracketed_paste());
         let data = crate::term::wrap_paste(&text, bracketed);
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                let f = tab.focus;
-                if let Some(pane) = tab.panes.get_mut(&f) {
-                    pane.term.scroll_to_bottom();
-                    pane.pty.write(&data);
-                }
-            }
+        if let Some(pane) = self.focused_pane_mut(wi) {
+            pane.term.scroll_to_bottom();
+            pane.pty.write(&data);
         }
     }
 
@@ -1158,11 +1154,8 @@ impl Gritty {
     }
 
     pub(crate) fn resize_focus(&mut self, wi: usize, axis: Axis, grow: bool) {
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                tab.resize_focus(axis, grow);
-            }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            tab.resize_focus(axis, grow);
         }
         self.relayout(wi);
         self.request_redraw(wi);
@@ -1287,8 +1280,7 @@ impl Gritty {
     /// CA-33: Return the hyperlink URI of the cell at pixel (x, y) in window `wi`.
     pub(crate) fn hyperlink_at_pixel(&self, wi: usize, x: f64, y: f64) -> Option<String> {
         let (w, h) = self.win_size(wi);
-        let win = self.windows.get(wi)?;
-        let tab = win.tabs.get(win.active)?;
+        let tab = self.active_tab(wi)?;
         let rects = self.pane_rects(wi, w, h);
         let (pane_id, rect) = rects
             .iter()
@@ -1348,10 +1340,7 @@ impl Gritty {
     /// CA-7: true if the focused pane of window `wi` has a mouse-reporting mode.
     pub(crate) fn pane_wants_mouse(&self, wi: usize) -> bool {
         use alacritty_terminal::term::TermMode;
-        self.windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-            .and_then(|t| t.panes.get(&t.focus))
+        self.focused_pane(wi)
             .is_some_and(|p| p.term.term.mode().intersects(TermMode::MOUSE_MODE))
     }
 
@@ -1361,10 +1350,7 @@ impl Gritty {
     /// the wire form and to gate motion reports.
     pub(crate) fn pane_mouse_flags(&self, wi: usize) -> (bool, bool, bool) {
         use alacritty_terminal::term::TermMode;
-        self.windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-            .and_then(|t| t.panes.get(&t.focus))
+        self.focused_pane(wi)
             .map(|p| {
                 let m = p.term.term.mode();
                 (
@@ -1382,14 +1368,8 @@ impl Gritty {
     pub(crate) fn forward_mouse(&mut self, wi: usize, btn: u8, col: u16, row: u16, press: bool) {
         let (sgr, _, _) = self.pane_mouse_flags(wi);
         let seq = encode_mouse(btn, col, row, press, sgr);
-        if let Some(win) = self.windows.get_mut(wi) {
-            let active = win.active;
-            if let Some(tab) = win.tabs.get_mut(active) {
-                let f = tab.focus;
-                if let Some(pane) = tab.panes.get_mut(&f) {
-                    pane.pty.write(&seq);
-                }
-            }
+        if let Some(pane) = self.focused_pane_mut(wi) {
+            pane.pty.write(&seq);
         }
     }
 
@@ -1456,8 +1436,7 @@ impl Gritty {
     /// CA-7: Convert pixel position to 1-based (col, row) for window `wi`'s focused pane.
     pub(crate) fn pixel_to_term_cell(&self, wi: usize, x: f64, y: f64) -> Option<(u16, u16)> {
         let (w, h) = self.win_size(wi);
-        let win = self.windows.get(wi)?;
-        let tab = win.tabs.get(win.active)?;
+        let tab = self.active_tab(wi)?;
         let rects = self.pane_rects(wi, w, h);
         let (_, pane_rect) = rects.iter().find(|(id, _)| *id == tab.focus)?;
         let grid = self.grid_rect(wi, *pane_rect);
@@ -1854,12 +1833,9 @@ impl ApplicationHandler<Wake> for Gritty {
                 if self.mods.control_key() {
                     if notches != 0.0 {
                         let grow = notches > 0.0;
-                        if let Some(win) = self.windows.get_mut(wi) {
-                            let active = win.active;
-                            if let Some(tab) = win.tabs.get_mut(active) {
-                                tab.resize_focus(Axis::LeftRight, grow);
-                                tab.resize_focus(Axis::TopBottom, grow);
-                            }
+                        if let Some(tab) = self.active_tab_mut(wi) {
+                            tab.resize_focus(Axis::LeftRight, grow);
+                            tab.resize_focus(Axis::TopBottom, grow);
                         }
                         self.relayout(wi);
                         self.request_redraw(wi);
@@ -1876,14 +1852,8 @@ impl ApplicationHandler<Wake> for Gritty {
                 } else {
                     let lines = (notches * 3.0) as i32;
                     if lines != 0 {
-                        if let Some(win) = self.windows.get_mut(wi) {
-                            let active = win.active;
-                            if let Some(tab) = win.tabs.get_mut(active) {
-                                let f = tab.focus;
-                                if let Some(pane) = tab.panes.get_mut(&f) {
-                                    pane.term.scroll(lines);
-                                }
-                            }
+                        if let Some(pane) = self.focused_pane_mut(wi) {
+                            pane.term.scroll(lines);
                         }
                         self.request_redraw(wi);
                     }
@@ -1998,9 +1968,7 @@ impl Gritty {
         let (w, h) = self.win_size(wi);
         let area = self.content_rect(w, h);
         let divider = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
+            .active_tab(wi)
             .and_then(|t| t.tree.divider_at(area, x as usize, y as usize, 5));
         if let Some(path) = divider {
             if let Some(win) = self.windows.get_mut(wi) {
@@ -2013,11 +1981,9 @@ impl Gritty {
         // CA-202: but Shift held bypasses forwarding to allow a local selection.
         if !self.mods.shift_key() && self.pane_wants_mouse(wi) {
             if let Some((id, _)) = self.pane_at(wi, x, y) {
-                if let Some(win) = self.windows.get_mut(wi) {
-                    if let Some(tab) = win.tabs.get_mut(win.active) {
-                        if tab.panes.contains_key(&id) {
-                            tab.focus = id;
-                        }
+                if let Some(tab) = self.active_tab_mut(wi) {
+                    if tab.panes.contains_key(&id) {
+                        tab.focus = id;
                     }
                 }
             }
@@ -2037,11 +2003,9 @@ impl Gritty {
             return;
         };
         // Focus the clicked pane.
-        if let Some(win) = self.windows.get_mut(wi) {
-            if let Some(tab) = win.tabs.get_mut(win.active) {
-                if tab.panes.contains_key(&id) {
-                    tab.focus = id;
-                }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            if tab.panes.contains_key(&id) {
+                tab.focus = id;
             }
         }
 
@@ -2058,9 +2022,7 @@ impl Gritty {
         let count = self.classify_click(wi);
 
         let (cols, off) = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
+            .active_tab(wi)
             .and_then(|t| t.panes.get(&id))
             .map(|p| (p.term.size.cols, p.term.display_offset()))
             .unwrap_or((1, 0));
@@ -2087,9 +2049,7 @@ impl Gritty {
         let (w, h) = self.win_size(wi);
         let area = self.content_rect(w, h);
         let Some((axis, srect)) = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
+            .active_tab(wi)
             .and_then(|t| t.tree.split_area(path, area))
         else {
             return;
@@ -2098,21 +2058,15 @@ impl Gritty {
             Axis::LeftRight => (x - srect.x as f64) / (srect.w.max(1) as f64),
             Axis::TopBottom => (y - srect.y as f64) / (srect.h.max(1) as f64),
         } as f32;
-        if let Some(win) = self.windows.get_mut(wi) {
-            if let Some(tab) = win.tabs.get_mut(win.active) {
-                tab.tree.set_ratio(path, ratio);
-            }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            tab.tree.set_ratio(path, ratio);
         }
         self.relayout(wi);
         self.request_redraw(wi);
     }
 
     pub(crate) fn update_selection(&mut self, wi: usize, x: f64, y: f64) {
-        let focus = match self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-        {
+        let focus = match self.active_tab(wi) {
             Some(t) => t.focus,
             None => return,
         };
@@ -2124,20 +2078,13 @@ impl Gritty {
             .map(|(_, r)| self.grid_rect(wi, r));
         let Some(grid) = grid else { return };
         let (cols, off) = self
-            .windows
-            .get(wi)
-            .and_then(|win| win.tabs.get(win.active))
-            .and_then(|t| t.panes.get(&focus))
+            .focused_pane(wi)
             .map(|p| (p.term.size.cols, p.term.display_offset()))
             .unwrap_or((1, 0));
         let (point, side) = self.point_in_grid(grid, x, y, cols, off);
-        if let Some(win) = self.windows.get_mut(wi) {
-            if let Some(tab) = win.tabs.get_mut(win.active) {
-                if let Some(pane) = tab.panes.get_mut(&focus) {
-                    if let Some(sel) = pane.term.term.selection.as_mut() {
-                        sel.update(point, side);
-                    }
-                }
+        if let Some(pane) = self.focused_pane_mut(wi) {
+            if let Some(sel) = pane.term.term.selection.as_mut() {
+                sel.update(point, side);
             }
         }
         self.request_redraw(wi);
