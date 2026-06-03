@@ -581,6 +581,16 @@ impl Gritty {
     }
 }
 
+/// Map a renderable cell's grid line to a 0-based screen row for painting.
+/// `display_iter` yields the visible viewport; when scrolled into scrollback the
+/// lines are negative (history), so the row is `line + display_offset`. Returns
+/// `None` only if that maps above the viewport (shouldn't happen for display_iter
+/// output — a defensive guard, and the seam this is unit-tested through).
+pub(crate) fn screen_row(line: i32, display_offset: usize) -> Option<usize> {
+    let r = line + display_offset as i32;
+    (r >= 0).then_some(r as usize)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_pane_grid(
     buffer: &mut [u32],
@@ -595,7 +605,8 @@ pub(crate) fn draw_pane_grid(
     let (cw, ch) = (font.cell_w, font.cell_h);
     let content = pane.term.term.renderable_content();
     let selection = content.selection;
-    let at_bottom = content.display_offset == 0;
+    let display_offset = content.display_offset;
+    let at_bottom = display_offset == 0;
     let cursor_shape = content.cursor.shape;
     let cursor_hidden = cursor_shape == CursorShape::Hidden;
     // Focused pane in a focused window: block cursor inverts the cell. Otherwise
@@ -615,15 +626,18 @@ pub(crate) fn draw_pane_grid(
 
     for item in content.display_iter {
         let line = item.point.line.0;
-        if line < 0 {
+        // Map the cell's grid line to a 0-based screen row. Scrolled-back history
+        // has NEGATIVE `line`; `display_iter` yields exactly the visible viewport,
+        // so `line + display_offset` ∈ [0, rows). The old `if line < 0 {continue}`
+        // dropped every scrolled-back cell, leaving a blank band over the text.
+        let Some(row) = screen_row(line, display_offset) else {
             continue;
-        }
+        };
         let cell = item.cell;
         // The spacer after a wide glyph is painted by the wide cell itself (CA-5).
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
-        let row = line as usize;
         let col = item.point.column.0;
 
         let base_fg = color::to_rgb(cell.fg, color::fg());
@@ -861,6 +875,22 @@ pub(crate) fn scrollbar_thumb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the wheel-scroll "grey blank band": scrolled-back history
+    /// has negative grid lines, which must map to on-screen rows (not be dropped).
+    #[test]
+    fn screen_row_maps_scrolled_history_to_visible_rows() {
+        // At the bottom (offset 0) lines are already screen rows.
+        assert_eq!(screen_row(0, 0), Some(0));
+        assert_eq!(screen_row(4, 0), Some(4));
+        // Scrolled up by 8: alacritty yields lines -8..-4 for a 5-row viewport;
+        // they must land on screen rows 0..4 (the old `line<0` skip blanked them).
+        assert_eq!(screen_row(-8, 8), Some(0));
+        assert_eq!(screen_row(-5, 8), Some(3));
+        assert_eq!(screen_row(-4, 8), Some(4));
+        // Only a line above the viewport top maps to None (defensive guard).
+        assert_eq!(screen_row(-9, 8), None);
+    }
 
     #[test]
     fn thumb_at_bottom_when_offset_zero() {

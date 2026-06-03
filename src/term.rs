@@ -348,6 +348,38 @@ pub fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Data probe for the wheel-scroll "grey blank band" report: after scrolling
+    /// up into history, the rendered viewport (what draw_pane_grid iterates) must
+    /// be history TEXT, not blank cells. If this passes, the scroll+content path
+    /// is sound and the bug is in rendering/geometry; if it fails, the scroll
+    /// wrapper itself is wrong.
+    #[test]
+    fn scroll_up_reveals_history_not_blank() {
+        use std::collections::BTreeMap;
+        let mut t = Terminal::new(20, 5, 5000); // 5 visible rows, 5000 scrollback
+        for i in 0..40 {
+            t.feed(format!("L{i}\r\n").as_bytes());
+        }
+        t.scroll(8); // up 8 lines into scrollback
+        assert!(t.display_offset() > 0, "scroll(8) should leave the bottom");
+
+        let mut rows: BTreeMap<i32, String> = BTreeMap::new();
+        let content = t.term.renderable_content();
+        for item in content.display_iter {
+            rows.entry(item.point.line.0).or_default().push(item.cell.c);
+        }
+        // The scrolled viewport is history text (e.g. L28). Note the line indices
+        // are NEGATIVE here — that's expected; the renderer maps them to screen
+        // rows via `screen_row(line, display_offset)` (see paint.rs). The bug was
+        // draw_pane_grid skipping negative lines, blanking all scrolled content.
+        let texts: Vec<String> = rows.values().map(|s| s.trim_end().to_string()).collect();
+        let nonblank = texts.iter().filter(|s| !s.is_empty()).count();
+        assert!(
+            nonblank >= 3 && texts.iter().any(|s| s.contains("L28")),
+            "scrolled viewport should show history text (e.g. L28); got {texts:?}"
+        );
+    }
+
     #[test]
     fn wrap_paste_caps_oversize_input() {
         // RT-20: a giant clipboard is truncated rather than copied wholesale.
