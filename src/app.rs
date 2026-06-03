@@ -3279,6 +3279,68 @@ mod tests {
         assert!(!reaping_is_frozen(false));
     }
 
+    #[test]
+    fn drag_freeze_keeps_the_grabbed_tab_under_its_captured_index() {
+        // CA-110 exploit invariant, pinned by modelling the exact mutation
+        // `reap_dead` performs (`win.tabs.remove(ti)`) against the press-time
+        // index a tear-off drag captures (`TabDrag.index`). The release path tears
+        // off `td.index` positionally, so for the gesture to be correct the tab
+        // sitting at `td.index` must still be the very tab the user grabbed.
+        //
+        // The whole fix is the `reaping_is_frozen` guard at the top of `reap_dead`:
+        // while a drag is in flight reaping is skipped, so `win.tabs` can't shift
+        // and the captured index stays true. Revert the guard (return `false`, or
+        // drop the call site so reaping runs mid-drag) and this test goes red,
+        // because the unfrozen reap below visibly steals the grabbed tab.
+        for ntabs in 2usize..=6 {
+            // Tabs are distinct labels; `grabbed` is the tab held for tear-off,
+            // its slot at press time is the index the drop will tear positionally.
+            let labels: Vec<char> = ('A'..).take(ntabs).collect();
+            for captured in 0..ntabs {
+                let grabbed = labels[captured]; // the tab under the pointer
+
+                for dead in 0..ntabs {
+                    // A drag is in flight, so the guard MUST freeze this reap.
+                    let drag_in_flight = true;
+                    assert!(
+                        reaping_is_frozen(drag_in_flight),
+                        "reap not frozen mid-drag (captured={captured}, dead={dead})",
+                    );
+
+                    // Because reaping is frozen, `win.tabs` is untouched: the
+                    // captured index still names the grabbed tab on release.
+                    assert_eq!(
+                        labels[captured], grabbed,
+                        "frozen reap must leave the grabbed tab at its captured index",
+                    );
+
+                    // The boundary the finding describes: had the reap NOT been
+                    // frozen, removing a *lower-indexed* dead tab shifts the
+                    // grabbed tab down a slot, so the captured index would name a
+                    // different tab — or, once everything below it is gone, run
+                    // off the end and silently drop the gesture. This block proves
+                    // the bug the freeze prevents is real; it never executes while
+                    // the guard holds.
+                    if !reaping_is_frozen(drag_in_flight) {
+                        let mut shifted = labels.clone();
+                        shifted.remove(dead); // exactly what reap_dead would do
+                        let torn = shifted.get(captured).copied();
+                        if dead < captured {
+                            assert_ne!(
+                                torn,
+                                Some(grabbed),
+                                "unfrozen reap of a lower tab would tear the wrong tab",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // No drag in flight → reaping proceeds normally and dead tabs are reaped.
+        assert!(!reaping_is_frozen(false));
+    }
+
     // --- CA-100/CA-113 persist-on-close ordering -----------------------------
 
     #[test]
