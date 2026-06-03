@@ -7,10 +7,10 @@
 **A lightweight, native Windows terminal multiplexer — in Rust.**
 
 Tabs, split panes, a command palette, copy/paste that *actually works*, session
-restore, process-aware panes — in a single **~1.25 MB** executable with **no GPU,
-no Electron, no runtime, no WSL.**
+restore, process-aware panes, HiDPI, IME — in a single **sub-800 KB** executable
+with **no GPU, no Electron, no runtime, no WSL.**
 
-`174 tests` · `262 deps` · CPU-rendered · one `gritty.exe`
+`290 tests` · `259 deps` · CPU-rendered · one `gritty.exe` **under 800 KB**
 
 </div>
 
@@ -25,17 +25,20 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 - **It's the terminal *and* the multiplexer, natively.** Speaks Windows **ConPTY**
   directly — one `.exe`, runs where WSL is banned (locked-down corporate boxes).
 - **Brutally lightweight, by construction.** CPU software rendering (no GPU
-  pipeline, no driver surface), `lto + strip + panic=abort`, ~22 MB idle RAM,
-  near-0% CPU when idle (event-driven repaint with a frame cap + wake coalescing).
-  Adding 15 noisy panes can't peg a core.
+  pipeline, no driver surface); a **sub-800 KB** binary (`opt-level=z` + `lto` +
+  `strip` + `panic=abort`, hand-rolled config/session parsers instead of
+  `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); ~22 MB idle
+  RAM; near-0% CPU when idle (event-driven repaint with a frame cap + wake
+  coalescing). 20 busy panes can't peg a core.
 - **Stands on giants, reinvents nothing risky.** It extracts the proven cores —
   WezTerm's `portable-pty` for ConPTY and Alacritty's `alacritty_terminal` VT
   engine — and wraps them in its own lean multiplexer, renderer, and UX.
-- **Hardened like it's going to production.** A red-team + code-audit pass drove
-  out paste-injection, PATH-hijack, session-restore DoS, an unmaintained
-  dependency (RUSTSEC-2017-0008), a memory-unsafety race, and silent panics —
-  every fix shipped with tests behind a quality gate (fmt + clippy `-D` + tests +
-  binary/dependency budgets).
+- **Hardened like it's going to production.** Successive red-team + code-audit
+  campaigns drove out paste-injection, PATH-hijack, session-restore DoS, OSC-8
+  `file://` execution, a proc-tree-cycle UI hang, an unmaintained dependency
+  (RUSTSEC-2017-0008), a memory-unsafety race, and silent panics (now a crash
+  log) — ~50 findings, every fix shipped with a fail-on-revert test behind a
+  quality gate (fmt + clippy `-D` + tests + binary/dependency budgets).
 - **True color, zero config.** None of tmux's `TERM`/`terminal-overrides` dance.
 
 ## Features
@@ -47,12 +50,15 @@ and all); **seamless mode** (hide all chrome, just a glow on the focused pane).
 
 **Input & navigation** — full xterm key encoding (F-keys, modified arrows,
 Alt-as-ESC, Ctrl-masking); mouse reporting to TUI apps (vim/htop/fzf get clicks &
-wheel); double-click word / triple-click line selection; **command palette**
-(`Ctrl+Shift+P`, fuzzy); **keybinding help overlay** (`F1`); font zoom.
+wheel, Shift to bypass for local selection); double-click word / triple-click
+line selection; **command palette** (`Ctrl+Shift+P`, fuzzy); **keybinding help
+overlay** (`F1`); font zoom; **IME / dead-key composition** (CJK & accents);
+**HiDPI-aware** (text scales correctly on 150 %/200 % displays).
 
 **Copy/paste that always works** — drag to auto-copy, `Ctrl+Shift+C/V`,
 right-click paste, **sanitized & bracketed-paste-safe** (strips control/escape
-injection); **Ctrl-click OSC-8 hyperlinks** (scheme-restricted).
+injection); **broadcast one paste to every pane** (`Ctrl+Shift+B` — fan a command
+out to a whole fleet at once); **Ctrl-click OSC-8 hyperlinks** (http/https only).
 
 **Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
@@ -67,7 +73,9 @@ so it never fails to start.
 error dialog instead of a silent crash if no shell can spawn.
 
 ## Resize a pane three ways
-Drag the border · `Ctrl+Alt+Arrows` · `Ctrl+Mouse-wheel`.
+Drag the border · `Ctrl+Alt+Arrows` · `Ctrl+Mouse-wheel`. The window's maximize
+button fills the screen; restore-down snaps back to a centered, comfortably-sized
+window (not the near-full-screen pre-maximize size).
 
 ## Install
 
@@ -88,17 +96,22 @@ window you started them from. Uninstall any time:
 irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/uninstall.ps1 | iex
 ```
 
-**Build from source** — Rust toolchain (MSVC target):
+**Build from source** — `rustup` only; the pinned toolchain is automatic:
 
 ```sh
 git clone https://github.com/idreadpirate/gritty
 cd gritty
-cargo build --release
-./target/release/gritty.exe
+cargo build --release   # rust-toolchain.toml auto-selects nightly + rust-src;
+                        # .cargo/config.toml rebuilds std at opt=z (-Z build-std)
+./target/x86_64-pc-windows-msvc/release/gritty.exe
 ```
 
-Output is one self-contained `gritty.exe` (~1.25 MB). Maintainers cut a release
-with `./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
+gritty pins a **nightly** toolchain (`rust-toolchain.toml`) and uses `-Z build-std`
+(`.cargo/config.toml`) to rebuild `std` for size — that, with `opt-level=z` and
+the hand-rolled parsers, keeps the self-contained `gritty.exe` **under 800 KB**.
+`rustup` installs the pinned toolchain, `rust-src`, and the MSVC target
+automatically on first build — no manual setup. Maintainers cut a release with
+`./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
 
 ## Keybindings (essentials)
 

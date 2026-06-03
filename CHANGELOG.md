@@ -4,6 +4,32 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Footprint & build
+- **Self-contained `gritty.exe` is now under 800 KB** (was ~1.25 MB): release
+  profile `opt-level=z` + `codegen-units=1`; hand-rolled `config.toml` and
+  `session.json` parsers (drop `toml`/`serde_json` from the runtime); a 32px
+  embedded icon; and a `build-std`-rebuilt `std` compiled for size. Pinned
+  nightly toolchain (`rust-toolchain.toml`) + `-Z build-std` (`.cargo/config.toml`),
+  using `std,panic_abort` so the crash-log panic hook still fires.
+- **CI**: GitHub Actions runs the full `gate.ps1` (fmt + clippy `-D` + tests +
+  release build + binary/dependency budgets) on Windows for every push/PR.
+
+### Hardening & correctness (2026-06 red-team campaign)
+- Closed ~50 audit findings, each with a fail-on-revert regression test —
+  e.g. OSC-8 `file://` execution blocked (http/https only); proc-tree-cycle UI
+  hang guarded; aggregate session-restore pane budget + runtime tab/pane/window
+  caps; atomic session writes; crash-log panic hook; keyboard/active-tab index
+  desync on reap; mouse-protocol fidelity (legacy form, motion gating,
+  right/middle buttons, Shift-to-bypass); HiDPI; IME; `config.toml` actually
+  applied; window title from OSC 0/2; dirty-rect-aware repaint; CJK-width tabs.
+
+### Window & input
+- **HiDPI / `ScaleFactorChanged` aware** — text scales correctly on 150 %/200 %.
+- **IME / dead-key composition** (CJK & accents).
+- **Broadcast paste** to every pane at once (`Ctrl+Shift+B`).
+- Maximize→restore-down snaps to a centered, comfortably-sized window instead of
+  the near-full-screen pre-maximize size.
+
 ### Install & lifecycle
 - One-line PowerShell installer (`scripts/install.ps1`): downloads the released
   exe, installs under `%LOCALAPPDATA%\Programs\gritty`, adds Start Menu + Desktop

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# One quality gate, the same one maintainers run locally (scripts/gate.ps1):
+# fmt + clippy -D warnings + tests + release build (-Z build-std) + binary-size
+# and dependency budgets. The pinned toolchain (rust-toolchain.toml) brings its
+# own nightly + rust-src + MSVC target, so there's nothing to configure here.
+jobs:
+  gate:
+    name: quality gate (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show   # installs the pinned nightly + rust-src + msvc target
+
+      - name: Cache cargo + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Quality gate
+        shell: pwsh
+        run: ./scripts/gate.ps1

@@ -36,7 +36,8 @@ Step "Running quality gate"
 & "$PSScriptRoot\gate.ps1"
 if ($LASTEXITCODE) { Die "Quality gate failed — release aborted." }
 
-$exe = "target/release/gritty.exe"
+# build-std pins the MSVC target, so the release exe lands under the target triple.
+$exe = "target/x86_64-pc-windows-msvc/release/gritty.exe"
 if (-not (Test-Path $exe)) { Die "$exe not found after build." }
 
 # --- Stage assets (exe + checksum) ------------------------------------------
