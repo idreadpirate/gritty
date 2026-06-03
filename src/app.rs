@@ -383,6 +383,7 @@ impl Gritty {
 
     pub(crate) fn split_focus(&mut self, wi: usize, axis: Axis) {
         let proxy = self.proxy.clone();
+        let mut spawn_err: Option<String> = None;
         if let Some(win) = self.windows.get_mut(wi) {
             let active = win.active;
             if let Some(tab) = win.tabs.get_mut(active) {
@@ -392,10 +393,19 @@ impl Gritty {
                 if pane_cap_reached(tab.panes.len()) {
                     return;
                 }
-                // On split failure (shell could not spawn) we silently skip the
-                // split rather than crash — the existing pane continues.
-                let _ = tab.split(axis, proxy);
+                // CA-53: a failed split (shell could not spawn) leaves the
+                // existing pane intact — but report it instead of swallowing it
+                // silently, mirroring `new_tab`'s non-fatal feedback. `split`
+                // already rolled back its tree on failure, so the tab is fine.
+                if let Err(e) = tab.split(axis, proxy) {
+                    spawn_err = Some(e);
+                }
             }
+        }
+        if let Some(e) = spawn_err {
+            show_error_dialog(&format!(
+                "Gritty could not split the pane.\n\n{e}\n\nThe existing pane is unaffected."
+            ));
         }
         self.relayout(wi);
     }
@@ -443,6 +453,49 @@ impl Gritty {
             self.request_redraw(f);
         } else {
             self.relayout(wi);
+        }
+    }
+
+    /// CA-105: close the ENTIRE tab `ti` in window `wi` (the tab-strip `×`),
+    /// dropping all of its panes/PTYs at once — not just the focused pane like
+    /// `close_focus`. Removing the last tab empties the window, which is handled
+    /// exactly like `close_focus` (exit on the last window without persisting an
+    /// empty session, else clamp `focused` and repaint). The surviving active
+    /// tab index is re-resolved with the shared `active_after_tab_removed` so
+    /// closing a background tab doesn't shift which tab is shown.
+    pub(crate) fn close_tab(&mut self, wi: usize, ti: usize, event_loop: &ActiveEventLoop) {
+        let win_empty = {
+            let Some(win) = self.windows.get_mut(wi) else {
+                return;
+            };
+            if ti >= win.tabs.len() {
+                return;
+            }
+            win.tabs.remove(ti); // drops the tab's panes (and their PTYs)
+            if win.tabs.is_empty() {
+                true
+            } else {
+                win.active = active_after_tab_removed(win.active, ti, win.tabs.len());
+                false
+            }
+        };
+        if win_empty {
+            self.windows.remove(wi);
+            if self.windows.is_empty() {
+                // CA-100: don't persist an empty window list (would wipe the
+                // saved workspace); leave the last good session intact.
+                event_loop.exit();
+                return;
+            }
+            if self.focused >= self.windows.len() {
+                self.focused = self.windows.len() - 1;
+            }
+            let f = self.focused;
+            self.relayout(f);
+            self.request_redraw(f);
+        } else {
+            self.relayout(wi);
+            self.request_redraw(wi);
         }
     }
 
@@ -931,18 +984,23 @@ impl Gritty {
     /// Tab index under an x pixel on window `wi`'s tab bar.
     pub(crate) fn tab_at(&self, wi: usize, x: usize) -> Option<usize> {
         let win = self.windows.get(wi)?;
+        let (w, _) = self.win_size(wi);
+        // CA-45: measure by display width (CJK = 2 cells) and CA-43: cap at the
+        // window width, so the hit-test matches the renderer exactly.
         layout::tab_at(
-            win.tabs.iter().map(|t| t.name.chars().count()),
+            win.tabs.iter().map(|t| layout::name_cols(&t.name)),
             self.font.cell_w,
             x,
+            w,
         )
     }
 
     /// CA-28: hit-test window `wi`'s tab strip for `×` and `+` buttons.
     pub(crate) fn tab_button_at(&self, wi: usize, x: usize, w: usize) -> Option<TabHit> {
         let win = self.windows.get(wi)?;
+        // CA-45: same display-width measure as the renderer and `tab_at`.
         tab_button_at(
-            win.tabs.iter().map(|t| t.name.chars().count()),
+            win.tabs.iter().map(|t| layout::name_cols(&t.name)),
             self.font.cell_w,
             x,
             w,
@@ -1578,11 +1636,13 @@ impl Gritty {
                         let len = self.windows.get(wi).map(|win| win.tabs.len()).unwrap_or(0);
                         if i < len {
                             if let Some(win) = self.windows.get_mut(wi) {
-                                win.active = i;
                                 win.broadcast = false;
                                 win.broadcast_pending_signal = None;
                             }
-                            self.close_focus(wi, event_loop);
+                            // CA-105: the tab `×` closes the WHOLE tab `i` (all its
+                            // panes/PTYs), not the focused pane of that tab. (The
+                            // close-*pane* action stays on Ctrl+Shift+W.)
+                            self.close_tab(wi, i, event_loop);
                         }
                     }
                     TabHit::New => {
@@ -1665,6 +1725,15 @@ impl Gritty {
                     tab.focus = id;
                 }
             }
+        }
+
+        // CA-41: a press on the pane's *title* band (above its grid) only
+        // focuses the pane — it must not start a selection. `point_in_grid`
+        // clamps a title-band `y` to row 0, so without this guard a press/drag
+        // beginning on a pane title would spuriously select from row 0.
+        if (y as usize) < grid.y {
+            self.request_redraw(wi);
+            return;
         }
 
         // CA-18: classify click count for word/line selection.
@@ -2333,6 +2402,24 @@ mod tests {
         let w = 5;
         assert_eq!(tab_button_at(lens, cw, 0, w), None);
         assert_eq!(tab_button_at(lens, cw, 4, w), None);
+    }
+
+    #[test]
+    fn tab_close_and_switch_agree_on_cjk_width() {
+        // CA-45: the `×` hit-test and the tab-switch hit-test must derive the
+        // slot from the SAME display width the renderer uses, or a click on a
+        // CJK tab lands on the wrong tab / misses its `×`. "世界"(width 4) ->
+        // text_w = (4+2)*10 = 60, close cell [60,70), slot 70, next tab at 75.
+        let cw = 10usize;
+        let w = 1000usize;
+        let name = "世界";
+        let lens = || [layout::name_cols(name), 1usize].into_iter();
+        // The `×` sits in the close cell derived from the display width.
+        assert_eq!(tab_button_at(lens(), cw, 65, w), Some(TabHit::Close(0)));
+        // A click inside the wide label resolves to tab 0 (not a neighbour).
+        assert_eq!(layout::tab_at(lens(), cw, 30, w), Some(0));
+        // The second tab begins after the full wide slot + gap.
+        assert_eq!(layout::tab_at(lens(), cw, 76, w), Some(1));
     }
 
     // --- Tab tear-off decision ------------------------------------------------

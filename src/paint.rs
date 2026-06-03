@@ -100,7 +100,9 @@ impl Gritty {
                 format!(" {} ", tab.name)
             };
             // CA-28: slot = label text + one cell for '×'.
-            let text_w = (tab.name.chars().count() + 2) * cw;
+            // CA-45: size the slot by the name's display width (CJK = 2 cells),
+            // the same measure the hit-tests use, so render and click agree.
+            let text_w = (crate::layout::name_cols(&tab.name) + 2) * cw;
             let slot_w = text_w + cw;
             if tx + slot_w > stride {
                 break; // overflow: stop drawing tabs past the window edge

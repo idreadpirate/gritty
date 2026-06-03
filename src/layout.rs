@@ -97,19 +97,42 @@ pub fn grid_rect(rect: Rect, title: usize) -> Rect {
     }
 }
 
+/// Display width (in terminal cells) of a tab/pane name. CA-45: wide East-Asian
+/// glyphs occupy two cells and combining/zero-width marks occupy none, so a raw
+/// `chars().count()` mis-measures CJK names. The renderer advances the tab strip
+/// by this width and the hit-tests (`tab_at`, `app::tab_button_at`) must use the
+/// *same* measure, or a click lands on the wrong tab / misses the `×`.
+pub fn name_cols(name: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    name.width()
+}
+
 /// Index of the tab whose slot sits under pixel `x` on the tab bar.
-/// `name_lens` yields each tab name's character count. The renderer
-/// (`paint::redraw`) draws each tab as a slot of `(len + 2)` label cells plus
-/// one close-button (`×`) cell, then advances by a half-cell gap — i.e. the
-/// stride is `(len + 2) * cw + cw + cw / 2`. Mirror that exactly (CA-111) so a
-/// plain tab-switch click lands on the tab it appears over from the 2nd tab on.
-/// (The close-button cell is hit-tested first by `app::tab_button_at`, so
-/// including it in the slot here is correct: a tab-switch click anywhere in the
-/// drawn slot resolves to that tab.)
-pub fn tab_at(name_lens: impl IntoIterator<Item = usize>, cw: usize, x: usize) -> Option<usize> {
+/// `name_lens` yields each tab name's display width (see `name_cols`). The
+/// renderer (`paint::redraw`) draws each tab as a slot of `(len + 2)` label
+/// cells plus one close-button (`×`) cell, then advances by a half-cell gap —
+/// i.e. the stride is `(len + 2) * cw + cw + cw / 2`. Mirror that exactly
+/// (CA-111) so a plain tab-switch click lands on the tab it appears over from
+/// the 2nd tab on. (The close-button cell is hit-tested first by
+/// `app::tab_button_at`, so including it in the slot here is correct: a
+/// tab-switch click anywhere in the drawn slot resolves to that tab.)
+///
+/// CA-43: `w` caps the strip at the window width exactly as the renderer and
+/// `app::tab_button_at` do (they stop drawing/hit-testing once `tx + slot_w`
+/// exceeds the window), so `tab_at` never returns an off-screen tab the user
+/// can't see or click.
+pub fn tab_at(
+    name_lens: impl IntoIterator<Item = usize>,
+    cw: usize,
+    x: usize,
+    w: usize,
+) -> Option<usize> {
     let mut tx = 0usize;
     for (i, len) in name_lens.into_iter().enumerate() {
         let slot_w = (len + 2) * cw + cw;
+        if tx + slot_w > w {
+            break; // overflow: matches the renderer's edge cap (CA-43)
+        }
         if x >= tx && x < tx + slot_w {
             return Some(i);
         }
@@ -648,13 +671,50 @@ mod tests {
         let cw = 10;
         // "ab"(2) -> slot (2+2)*10 + 10 = 50, gap 5; "cde"(3) -> slot (3+2)*10 + 10 = 60.
         let lens = [2usize, 3];
-        assert_eq!(tab_at(lens, cw, 0), Some(0));
-        assert_eq!(tab_at(lens, cw, 49), Some(0)); // last pixel of tab 0's slot
-        assert_eq!(tab_at(lens, cw, 52), None); // in the gap between tabs [50, 55)
-        assert_eq!(tab_at(lens, cw, 55), Some(1)); // first tab slot 50 + gap 5
-        assert_eq!(tab_at(lens, cw, 114), Some(1)); // 55 + 60 - 1, last pixel of tab 1
-        assert_eq!(tab_at(lens, cw, 115), None); // first pixel past tab 1's slot
-        assert_eq!(tab_at(lens, cw, 1000), None); // past the last tab
+        let w = 1000; // wide enough that nothing overflows
+        assert_eq!(tab_at(lens, cw, 0, w), Some(0));
+        assert_eq!(tab_at(lens, cw, 49, w), Some(0)); // last pixel of tab 0's slot
+        assert_eq!(tab_at(lens, cw, 52, w), None); // in the gap between tabs [50, 55)
+        assert_eq!(tab_at(lens, cw, 55, w), Some(1)); // first tab slot 50 + gap 5
+        assert_eq!(tab_at(lens, cw, 114, w), Some(1)); // 55 + 60 - 1, last pixel of tab 1
+        assert_eq!(tab_at(lens, cw, 115, w), None); // first pixel past tab 1's slot
+        assert_eq!(tab_at(lens, cw, 1000, w), None); // past the last tab
+    }
+
+    #[test]
+    fn tab_at_never_returns_an_overflowed_tab() {
+        // CA-43: a tab whose slot would extend past the window width `w` is not
+        // drawn by the renderer, so `tab_at` must not hit-test it either — a
+        // click in that off-screen region returns None, matching the renderer
+        // and `tab_button_at`'s edge cap (so far tabs aren't "clickable" ghosts).
+        let cw = 10;
+        // tab 0 slot = 50 (gap 5), tab 1 slot = 50. With w=70, tab 1 would start
+        // at tx=55 and end at 105 > 70, so it must be skipped.
+        let lens = [2usize, 2];
+        let w = 70;
+        assert_eq!(tab_at(lens, cw, 10, w), Some(0)); // tab 0 fits and is hit
+        assert_eq!(tab_at(lens, cw, 60, w), None); // tab 1 overflows → not hit
+    }
+
+    #[test]
+    fn name_cols_measures_display_width_not_char_count() {
+        // CA-45: ASCII is one cell per char; East-Asian wide glyphs are two; a
+        // combining mark adds zero. A raw chars().count() would mis-size every
+        // CJK tab, desyncing the renderer from the hit-tests.
+        assert_eq!(name_cols("abc"), 3);
+        assert_eq!(name_cols("世界"), 4); // two wide CJK glyphs = 4 cells
+        assert_eq!(name_cols("a\u{0301}"), 1); // 'a' + combining acute = 1 cell
+    }
+
+    #[test]
+    fn tab_at_uses_display_width_for_wide_names() {
+        // CA-45: a CJK tab name must hit-test by the cells it actually occupies.
+        // "世"(width 2) -> slot (2+2)*10 + 10 = 50; next tab starts at 55.
+        let cw = 10;
+        let w = 1000;
+        let lens = [name_cols("世"), 1]; // 2, 1
+        assert_eq!(tab_at(lens, cw, 25, w), Some(0)); // inside the wide tab
+        assert_eq!(tab_at(lens, cw, 56, w), Some(1)); // second tab after the gap
     }
 
     /// A three-level tree: root LeftRight( Split(0,1) , Leaf(2) ).
