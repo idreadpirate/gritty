@@ -10,7 +10,7 @@ Tabs, split panes, a command palette, copy/paste that *actually works*, session
 restore, process-aware panes, HiDPI, IME — in a single **sub-800 KB** executable
 with **no GPU, no Electron, no runtime, no WSL.**
 
-`290 tests` · `259 deps` · CPU-rendered · one `gritty.exe` **under 800 KB**
+`300+ tests` · `259 deps` · CPU-rendered · one `gritty.exe` **under 800 KB**
 
 </div>
 

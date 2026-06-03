@@ -11,7 +11,7 @@ through a bounded channel.
    `alacritty_terminal`. gritty owns the multiplexer, renderer, input, and UX.
 3. **Pure logic is testable logic** — geometry, fuzzy matching, key/mouse
    encoding, color/flags, paste sanitization, process-tree walking, and
-   serialization are pure functions with unit tests (174 total); the GUI shell
+   serialization are pure functions with unit tests (300+ total); the GUI shell
    stays thin and wires them together.
 
 ## Module map
@@ -55,6 +55,6 @@ into its surviving child. Rects derive from the tree + window size; each pane's
 grid is sized to its rect.
 
 ## Testing
-`cargo test` (174). The quality gate (`scripts/gate.ps1`) enforces: rustfmt,
+`cargo test` (300+). The quality gate (`scripts/gate.ps1`) enforces: rustfmt,
 clippy `-D warnings`, all tests, release build, and **binary-size + dependency
 budgets** — every change must keep it green.
