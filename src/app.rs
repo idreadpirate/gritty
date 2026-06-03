@@ -3052,6 +3052,45 @@ mod tests {
         assert!(restored <= MAX_RESTORED_PANES);
     }
 
+    #[test]
+    fn restore_budget_rejects_crafted_single_window_pane_bomb() {
+        // RT-26 exploit case: the per-window/per-tab caps pass independently, yet a
+        // single crafted window can encode 64 tabs × 64 leaves = 4096 panes — the
+        // product the finding flags. `restore_windows` sums a window's leaves across
+        // all its tabs into `window_panes` and feeds that aggregate to this seam, so
+        // the bomb must be refused on the FIRST window, from an empty budget.
+        let window_panes = MAX_TABS * MAX_PANES_PER_TAB; // 64 × 64 = 4096
+        assert_eq!(window_panes, 4096);
+        // Sanity: 4096 dwarfs the budget, so it can never be admitted.
+        assert!(window_panes > MAX_RESTORED_PANES);
+        // The fix's core decision: even with nothing restored yet, the bomb window
+        // is over budget and must be rejected. With the guard reverted (no budget /
+        // a predicate that never trips) this is the assertion that flips red.
+        assert!(restored_panes_over_budget(0, window_panes));
+
+        // Drive the actual restore-loop logic — stop at the first over-budget
+        // window — over a crafted multi-window session of these bombs. The total
+        // panes that would be spawned must stay bounded by MAX_RESTORED_PANES (here
+        // the very first window is already over budget, so ZERO panes are admitted),
+        // never the unbounded 16 × 4096 ≈ 64k the finding describes.
+        let crafted = vec![window_panes; MAX_WINDOWS];
+        let mut restored = 0usize;
+        for &wp in &crafted {
+            if restored_panes_over_budget(restored, wp) {
+                break;
+            }
+            restored += wp;
+        }
+        assert!(
+            restored <= MAX_RESTORED_PANES,
+            "crafted pane-bomb session restored {restored} panes, over the {MAX_RESTORED_PANES} budget",
+        );
+        assert_eq!(
+            restored, 0,
+            "a window that alone exceeds budget admits no panes"
+        );
+    }
+
     // --- RT-137 runtime creation caps ----------------------------------------
 
     #[test]
