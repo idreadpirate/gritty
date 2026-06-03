@@ -19,8 +19,10 @@ use crate::proc;
 use crate::session::{Pane, SpawnCfg, Tab};
 use crate::{Dir4, Wake, FRAME, TAB_PALETTE};
 
-/// Default font size in pixels.
-pub(crate) const DEFAULT_FONT_PX: f32 = 18.0;
+/// Default font size in logical pixels (the startup size when no `config.toml`
+/// `font_size` is set). Single source of truth — `config::Config::default()`
+/// reads this. Tune live with `Ctrl +/-/0`.
+pub(crate) const DEFAULT_FONT_PX: f32 = 14.0;
 /// Minimum font size in pixels.
 const MIN_FONT_PX: f32 = 6.0;
 /// Maximum font size in pixels.

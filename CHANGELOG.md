@@ -41,6 +41,8 @@ All notable changes to gritty.
 - **HiDPI / `ScaleFactorChanged` aware** — text scales correctly on 150 %/200 %.
 - **IME / dead-key composition** (CJK & accents).
 - **Broadcast paste** to every pane at once (`Ctrl+Shift+B`).
+- Default font size is now **14 px** (was 18) — tune live with `Ctrl +/-/0` or
+  set `font_size` in `config.toml`.
 - Maximize→restore-down snaps to a centered, comfortably-sized window instead of
   the near-full-screen pre-maximize size.
 

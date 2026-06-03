@@ -15,8 +15,9 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// `font_size = 20.0`) works without listing every key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Rasterisation size for the primary font, in pixels.  Mirrors the
-    /// `FontAtlas::new(18.0)` call in `app.rs`.
+    /// Rasterisation size for the primary font, in logical pixels.  Defaults to
+    /// `app::DEFAULT_FONT_PX` (the single source of truth); tune live via
+    /// `Ctrl +/-/0` or set `font_size` here.
     pub font_size: f32,
 
     /// Lines of scrollback kept per pane.  Mirrors `scrolling_history: 5000`
@@ -40,7 +41,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            font_size: 18.0,
+            font_size: crate::app::DEFAULT_FONT_PX,
             scrollback: 5000,
             shell: None,
             fg: None,
