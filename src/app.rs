@@ -31,6 +31,11 @@ pub(crate) const ZOOM_STEP: f32 = 2.0;
 /// Maximum time between clicks to be counted as a multi-click (ms).
 const MULTI_CLICK_MS: u64 = 500;
 
+/// CA-54: how often to refresh per-pane foreground process names. The poll is a
+/// full process-table snapshot, so it only runs this often and only while a
+/// window is visible.
+const PROC_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
 /// Cap on simultaneously-restored windows (mirrors the per-window tab cap; guards
 /// against a crafted session mass-spawning OS windows). Also the runtime ceiling
 /// on interactively-created OS windows (RT-137).
@@ -97,6 +102,14 @@ pub(crate) struct Win {
     /// mouse-mode app, so a drag reports the right button and motion gating can
     /// distinguish a drag (1002) from a bare hover (1003).
     pub(crate) mouse_button_held: Option<u8>,
+    /// CA-54: whether this window is currently visible (not occluded/minimized).
+    /// Hidden windows skip `redraw` (and gate the global proc poll) so an idle,
+    /// covered app does no per-frame paint work.
+    pub(crate) visible: bool,
+    /// CA-47: whether this OS window currently has keyboard focus. The cursor is
+    /// drawn hollow when the window is unfocused (convention), independent of
+    /// which *pane* is focused inside it.
+    pub(crate) os_focused: bool,
 }
 
 pub(crate) struct Gritty {
@@ -180,6 +193,9 @@ impl Gritty {
             last_click_pos: None,
             last_mouse_cell: None,
             mouse_button_held: None,
+            // CA-54/CA-47: a freshly created window is shown and takes OS focus.
+            visible: true,
+            os_focused: true,
         })
     }
 
@@ -278,13 +294,33 @@ impl Gritty {
             if let Some(tab) = win.tabs.get_mut(active) {
                 for (id, rect) in rects {
                     if let Some(pane) = tab.panes.get_mut(&id) {
-                        let grid = Rect {
-                            x: rect.x,
-                            y: rect.y + th,
-                            w: rect.w,
-                            h: rect.h.saturating_sub(th),
-                        };
-                        pane.resize(grid.w / cw, grid.h / ch);
+                        let (cols, rows) = pane_grid_cells(rect, th, cw, ch);
+                        pane.resize(cols, rows);
+                    }
+                }
+            }
+        }
+    }
+
+    /// CA-140: resize the panes of EVERY tab in window `wi`, not just the active
+    /// one. `WindowEvent::Resized` previously only relaid the active tab, so a
+    /// backgrounded shell kept its stale cols/rows (and received no SIGWINCH-
+    /// equivalent) until the user switched to it — a TUI/pager in a background tab
+    /// stayed wrapped at the old width. Each tab is laid out against the same
+    /// content area using its own split tree.
+    pub(crate) fn relayout_all(&mut self, wi: usize) {
+        let (w, h) = self.win_size(wi);
+        let area = self.content_rect(w, h);
+        let (cw, ch) = (self.font.cell_w.max(1), self.font.cell_h.max(1));
+        let th = self.title_h(wi);
+        if let Some(win) = self.windows.get_mut(wi) {
+            for tab in &mut win.tabs {
+                let mut rects = Vec::new();
+                tab.tree.layout(area, &mut rects);
+                for (id, rect) in rects {
+                    if let Some(pane) = tab.panes.get_mut(&id) {
+                        let (cols, rows) = pane_grid_cells(rect, th, cw, ch);
+                        pane.resize(cols, rows);
                     }
                 }
             }
@@ -463,8 +499,17 @@ impl Gritty {
         let mut dirty = Vec::new();
         for (wi, win) in self.windows.iter_mut().enumerate() {
             let active = win.active;
+            let visible = win.visible;
             let mut win_dirty = false;
             for (ti, tab) in win.tabs.iter_mut().enumerate() {
+                // CA-46: a tab is painted in real time only when it's the active
+                // tab of a visible window. For every other (background/occluded)
+                // tab the BEL would otherwise stay latched and flash belatedly on
+                // the next switch — so consume it here and raise the tab's activity
+                // marker instead. The active visible tab leaves its bell for
+                // `draw_pane_grid` to consume and flash this frame.
+                let painted = bell_painted_live(ti == active, visible);
+                let mut tab_belled = false;
                 for pane in tab.panes.values_mut() {
                     pane.pty.mark_drained();
                     let mut got = false;
@@ -472,9 +517,15 @@ impl Gritty {
                         pane.term.feed(&chunk);
                         got = true;
                     }
+                    if !painted && pane.term.take_bell() {
+                        tab_belled = true;
+                    }
                     if got && ti == active {
                         win_dirty = true;
                     }
+                }
+                if tab_belled {
+                    tab.activity = true;
                 }
             }
             if win_dirty {
@@ -1196,7 +1247,12 @@ impl ApplicationHandler<Wake> for Gritty {
         let dirty = self.drain_pty();
         self.reap_dead(event_loop);
         let mut proc_dirty = false;
-        if self.last_proc_poll.elapsed() >= Duration::from_millis(750) {
+        // CA-54: skip the (full process-table) snapshot entirely when no window is
+        // visible — an occluded/minimized app shows no titles, so polling is pure
+        // wasted work. The timer still advances so the poll resumes promptly once
+        // a window is shown again.
+        let any_visible = self.windows.iter().any(|w| w.visible);
+        if proc_poll_due(self.last_proc_poll.elapsed(), any_visible) {
             proc_dirty = self.update_procs(); // repaint only if a header changed
             self.last_proc_poll = Instant::now();
 
@@ -1230,11 +1286,28 @@ impl ApplicationHandler<Wake> for Gritty {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Windows already past their frame cooldown can paint now.
         for win in &self.windows {
             if win.redraw_pending && win.last_render.elapsed() >= FRAME {
                 win.window.request_redraw();
             }
+        }
+        // CA-114/CA-123: re-arm a wake for any window with a frame pending but
+        // still inside its ~16 ms cooldown. `RedrawRequested` unconditionally
+        // resets control flow to flat `Wait`, dropping the `WaitUntil` that
+        // `schedule_redraw` armed — so during a quiet period such a deferred frame
+        // would stall until the next unrelated event. Re-arming `WaitUntil` to the
+        // soonest remaining cooldown ensures the cooling window still gets its
+        // frame. (Windows already past `FRAME` were just requested above, so this
+        // never re-arms an already-elapsed wait — no busy-spin.)
+        let pending = self
+            .windows
+            .iter()
+            .map(|w| (w.redraw_pending, w.last_render.elapsed()));
+        if let Some(remaining) = next_deferred_wait(pending, FRAME) {
+            let until = Instant::now() + remaining;
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(until));
         }
     }
 
@@ -1281,11 +1354,30 @@ impl ApplicationHandler<Wake> for Gritty {
 
             // Repaint a fresh frame when re-shown or refocused, so alt-tabbing
             // back can't present a stale softbuffer frame.
-            WindowEvent::Focused(true) => {
-                self.focused = wi;
+            WindowEvent::Focused(focused) => {
+                // CA-47: track per-window OS focus so the cursor is drawn hollow
+                // when this window doesn't have keyboard focus.
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.os_focused = focused;
+                }
+                if focused {
+                    self.focused = wi;
+                }
                 self.request_redraw(wi);
             }
-            WindowEvent::Occluded(false) => self.request_redraw(wi),
+            // CA-54: track per-window visibility. A window the OS reports as fully
+            // occluded (covered/minimized) skips `redraw` and gates the proc poll,
+            // so an idle hidden app does no per-frame paint or snapshot work.
+            WindowEvent::Occluded(occluded) => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.visible = !occluded;
+                }
+                if !occluded {
+                    // Re-shown: repaint a fresh frame (alt-tab can't leave a stale
+                    // softbuffer frame on screen).
+                    self.request_redraw(wi);
+                }
+            }
 
             // Pointer left the window: if a tab is being dragged, arm tear-off
             // (belt-and-suspenders with the bounds check in CursorMoved, so the
@@ -1438,7 +1530,10 @@ impl ApplicationHandler<Wake> for Gritty {
             }
 
             WindowEvent::Resized(_) => {
-                self.relayout(wi);
+                // CA-140: push the new geometry to ALL tabs in the window, so a
+                // backgrounded shell gets the resize (SIGWINCH-equivalent) instead
+                // of staying at stale dimensions until it's brought forward.
+                self.relayout_all(wi);
                 self.request_redraw(wi);
             }
 
@@ -1972,6 +2067,56 @@ pub(crate) fn selection_is_copyable(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
+/// CA-140: the `(cols, rows)` a pane occupying `rect` should be sized to, after
+/// reserving `title_h` pixels at the top for the pane's title bar (0 in seamless
+/// mode) and dividing by the cell size. Shared by `relayout` (active tab) and
+/// `relayout_all` (every tab) so a backgrounded tab's panes are sized by the same
+/// math the active tab uses.
+pub(crate) fn pane_grid_cells(rect: Rect, title_h: usize, cw: usize, ch: usize) -> (usize, usize) {
+    let (cw, ch) = (cw.max(1), ch.max(1));
+    let gw = rect.w;
+    let gh = rect.h.saturating_sub(title_h);
+    (gw / cw, gh / ch)
+}
+
+/// CA-46: whether a tab's BEL will be flashed in real time this frame, i.e. its
+/// panes are actually painted now. That happens only for the active tab of a
+/// visible window; every other (background or occluded) tab must instead consume
+/// its bell into a per-tab activity marker so the flash doesn't fire belatedly on
+/// the next switch.
+pub(crate) fn bell_painted_live(is_active_tab: bool, window_visible: bool) -> bool {
+    is_active_tab && window_visible
+}
+
+/// CA-54: whether the foreground-process poll should run this tick. It runs only
+/// when the interval has elapsed AND at least one window is visible — an
+/// occluded/minimized app shows no titles, so a full process-table snapshot is
+/// pure wasted work while hidden.
+pub(crate) fn proc_poll_due(since_last: Duration, any_window_visible: bool) -> bool {
+    any_window_visible && since_last >= PROC_POLL_INTERVAL
+}
+
+/// CA-114/CA-123: the soonest remaining cooldown across all windows that have a
+/// frame pending but are still inside `FRAME` (so they were NOT requested to
+/// repaint this `about_to_wait`). `about_to_wait` re-arms `ControlFlow::WaitUntil`
+/// for this duration so a cooling window's deferred frame isn't dropped when
+/// another window's `RedrawRequested` resets control flow to flat `Wait`.
+///
+/// `windows` yields `(redraw_pending, elapsed_since_last_render)` per window.
+/// Windows already past `FRAME` are excluded — they paint this tick — so this
+/// never re-arms a zero/elapsed wait (which would busy-spin). Returns `None` when
+/// no window needs a deferred wake.
+pub(crate) fn next_deferred_wait(
+    windows: impl IntoIterator<Item = (bool, Duration)>,
+    frame: Duration,
+) -> Option<Duration> {
+    windows
+        .into_iter()
+        .filter(|(pending, elapsed)| *pending && *elapsed < frame)
+        .map(|(_, elapsed)| frame - elapsed)
+        .min()
+}
+
 /// CA-18 / CA-62 / CA-82: classify a click into single/double/triple. A multi-
 /// click requires both a short interval (`elapsed_ms <= MULTI_CLICK_MS`) AND that
 /// the pointer did not move far from the previous press (`!moved_far`); otherwise
@@ -2395,6 +2540,154 @@ mod tests {
     fn new_tab_failure_fatal_only_at_cold_start() {
         assert!(new_tab_failure_is_fatal(false)); // no tab alive → cold start → exit
         assert!(!new_tab_failure_is_fatal(true)); // tabs alive → keep them, non-fatal
+    }
+
+    // --- CA-140 pane grid-cell sizing ----------------------------------------
+
+    #[test]
+    fn pane_grid_cells_reserves_title_then_divides() {
+        // 800x600 rect, 10x20 cells, 20px title reserved: 800/10 = 80 cols,
+        // (600-20)/20 = 29 rows.
+        assert_eq!(
+            pane_grid_cells(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600
+                },
+                20,
+                10,
+                20
+            ),
+            (80, 29)
+        );
+        // Seamless (no title bar) uses the full height: 600/20 = 30 rows.
+        assert_eq!(
+            pane_grid_cells(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600
+                },
+                0,
+                10,
+                20
+            ),
+            (80, 30)
+        );
+    }
+
+    #[test]
+    fn pane_grid_cells_guards_zero_cell_and_tiny_rect() {
+        // Zero cell size is clamped to 1 (never divides by zero).
+        assert_eq!(
+            pane_grid_cells(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                },
+                0,
+                0,
+                0
+            ),
+            (5, 5)
+        );
+        // Title taller than the rect saturates to 0 rows, never underflows.
+        assert_eq!(
+            pane_grid_cells(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 10
+                },
+                20,
+                10,
+                20
+            ),
+            (10, 0)
+        );
+    }
+
+    // --- CA-46 background-tab bell consumption -------------------------------
+
+    #[test]
+    fn bell_flashes_live_only_for_active_visible_tab() {
+        // Only the active tab of a visible window paints its panes this frame, so
+        // only it flashes a bell in real time.
+        assert!(bell_painted_live(true, true));
+        // A background tab (even in a visible window) must redirect its bell to the
+        // activity marker — otherwise it flashes belatedly on the next switch.
+        assert!(!bell_painted_live(false, true));
+        // The active tab of an occluded window isn't painted either, so its bell
+        // also becomes a marker rather than a never-seen flash.
+        assert!(!bell_painted_live(true, false));
+        assert!(!bell_painted_live(false, false));
+    }
+
+    // --- CA-54 visibility-gated proc poll ------------------------------------
+
+    #[test]
+    fn proc_poll_runs_only_when_due_and_a_window_is_visible() {
+        let due = PROC_POLL_INTERVAL;
+        let not_due = PROC_POLL_INTERVAL - Duration::from_millis(1);
+        // Due + a visible window → poll.
+        assert!(proc_poll_due(due, true));
+        assert!(proc_poll_due(due + Duration::from_secs(1), true));
+        // Due but every window hidden → skip (no titles shown; wasted snapshot).
+        assert!(!proc_poll_due(due, false));
+        // Visible but not yet due → skip.
+        assert!(!proc_poll_due(not_due, true));
+        assert!(!proc_poll_due(not_due, false));
+    }
+
+    // --- CA-114/CA-123 deferred-frame re-arm ---------------------------------
+
+    #[test]
+    fn no_deferred_wait_when_no_pending_cooling_window() {
+        // Nothing pending → nothing to re-arm.
+        assert_eq!(next_deferred_wait([], FRAME), None);
+        // Pending but already past FRAME → it paints this tick, not deferred.
+        assert_eq!(
+            next_deferred_wait([(true, FRAME)], FRAME),
+            None,
+            "a window past its cooldown is requested directly, never re-armed"
+        );
+        // Not pending, even though cooling → nothing to wake for.
+        assert_eq!(
+            next_deferred_wait([(false, Duration::from_millis(1))], FRAME),
+            None
+        );
+    }
+
+    #[test]
+    fn deferred_wait_picks_soonest_cooling_window() {
+        // CA-114: window A painted 10 ms ago (6 ms left), window B 2 ms ago
+        // (14 ms left); both pending. The re-armed wake must be the SOONEST (A's
+        // 6 ms) so neither cooling window's frame is dropped.
+        let a = (true, Duration::from_millis(10));
+        let b = (true, Duration::from_millis(2));
+        assert_eq!(
+            next_deferred_wait([a, b], FRAME),
+            Some(FRAME - Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn deferred_wait_ignores_non_pending_and_elapsed_windows() {
+        // A mix: one pending+cooling (re-arm), one pending+elapsed (paints now),
+        // one not-pending. Only the cooling one contributes a deadline.
+        let cooling = (true, Duration::from_millis(4));
+        let elapsed = (true, FRAME + Duration::from_millis(5));
+        let idle = (false, Duration::from_millis(1));
+        assert_eq!(
+            next_deferred_wait([elapsed, cooling, idle], FRAME),
+            Some(FRAME - Duration::from_millis(4))
+        );
     }
 
     // --- RT-8 control-byte predicate -----------------------------------------

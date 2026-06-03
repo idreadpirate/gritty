@@ -36,6 +36,14 @@ impl Gritty {
         win.last_render = std::time::Instant::now();
         win.redraw_pending = false;
 
+        // CA-54: a window the OS reports as occluded/minimized is not on screen,
+        // so skip the whole paint (full-buffer blit + per-cell render). Bookkeeping
+        // was cleared above, so this won't busy-spin `about_to_wait`; the next
+        // `Occluded(false)` re-shows and requests a fresh frame.
+        if !win.visible {
+            return;
+        }
+
         // w/h are clamped to >=1 by win_size(), but construct defensively so a
         // future refactor can't turn this into a panic (CA-14).
         let nz_w = NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN);
@@ -53,7 +61,18 @@ impl Gritty {
         let (cw, ch) = (font.cell_w, font.cell_h);
         let active = win.active;
         let seamless = win.seamless;
+        // CA-47: when the OS window is unfocused, the cursor is drawn hollow even
+        // in the focused pane (convention), independent of intra-window focus.
+        let os_focused = win.os_focused;
         let th = if seamless { 0 } else { ch };
+
+        // CA-46: the active tab is being viewed now, so clear its background-
+        // activity marker. (BELs in the active tab's visible panes flash in real
+        // time below; only background tabs accumulate the marker, set in
+        // `drain_pty`.)
+        if let Some(tab) = win.tabs.get_mut(active) {
+            tab.activity = false;
+        }
 
         // Tab bar.
         fill_rect(
@@ -70,8 +89,13 @@ impl Gritty {
         let mut tx = 0usize;
         for (i, tab) in win.tabs.iter().enumerate() {
             // CA-25: prefix active tab with a glyph marker (not color alone).
+            // CA-46: a background tab with output/bell activity since last viewed
+            // gets a `•` marker in the same leading-pad cell, so it doesn't shift
+            // the tab geometry the hit-tests depend on.
             let label = if i == active {
                 format!(" ▸{} ", tab.name)
+            } else if tab.activity {
+                format!("•{} ", tab.name)
             } else {
                 format!(" {} ", tab.name)
             };
@@ -272,7 +296,16 @@ impl Gritty {
                 h: rect.h.saturating_sub(th),
             };
             if let Some(pane) = win.tabs.get(active).and_then(|t| t.panes.get(&id)) {
-                draw_pane_grid(&mut buffer, stride, font, pane, grid, is_focus, accent);
+                draw_pane_grid(
+                    &mut buffer,
+                    stride,
+                    font,
+                    pane,
+                    grid,
+                    is_focus,
+                    os_focused,
+                    accent,
+                );
             }
 
             // Focused pane gets the accent glow border; unfocused panes get a
@@ -523,6 +556,7 @@ pub(crate) fn draw_pane_grid(
     pane: &session::Pane,
     grid: Rect,
     is_focus: bool,
+    window_focused: bool,
     accent: u32,
 ) {
     let (cw, ch) = (font.cell_w, font.cell_h);
@@ -531,7 +565,10 @@ pub(crate) fn draw_pane_grid(
     let at_bottom = content.display_offset == 0;
     let cursor_shape = content.cursor.shape;
     let cursor_hidden = cursor_shape == CursorShape::Hidden;
-    // Focused pane: block cursor inverts cell; unfocused: hollow outline drawn after grid.
+    // Focused pane in a focused window: block cursor inverts the cell. Otherwise
+    // (unfocused pane, OR an unfocused OS window — CA-47) the cursor is drawn as a
+    // hollow outline after the grid.
+    let cursor_solid = cursor_is_solid(is_focus, window_focused);
     let cursor_active = at_bottom && !cursor_hidden;
     let cur_row = content.cursor.point.line.0;
     let cur_col = content.cursor.point.column.0 as i32;
@@ -561,7 +598,7 @@ pub(crate) fn draw_pane_grid(
         if selection.is_some_and(|r| r.contains(item.point)) {
             bg = SELECTION_BG;
             fill_bg = true;
-        } else if is_focus
+        } else if cursor_solid
             && cursor_active
             && line == cur_row
             && col as i32 == cur_col
@@ -683,7 +720,7 @@ pub(crate) fn draw_pane_grid(
     if cursor_active && cur_row >= 0 && cur_col >= 0 {
         let cur_px = grid.x + cur_col as usize * cw;
         let cur_py = grid.y + cur_row as usize * ch;
-        if is_focus {
+        if cursor_solid {
             match cursor_shape {
                 CursorShape::Underline => {
                     // 2px bar at the bottom of the cell.
@@ -731,6 +768,14 @@ pub(crate) fn draw_pane_grid(
             );
         }
     }
+}
+
+/// CA-17/CA-47: whether the text cursor is drawn solid (filled block / accent
+/// beam / underline) rather than as a hollow outline. Solid only when this pane
+/// is the focused pane AND its OS window currently has keyboard focus; an
+/// unfocused pane or an unfocused window both hollow the cursor.
+pub(crate) fn cursor_is_solid(pane_focused: bool, window_focused: bool) -> bool {
+    pane_focused && window_focused
 }
 
 /// Buffer height in pixels (stride must be > 0).
@@ -820,5 +865,19 @@ mod tests {
                 "thumb must not exceed track: top={top} h={h}"
             );
         }
+    }
+
+    // --- CA-47 cursor hollows when the OS window is unfocused -----------------
+
+    #[test]
+    fn cursor_solid_only_when_pane_and_window_focused() {
+        // The filled block / accent beam only when this is the focused pane AND
+        // the OS window has keyboard focus.
+        assert!(cursor_is_solid(true, true));
+        // CA-47: a focused pane in an UNFOCUSED window draws a hollow cursor.
+        assert!(!cursor_is_solid(true, false));
+        // An unfocused pane is always hollow (pre-existing CA-17 behaviour).
+        assert!(!cursor_is_solid(false, true));
+        assert!(!cursor_is_solid(false, false));
     }
 }

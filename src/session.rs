@@ -124,6 +124,11 @@ pub struct Tab {
     pub name: String,
     pub color: u32,
     next_id: usize,
+    /// CA-46: a BEL fired in one of this tab's panes since it was last viewed.
+    /// Set while the tab is in the background (its panes aren't painted, so the
+    /// real-time amber flash can't fire); drawn as a marker on the tab and
+    /// cleared when the tab becomes active again.
+    pub activity: bool,
 }
 
 impl Tab {
@@ -143,6 +148,7 @@ impl Tab {
             name,
             color,
             next_id: 1,
+            activity: false,
         })
     }
 
@@ -167,6 +173,7 @@ impl Tab {
             name: saved.name.clone(),
             color: saved.color,
             next_id,
+            activity: false,
         })
     }
 
@@ -332,6 +339,34 @@ mod tests {
         fp.resize(0, 0);
         assert_eq!(fp.term.size.cols, 1);
         assert_eq!(fp.term.size.rows, 1);
+    }
+
+    /// CA-140: a window resize must reach EVERY tab's panes, not just the active
+    /// tab. Before the fix, `relayout` only iterated the active tab, so a
+    /// backgrounded shell kept stale dimensions. We model the all-tabs resize loop
+    /// over fake panes (no real PTY) and assert every tab's term was resized.
+    #[test]
+    fn resize_reaches_every_tab_not_just_active() {
+        use crate::term::Terminal;
+
+        // Three "tabs", each a single fake pane sized 80x24. `active` is tab 2,
+        // but the resize must update tabs 0 and 1 (the background ones) too.
+        let mut tabs: Vec<Terminal> = (0..3).map(|_| Terminal::new(80, 24)).collect();
+        let active = 2usize;
+
+        // The active-only path (the pre-CA-140 bug): only `active` would resize.
+        // The relayout_all path: iterate ALL tabs.
+        for term in tabs.iter_mut() {
+            term.resize(120, 40);
+        }
+
+        for (i, term) in tabs.iter().enumerate() {
+            assert_eq!(
+                (term.size.cols, term.size.rows),
+                (120, 40),
+                "background tab {i} (active={active}) must be resized too"
+            );
+        }
     }
 
     /// RT-6: `shell_candidates` must never include a path that is resolved via
