@@ -3216,6 +3216,59 @@ mod tests {
         assert_eq!(active_after_tab_removed(0, 0, 0), 0);
     }
 
+    #[test]
+    fn reap_keeps_the_viewed_tab_visible_and_index_in_range() {
+        // RT-73 exploit invariant, pinned by modelling the actual reap mutation
+        // `reap_dead` performs: tabs are distinct labels, `active` names the tab
+        // the user is *looking at*, then the tab at `removed` is reaped. The fix's
+        // whole job is that `win.active` keeps naming the SAME surviving tab and
+        // never points off the end. We check that property across every
+        // (tabs, active, removed) the loop can hit — so a revert to the buggy
+        // "never touch active" no-op, a clamp-only patch that forgets the
+        // decrement, or any off-by-one all turn this test red.
+        for ntabs in 1usize..=6 {
+            let labels: Vec<char> = ('A'..).take(ntabs).collect();
+            for active in 0..ntabs {
+                let viewed = labels[active]; // the tab the user is on
+                for removed in 0..ntabs {
+                    let mut survivors = labels.clone();
+                    survivors.remove(removed); // exactly what reap_dead does
+                    let new_active = active_after_tab_removed(active, removed, survivors.len());
+
+                    if survivors.is_empty() {
+                        // Reaping the only tab empties the window; index clamps to 0
+                        // and `reap_dead` drops the window — nothing to keep visible.
+                        assert_eq!(new_active, 0);
+                        continue;
+                    }
+
+                    // Core guarantee #1: never names a missing/out-of-range tab.
+                    assert!(
+                        new_active < survivors.len(),
+                        "OOB active {new_active} for survivors {survivors:?} \
+                         (ntabs={ntabs}, active={active}, removed={removed})",
+                    );
+
+                    if removed == active {
+                        // The viewed tab itself was reaped: it can't survive, but
+                        // the index must still be valid (asserted above).
+                        continue;
+                    }
+
+                    // Core guarantee #2 (the RT-73 boundary): reaping any *other*
+                    // tab — especially one BELOW the active one — must leave the
+                    // very same tab on screen, not shift the view to a neighbour.
+                    assert_eq!(
+                        survivors[new_active], viewed,
+                        "reap shifted the view off tab {viewed}: survivors \
+                         {survivors:?}, new_active {new_active} \
+                         (active={active}, removed={removed})",
+                    );
+                }
+            }
+        }
+    }
+
     // --- CA-110 reaping frozen during a tab tear-off drag --------------------
 
     #[test]
