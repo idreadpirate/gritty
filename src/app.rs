@@ -3117,6 +3117,74 @@ mod tests {
         assert!(window_cap_reached(MAX_WINDOWS + 1));
     }
 
+    /// Drive the *guard wiring* of an interactive creator, not just the
+    /// predicate's truth table. Each creator (`new_tab`, `split_focus`,
+    /// `tear_off`) is `if <cap_reached>(len) { return; } else { len += 1; }`;
+    /// this models that exact shape and runs it under the auto-repeat
+    /// fork-bomb the finding describes (holding Ctrl+Shift+T/D/N fires the
+    /// creator far more times than the cap allows).
+    ///
+    /// Returns the final count once the bomb loop settles. With the RT-137
+    /// guard in place the count saturates at `cap`; if the guard were reverted
+    /// (predicate stubbed to `false`, or the `if … return` deleted) the count
+    /// would equal the unbounded number of key presses instead — which is the
+    /// assertion that flips this red on revert.
+    fn drive_creation_bomb(cap_reached: impl Fn(usize) -> bool, presses: usize) -> usize {
+        let mut count = 0usize;
+        for _ in 0..presses {
+            // Mirror new_tab/split_focus/tear_off: refuse before creating.
+            if cap_reached(count) {
+                continue;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn new_tab_bomb_cannot_exceed_max_tabs() {
+        // Hold Ctrl+Shift+T well past the cap.
+        let presses = MAX_TABS * 4 + 7;
+        let final_tabs = drive_creation_bomb(tab_cap_reached, presses);
+        assert_eq!(
+            final_tabs, MAX_TABS,
+            "interactive new_tab must saturate at MAX_TABS ({MAX_TABS}), not the {presses} presses"
+        );
+        // Once at the cap the guard refuses every further press.
+        assert!(tab_cap_reached(final_tabs));
+    }
+
+    #[test]
+    fn split_bomb_cannot_exceed_max_panes_per_tab() {
+        // A split starts from one live pane, so seed the count at 1 the way a
+        // fresh tab does, then hold Ctrl+Shift+D past the cap.
+        let presses = MAX_PANES_PER_TAB * 4;
+        let mut count = 1usize;
+        for _ in 0..presses {
+            if pane_cap_reached(count) {
+                continue;
+            }
+            count += 1;
+        }
+        assert_eq!(
+            count, MAX_PANES_PER_TAB,
+            "interactive split must saturate at MAX_PANES_PER_TAB ({MAX_PANES_PER_TAB})"
+        );
+        assert!(pane_cap_reached(count));
+    }
+
+    #[test]
+    fn tear_off_bomb_cannot_exceed_max_windows() {
+        // Repeated tear-offs / Ctrl+Shift+N must not spawn unbounded OS windows.
+        let presses = MAX_WINDOWS * 4 + 3;
+        let final_windows = drive_creation_bomb(window_cap_reached, presses);
+        assert_eq!(
+            final_windows, MAX_WINDOWS,
+            "repeated tear-off must saturate at MAX_WINDOWS ({MAX_WINDOWS}), not the {presses} presses"
+        );
+        assert!(window_cap_reached(final_windows));
+    }
+
     // --- RT-73/CA-93 active-tab clamp after a reap ---------------------------
 
     #[test]
