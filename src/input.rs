@@ -108,8 +108,14 @@ impl Gritty {
             return;
         }
 
-        // Command palette swallows input while open.
+        // Command palette swallows input while open. Ctrl+Shift+P toggles it shut
+        // (so the open shortcut closes it, rather than typing 'p' into the query).
         if self.windows[wi].palette.is_some() {
+            if ctrl && shift && matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("p")) {
+                self.windows[wi].palette = None;
+                self.request_redraw(wi);
+                return;
+            }
             self.handle_palette_key(event_loop, key);
             return;
         }

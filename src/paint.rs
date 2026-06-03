@@ -606,6 +606,13 @@ pub(crate) fn draw_pane_grid(
     let cur_row = content.cursor.point.line.0;
     let cur_col = content.cursor.point.column.0 as i32;
 
+    // Fill the grid rect with the terminal background before drawing cells.
+    // Without this, cells with the default background color are drawn
+    // transparently, letting the decorative glow show through — which creates
+    // a visible colour mismatch and a "blocked" appearance, especially in
+    // multi-pane layouts where panes sit away from the glow's centre.
+    fill_rect(buffer, stride, grid, color::bg());
+
     for item in content.display_iter {
         let line = item.point.line.0;
         if line < 0 {

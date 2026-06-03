@@ -547,13 +547,19 @@ impl Gritty {
         // CA-50: a pane running a live non-shell foreground process (an editor, a
         // build, an SSH session) is killed on close — confirm first so a stray
         // Ctrl+Shift+W can't silently drop unsaved work.
-        if close_needs_confirm(&self.focused_proc_name(wi))
-            && !confirm_dialog(&format!(
+        if close_needs_confirm(&self.focused_proc_name(wi)) {
+            let msg = format!(
                 "A program (\"{}\") is still running in this pane.\n\nClose it anyway?",
                 self.focused_proc_name(wi).trim()
-            ))
-        {
-            return;
+            );
+            let confirmed = self
+                .windows
+                .get(wi)
+                .map(|w| confirm_dialog(&w.window, &msg))
+                .unwrap_or(true);
+            if !confirmed {
+                return;
+            }
         }
         let win_empty = {
             let Some(win) = self.windows.get_mut(wi) else {
@@ -617,13 +623,19 @@ impl Gritty {
             .and_then(|t| t.panes.get(&t.focus))
             .map(|p| p.proc_name.clone())
             .unwrap_or_default();
-        if close_needs_confirm(&tab_proc)
-            && !confirm_dialog(&format!(
+        if close_needs_confirm(&tab_proc) {
+            let msg = format!(
                 "A program (\"{}\") is still running in this tab.\n\nClose it anyway?",
                 tab_proc.trim()
-            ))
-        {
-            return;
+            );
+            let confirmed = self
+                .windows
+                .get(wi)
+                .map(|w| confirm_dialog(&w.window, &msg))
+                .unwrap_or(true);
+            if !confirmed {
+                return;
+            }
         }
         let win_empty = {
             let Some(win) = self.windows.get_mut(wi) else {
@@ -1626,10 +1638,16 @@ impl ApplicationHandler<Wake> for Gritty {
                 // runs a live non-shell program, confirm before tearing the whole
                 // window down.
                 if let Some(name) = self.window_live_program(wi) {
-                    if !confirm_dialog(&format!(
+                    let msg = format!(
                         "A program (\"{}\") is still running in this window.\n\nClose it anyway?",
                         name.trim()
-                    )) {
+                    );
+                    let confirmed = self
+                        .windows
+                        .get(wi)
+                        .map(|w| confirm_dialog(&w.window, &msg))
+                        .unwrap_or(true);
+                    if !confirmed {
                         return;
                     }
                 }
@@ -1908,6 +1926,51 @@ impl ApplicationHandler<Wake> for Gritty {
 }
 
 impl Gritty {
+    /// Handle a left-click while the command palette is open: run the clicked
+    /// command row, keep it open on the query line, or dismiss it on an outside
+    /// click. Without this the palette ignored the mouse entirely — clicking an
+    /// entry did nothing and the palette stayed stuck open, swallowing later
+    /// input (it looked frozen, and Ctrl+Shift+P just typed into the query).
+    fn palette_click(&mut self, wi: usize, px: f64, py: f64, event_loop: &ActiveEventLoop) {
+        let (cw, ch) = (self.font.cell_w.max(1), self.font.cell_h.max(1));
+        let (stride, _) = self.win_size(wi);
+        // Recompute the panel geometry exactly as paint.rs lays it out.
+        let matches = match self.windows.get(wi).and_then(|w| w.palette.as_ref()) {
+            Some(p) => p.matches(),
+            None => return,
+        };
+        let shown = matches.len().min(8);
+        let box_w = (stride * 2 / 3).max(40 * cw).min(stride.saturating_sub(cw));
+        let box_h = (shown + 1) * ch + ch / 2;
+        let bx = stride.saturating_sub(box_w) / 2;
+        let by = ch * 2;
+        match palette_hit(
+            px.max(0.0) as usize,
+            py.max(0.0) as usize,
+            bx,
+            by,
+            box_w,
+            box_h,
+            ch,
+            shown,
+        ) {
+            PaletteHit::Row(i) => {
+                let cmd = matches[i].1;
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.palette = None;
+                }
+                self.run_cmd(cmd, event_loop);
+            }
+            PaletteHit::Outside => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.palette = None;
+                }
+            }
+            PaletteHit::Chrome => {}
+        }
+        self.request_redraw(wi);
+    }
+
     pub(crate) fn begin_selection(&mut self, wi: usize, event_loop: &ActiveEventLoop) {
         // Clear any stale tab-drag from a previous press whose release we never
         // saw (e.g. released over another window with no pointer capture).
@@ -1919,6 +1982,27 @@ impl Gritty {
             .get(wi)
             .map(|w| w.mouse_pos)
             .unwrap_or((0.0, 0.0));
+
+        // A click while a modal overlay is open belongs to that overlay, not a
+        // pane selection behind it: the palette runs the clicked row / dismisses
+        // on an outside click; an open rename is cancelled by a click. Without
+        // this, clicking a palette entry did nothing and left it stuck open.
+        if self
+            .windows
+            .get(wi)
+            .and_then(|w| w.palette.as_ref())
+            .is_some()
+        {
+            self.palette_click(wi, x, y, event_loop);
+            return;
+        }
+        if self.windows.get(wi).is_some_and(|w| w.rename.is_some()) {
+            if let Some(win) = self.windows.get_mut(wi) {
+                win.rename = None;
+            }
+            self.request_redraw(wi);
+            return;
+        }
 
         // CA-33: Ctrl+Click on a hyperlink cell — open it in the OS handler.
         if self.mods.control_key() {
@@ -2164,11 +2248,24 @@ pub(crate) fn show_error_dialog(message: &str) {
 /// proceed. A native Yes/No MessageBox on Windows; off-Windows there is no
 /// modal UI, so we proceed (the close paths there are test/dev only).
 #[cfg(windows)]
-pub(crate) fn confirm_dialog(message: &str) -> bool {
+pub(crate) fn confirm_dialog(owner: &Window, message: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO,
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    // Own the box to the gritty window so it's modal *to that window* and drawn
+    // in front. A null-owner box can land behind/off-screen yet still block the
+    // UI thread in its own message pump — the close then looks frozen and the
+    // window can't be dismissed. TOPMOST + SETFOREGROUND make sure it surfaces.
+    let owner_hwnd = owner
+        .window_handle()
+        .ok()
+        .and_then(|h| match h.as_raw() {
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut core::ffi::c_void),
+            _ => None,
+        })
+        .unwrap_or_default();
     let title: Vec<u16> = "Gritty — Confirm close"
         .encode_utf16()
         .chain(std::iter::once(0u16))
@@ -2177,21 +2274,21 @@ pub(crate) fn confirm_dialog(message: &str) -> bool {
         .encode_utf16()
         .chain(std::iter::once(0u16))
         .collect();
-    // SAFETY: both pointers are valid null-terminated UTF-16 buffers; a null
-    // owner is valid for an app-modal box.
+    // SAFETY: both string pointers are valid null-terminated UTF-16 buffers;
+    // owner_hwnd is a live window handle or null (both valid for MessageBoxW).
     let ret = unsafe {
         MessageBoxW(
-            std::ptr::null_mut(),
+            owner_hwnd,
             body.as_ptr(),
             title.as_ptr(),
-            MB_YESNO | MB_ICONWARNING,
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
         )
     };
     ret == IDYES
 }
 
 #[cfg(not(windows))]
-pub(crate) fn confirm_dialog(_message: &str) -> bool {
+pub(crate) fn confirm_dialog(_owner: &Window, _message: &str) -> bool {
     true
 }
 
@@ -2627,10 +2724,46 @@ pub(crate) fn pane_grid_cells(rect: Rect, title_h: usize, cw: usize, ch: usize) 
     (gw / cw, gh / ch)
 }
 
-/// On a maximize→restore-down click, resize the window to a comfortable fraction
-/// of its current monitor and center it there, so "restore" yields a usable,
-/// movable window instead of the near-full-screen pre-maximize size. Monitor-
-/// relative (not a fixed pixel size) so it stays sensible on any display/DPI.
+/// Where a left-click landed on the open command-palette overlay. Geometry
+/// mirrors the renderer in `paint.rs`: `Row(i)` is the i-th visible match,
+/// `Chrome` is the query line / inner padding, `Outside` dismisses. Pure so the
+/// click→row mapping is unit-tested without a window.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PaletteHit {
+    Outside,
+    Chrome,
+    Row(usize),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn palette_hit(
+    px: usize,
+    py: usize,
+    bx: usize,
+    by: usize,
+    box_w: usize,
+    box_h: usize,
+    ch: usize,
+    shown: usize,
+) -> PaletteHit {
+    if px < bx || px >= bx + box_w || py < by || py >= by + box_h {
+        return PaletteHit::Outside;
+    }
+    // Rows start a query-line + half-line below the panel top, each `ch` tall
+    // (paint.rs: iy = by + ch + ch/2 + i*ch).
+    let rows_top = by + ch + ch / 2;
+    if py >= rows_top {
+        let i = (py - rows_top) / ch.max(1);
+        if i < shown {
+            return PaletteHit::Row(i);
+        }
+    }
+    PaletteHit::Chrome
+}
+
+/// On a maximize→restore-down click, resize the window to a fixed, much-smaller
+/// size (clamped to fit the monitor) and center it, so "restore" yields a usable
+/// movable window instead of the near-full-screen pre-maximize size.
 fn snap_restored_window(window: &Window) {
     let Some(mon) = window.current_monitor() else {
         return;
@@ -2639,8 +2772,13 @@ fn snap_restored_window(window: &Window) {
     if ms.width == 0 || ms.height == 0 {
         return;
     }
-    let w = (ms.width as f64 * 0.62).round() as u32;
-    let h = (ms.height as f64 * 0.68).round() as u32;
+    // Fixed, much-smaller-than-full restore size, clamped to always fit the
+    // monitor (≤90% each axis). Tune these two constants to taste — e.g. swap to
+    // a landscape size if you prefer wide over tall.
+    const RESTORE_W: u32 = 900;
+    const RESTORE_H: u32 = 1300;
+    let w = RESTORE_W.min(ms.width * 9 / 10).max(1);
+    let h = RESTORE_H.min(ms.height * 9 / 10).max(1);
     let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
     // Center: monitor origin + half the leftover margin on each axis.
     let mp = mon.position();
@@ -2702,6 +2840,53 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_hit_maps_click_to_row_chrome_or_outside() {
+        // Panel at (bx=100, by=20), 200x100, cell height 10, 4 visible rows.
+        // Rows start at by + ch + ch/2 = 35, each `ch`=10 tall (mirrors paint.rs).
+        let (bx, by, bw, bh, ch, shown) = (100usize, 20, 200, 100, 10, 4);
+        // Off the panel on each side → Outside (dismiss).
+        assert_eq!(
+            palette_hit(99, 50, bx, by, bw, bh, ch, shown),
+            PaletteHit::Outside
+        );
+        assert_eq!(
+            palette_hit(300, 50, bx, by, bw, bh, ch, shown),
+            PaletteHit::Outside
+        );
+        assert_eq!(
+            palette_hit(150, 19, bx, by, bw, bh, ch, shown),
+            PaletteHit::Outside
+        );
+        assert_eq!(
+            palette_hit(150, 120, bx, by, bw, bh, ch, shown),
+            PaletteHit::Outside
+        );
+        // Query line / padding above the first row → Chrome (keep open).
+        assert_eq!(
+            palette_hit(150, 25, bx, by, bw, bh, ch, shown),
+            PaletteHit::Chrome
+        );
+        // Rows: y∈[35,45)→0, y∈[55,65)→2.
+        assert_eq!(
+            palette_hit(150, 35, bx, by, bw, bh, ch, shown),
+            PaletteHit::Row(0)
+        );
+        assert_eq!(
+            palette_hit(150, 44, bx, by, bw, bh, ch, shown),
+            PaletteHit::Row(0)
+        );
+        assert_eq!(
+            palette_hit(150, 57, bx, by, bw, bh, ch, shown),
+            PaletteHit::Row(2)
+        );
+        // Inside the panel but below the last visible row → Chrome, not a phantom row.
+        assert_eq!(
+            palette_hit(150, 90, bx, by, bw, bh, ch, shown),
+            PaletteHit::Chrome
+        );
+    }
 
     // --- CA-37 config wiring -------------------------------------------------
 
