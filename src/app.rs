@@ -120,8 +120,16 @@ pub(crate) struct Gritty {
     pub(crate) windows: Vec<Win>,
     pub(crate) focused: usize,
     pub(crate) font: FontAtlas,
-    /// Current font size in pixels (CA-12 zoom). Shared across windows.
+    /// Current font size in *logical* pixels (CA-12 zoom). Shared across windows.
+    /// The atlas is rasterized at `font_px * scale` so glyphs stay crisp on
+    /// HiDPI displays (CA-35).
     pub(crate) font_px: f32,
+    /// CA-35: the display scale factor the atlas is currently built for (the
+    /// focused window's `scale_factor()`; 1.0 on a 100% display). softbuffer
+    /// surfaces and `inner_size()` are in physical pixels, so the atlas must be
+    /// rasterized at `font_px * scale` or text renders at ~`1/scale` of its cell
+    /// on a 150%/200% monitor.
+    pub(crate) scale: f64,
     pub(crate) clip: Clip,
     pub(crate) mods: winit::keyboard::ModifiersState,
     pub(crate) last_proc_poll: Instant,
@@ -141,11 +149,16 @@ impl Gritty {
             cfg.fg, cfg.bg, cfg.accent,
         ));
         let font_px = sanitize_font_px(cfg.font_size);
+        // CA-35: no window exists yet, so we can't read a real scale factor here.
+        // Start at 1.0 (logical == physical); `resumed()` reads the first window's
+        // `scale_factor()` and rebuilds the atlas before the first frame.
+        let scale = 1.0;
         Self {
             windows: Vec::new(),
             focused: 0,
-            font: FontAtlas::new(font_px),
+            font: FontAtlas::new(atlas_px(font_px, scale)),
             font_px,
+            scale,
             clip: Clip::new(),
             mods: winit::keyboard::ModifiersState::empty(),
             last_proc_poll: Instant::now() - Duration::from_secs(5),
@@ -1088,7 +1101,8 @@ impl Gritty {
         (Point::new(Line(row), Column(col)), side)
     }
 
-    /// CA-12: Rebuild the font atlas at `new_px`, relayout all windows, redraw.
+    /// CA-12: Rebuild the font atlas at `new_px` (logical), relayout all windows,
+    /// redraw. The atlas is rasterized at the DPI-scaled size (CA-35).
     pub(crate) fn apply_font_zoom(&mut self, new_px: f32) {
         let px = new_px.clamp(MIN_FONT_PX, MAX_FONT_PX);
         if (px - self.font_px).abs() < f32::EPSILON {
@@ -1097,9 +1111,31 @@ impl Gritty {
         self.font_px = px;
         // CA-103: re-derive metrics at the new size in place — keep the parsed
         // font face, don't re-read + re-parse the TTF from disk on every zoom key.
-        self.font.set_px(px);
+        // CA-35: rasterize at the physical (scaled) size so zoom stays crisp on
+        // HiDPI displays.
+        self.font.set_px(atlas_px(self.font_px, self.scale));
         for wi in 0..self.windows.len() {
             self.relayout(wi);
+            self.request_redraw(wi);
+        }
+    }
+
+    /// CA-35: adopt a new display `scale_factor` (read in `resumed()` and on
+    /// `WindowEvent::ScaleFactorChanged`). softbuffer surfaces / `inner_size()`
+    /// are physical pixels, so the atlas must be rebuilt at `font_px * scale` and
+    /// every window relaid out against the re-derived cell metrics — otherwise on
+    /// a 150%/200% monitor text renders at ~`1/scale` of its cell. A no-op when
+    /// the (sanitized) scale is unchanged, so a redundant event costs nothing.
+    pub(crate) fn apply_scale(&mut self, scale: f64) {
+        let scale = sanitize_scale(scale);
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        // Reuse the parsed face (CA-103); only the px-specific metrics/glyphs change.
+        self.font.set_px(atlas_px(self.font_px, self.scale));
+        for wi in 0..self.windows.len() {
+            self.relayout_all(wi);
             self.request_redraw(wi);
         }
     }
@@ -1355,6 +1391,14 @@ impl ApplicationHandler<Wake> for Gritty {
             }
         }
         self.focused = 0;
+        // CA-35: read the (focused) window's real DPI scale now that a window
+        // exists, and rebuild the atlas at the physical size before the first
+        // frame — otherwise the cold-start atlas stays at the logical 1.0 size and
+        // text renders tiny on a HiDPI monitor.
+        if let Some(win) = self.windows.first() {
+            let scale = win.window.scale_factor();
+            self.apply_scale(scale);
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
@@ -1644,6 +1688,15 @@ impl ApplicationHandler<Wake> for Gritty {
                         self.request_redraw(wi);
                     }
                 }
+            }
+
+            // CA-35: the window moved to a display with a different DPI (or the
+            // user changed the scale in Control Panel). Rebuild the atlas at the
+            // new physical size and relayout — `apply_scale` no-ops if unchanged.
+            // winit resizes the surface to the OS-suggested inner size by default;
+            // the follow-up `Resized` relays out again, which is harmless.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.apply_scale(scale_factor);
             }
 
             WindowEvent::Resized(_) => {
@@ -2116,6 +2169,28 @@ pub(crate) fn sanitize_font_px(px: f32) -> f32 {
     }
 }
 
+/// CA-35: sanitize a display `scale_factor` into a sane multiplier. A
+/// non-finite or absurd value (a misbehaving driver / virtual display) is
+/// rejected back to 1.0, and a real factor is clamped to `[0.5, 8.0]` so the
+/// derived atlas size can never be zero or astronomically large.
+pub(crate) fn sanitize_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.clamp(0.5, 8.0)
+    } else {
+        1.0
+    }
+}
+
+/// CA-35: the *physical* pixel size to rasterize the atlas at for a `font_px`
+/// logical size on a display of the given `scale`. softbuffer surfaces are
+/// physical pixels, so this is what keeps text the right size on HiDPI. The
+/// result is floored at `MIN_FONT_PX` so a tiny logical size on a sub-1.0 scale
+/// can't produce a degenerate (zero-metric) atlas.
+pub(crate) fn atlas_px(font_px: f32, scale: f64) -> f32 {
+    let px = font_px * sanitize_scale(scale) as f32;
+    px.max(MIN_FONT_PX)
+}
+
 /// CA-39: the OS window caption for a focused pane whose program announced
 /// `osc_title` via OSC 0/2. An empty title (none set, or after `ResetTitle`)
 /// shows the bare app name; otherwise it's `gritty — <title>`. Pure so the
@@ -2299,6 +2374,44 @@ mod tests {
         assert_eq!(sanitize_font_px(10_000.0), DEFAULT_FONT_PX);
         assert_eq!(sanitize_font_px(f32::NAN), DEFAULT_FONT_PX);
         assert_eq!(sanitize_font_px(f32::INFINITY), DEFAULT_FONT_PX);
+    }
+
+    // --- CA-35 HiDPI atlas sizing --------------------------------------------
+
+    #[test]
+    fn sanitize_scale_clamps_and_rejects_garbage() {
+        // A normal display scale passes through unchanged.
+        assert_eq!(sanitize_scale(1.0), 1.0);
+        assert_eq!(sanitize_scale(1.5), 1.5);
+        assert_eq!(sanitize_scale(2.0), 2.0);
+        // Out-of-range factors clamp into [0.5, 8.0].
+        assert_eq!(sanitize_scale(0.1), 0.5);
+        assert_eq!(sanitize_scale(100.0), 8.0);
+        // Non-finite / non-positive (a misbehaving driver) falls back to 1.0.
+        assert_eq!(sanitize_scale(0.0), 1.0);
+        assert_eq!(sanitize_scale(-2.0), 1.0);
+        assert_eq!(sanitize_scale(f64::NAN), 1.0);
+        assert_eq!(sanitize_scale(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn atlas_px_scales_logical_font_by_dpi() {
+        // The whole CA-35 fix in one assertion: an 18px logical font on a 200%
+        // display must rasterize at 36 physical px (not stay at 18, which renders
+        // text at half its cell). 100% is the identity.
+        assert_eq!(atlas_px(18.0, 1.0), 18.0);
+        assert_eq!(atlas_px(18.0, 2.0), 36.0);
+        assert_eq!(atlas_px(18.0, 1.5), 27.0);
+        // A garbage scale is sanitized to 1.0, so the logical size survives.
+        assert_eq!(atlas_px(18.0, f64::NAN), 18.0);
+    }
+
+    #[test]
+    fn atlas_px_never_below_min_font() {
+        // A small logical size on a sub-1.0 scale must not produce a degenerate
+        // (zero-metric) atlas; it floors at MIN_FONT_PX.
+        assert_eq!(atlas_px(MIN_FONT_PX, 0.5), MIN_FONT_PX);
+        assert!(atlas_px(6.0, 0.5) >= MIN_FONT_PX);
     }
 
     // --- CA-39 OSC 0/2 window caption ----------------------------------------
