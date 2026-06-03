@@ -35,7 +35,7 @@ All notable changes to gritty.
   caps; atomic session writes; crash-log panic hook; keyboard/active-tab index
   desync on reap; mouse-protocol fidelity (legacy form, motion gating,
   right/middle buttons, Shift-to-bypass); HiDPI; IME; `config.toml` actually
-  applied; window title from OSC 0/2; dirty-rect-aware repaint; CJK-width tabs.
+  applied; window title from OSC 0/2; CJK-width tabs.
 
 ### Window & input
 - **HiDPI / `ScaleFactorChanged` aware** — text scales correctly on 150 %/200 %.
@@ -92,7 +92,7 @@ All notable changes to gritty.
   crafted `session.json` can't request a degenerate `u32::MAX` window.
 - `Pane::new -> Result` with a native error dialog instead of a silent abort.
 - Embedded fallback font + no-panic glyph path; graceful surface device-loss.
-- Bounded PTY backpressure; coalesced wakes; ~120 fps frame cap; glyph-cache cap.
+- Bounded PTY backpressure; coalesced wakes; ~60 fps frame cap; glyph-cache cap.
 - Atomic ordering fix (no zombie panes on weak memory).
 - Dropped unmaintained `serial` dependency (RUSTSEC-2017-0008) via portable-pty 0.9.
 - WCAG-AA UI contrast; gamma-correct text blending.
@@ -101,8 +101,7 @@ All notable changes to gritty.
 - CPU rendering (winit + softbuffer), fontdue glyph cache.
 - ConPTY via portable-pty; VT engine via alacritty_terminal.
 - `main.rs` split into `app` / `input` / `paint` modules.
-- 174 tests; quality gate (fmt + clippy `-D` + tests + size/dep budgets).
+- 300+ tests; quality gate (fmt + clippy `-D` + tests + size/dep budgets).
 
 ### Deferred (tracked)
-- Per-cell damage-tracking repaint (perf; idle CPU already bounded).
 - UI-Automation screen-reader provider (dedicated a11y effort).

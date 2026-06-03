@@ -8,7 +8,7 @@ couldn't be independently verified, we say so rather than invent it.
 
 | | Binary | RAM | Rendering | Runtime |
 |---|---|---|---|---|
-| **gritty** | **793 KB** — one self-contained `.exe` | **~25 MB per pane** (5000-line scrollback grid each; tunable via `config.toml`) — tens of MB for a typical session | CPU / software (no GPU) | none |
+| **gritty** | **778 KB** — one self-contained `.exe` | **~25 MB per pane** (5000-line scrollback grid each; tunable via `config.toml`) — tens of MB for a typical session | CPU / software (no GPU) | none |
 
 A single sub-800 KB exe: no GPU pipeline, no Electron/Chromium, no language
 runtime, no WSL. RAM scales with panes because each pane keeps its own scrollback

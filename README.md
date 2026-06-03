@@ -29,8 +29,9 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
   `strip` + `panic=abort`, hand-rolled config/session parsers instead of
   `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); **~25 MB RAM
   per pane** (a 5000-line scrollback grid each — tunable via `config.toml`);
-  near-0% CPU when idle (event-driven repaint with a frame cap + wake
-  coalescing). 20 busy panes can't peg a core.
+  near-0% CPU when idle and bounded when busy — **damage-driven dirty-rect
+  repaint** (a streaming pane redraws only its changed rows), a ~60 fps frame
+  cap, and wake coalescing. A spinner or a fleet of busy panes can't peg a core.
 - **Stands on giants, reinvents nothing risky.** It extracts the proven cores —
   WezTerm's `portable-pty` for ConPTY and Alacritty's `alacritty_terminal` VT
   engine — and wraps them in its own lean multiplexer, renderer, and UX.
@@ -136,9 +137,9 @@ tmux on a server: it doesn't host detachable remote sessions over SSH. For
 remote/headless multiplexing, use tmux. See **[docs/COMPARISON.md](docs/COMPARISON.md)**
 for the measured, side-by-side honesty (including where tmux still wins).
 
-Two known deferrals, tracked with rationale: per-cell damage-tracking (a perf
-optimization — idle CPU is already bounded) and a UI-Automation screen-reader
-provider (a large dedicated a11y effort).
+One known deferral, tracked with rationale: a UI-Automation screen-reader
+provider (a large, dedicated a11y effort). Per-cell/per-line damage-tracking —
+once deferred here — now ships as the dirty-rect repaint described above.
 
 ## Documentation
 - [Architecture](docs/ARCHITECTURE.md) · [Comparison](docs/COMPARISON.md) ·

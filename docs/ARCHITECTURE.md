@@ -20,7 +20,7 @@ through a bounded channel.
 | `main.rs` | Entry: module decls, constants, OS icon/caption helpers, `main()` |
 | `app.rs` | `Gritty` state + lifecycle; tabs/panes; mouse selection & divider drag; drain/reap; session restore/snapshot; process polling; `ApplicationHandler` |
 | `input.rs` | Keyboard routing, command-palette input, command dispatch |
-| `paint.rs` | `redraw` + `draw_pane_grid`, tab bar, overlays, indicators |
+| `paint.rs` | `redraw` (dirty-rect: backbuffer + render signature) + `draw_pane_grid`, tab bar, overlays, indicators |
 | `render.rs` | Cell/text/rect compositing with clipping; gamma-correct blend |
 | `font.rs` | Monospace load + lazy glyph cache; embedded fallback; cache cap |
 | `background.rs` | Cached glow + dotted-grid base layer |
@@ -44,7 +44,12 @@ shell ─▶ reader thread ─▶ bounded channel ──(EventLoopProxy wake)─
 ```
 - **Wakes are coalesced**: the reader pings the UI only on idle→pending, re-armed
   on drain — a flooding pane can't wake-storm the loop. `ControlFlow::Wait` +
-  ~120 fps cap ⇒ ~0% idle CPU, bounded busy CPU.
+  ~60 fps cap ⇒ ~0% idle CPU, bounded busy CPU.
+- **Repaints are damage-driven (dirty-rect)**: each window retains a backbuffer
+  and a structural render signature (chrome/layout/focus/overlays/theme). A frame
+  is a full repaint only on a structural change; otherwise it repaints only the
+  VT-damaged grid rows (alacritty per-line damage), so a streaming pane costs
+  ~one row, not the whole window.
 - **Share-nothing concurrency**: the UI thread owns all terminal state; threads
   only push bytes through channels ⇒ no data races by construction.
 
