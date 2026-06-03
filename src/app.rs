@@ -90,6 +90,13 @@ pub(crate) struct Win {
     /// CA-62/CA-82: pixel position of the last left press, so a multi-click is
     /// only counted when the pointer stayed at (about) the same cell.
     pub(crate) last_click_pos: Option<(f64, f64)>,
+    /// CA-80: last (col,row) cell reported via a motion event, so pointer jitter
+    /// inside one cell doesn't stream redundant motion reports to the child.
+    pub(crate) last_mouse_cell: Option<(u16, u16)>,
+    /// CA-34: SGR button code of the button currently held while forwarding to a
+    /// mouse-mode app, so a drag reports the right button and motion gating can
+    /// distinguish a drag (1002) from a bare hover (1003).
+    pub(crate) mouse_button_held: Option<u8>,
 }
 
 pub(crate) struct Gritty {
@@ -171,6 +178,8 @@ impl Gritty {
             last_click: None,
             click_count: 0,
             last_click_pos: None,
+            last_mouse_cell: None,
+            mouse_button_held: None,
         })
     }
 
@@ -1024,24 +1033,36 @@ impl Gritty {
             .get(wi)
             .and_then(|win| win.tabs.get(win.active))
             .and_then(|t| t.panes.get(&t.focus))
-            .is_some_and(|p| {
-                p.term
-                    .term
-                    .mode()
-                    .intersects(TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
-            })
+            .is_some_and(|p| p.term.term.mode().intersects(TermMode::MOUSE_MODE))
     }
 
-    /// CA-7: Forward a mouse event to window `wi`'s focused pane as SGR.
-    pub(crate) fn forward_mouse_sgr(
-        &mut self,
-        wi: usize,
-        btn: u8,
-        col: u16,
-        row: u16,
-        press: bool,
-    ) {
-        let seq = encode_sgr_mouse(btn, col, row, press);
+    /// CA-34: the focused pane's negotiated mouse-tracking flags `(sgr, motion,
+    /// drag)`: whether it asked for SGR encoding (1006), any-motion tracking
+    /// (1003) and button-event/drag tracking (1002) respectively. Used to pick
+    /// the wire form and to gate motion reports.
+    pub(crate) fn pane_mouse_flags(&self, wi: usize) -> (bool, bool, bool) {
+        use alacritty_terminal::term::TermMode;
+        self.windows
+            .get(wi)
+            .and_then(|win| win.tabs.get(win.active))
+            .and_then(|t| t.panes.get(&t.focus))
+            .map(|p| {
+                let m = p.term.term.mode();
+                (
+                    m.contains(TermMode::SGR_MOUSE),
+                    m.contains(TermMode::MOUSE_MOTION),
+                    m.contains(TermMode::MOUSE_DRAG),
+                )
+            })
+            .unwrap_or((false, false, false))
+    }
+
+    /// CA-7/CA-34: Forward a mouse event to window `wi`'s focused pane in whichever
+    /// wire form it negotiated — SGR (1006) when set, else the legacy `\x1b[M` byte
+    /// form so 1000/1002/1003-without-SGR apps get a sequence they can parse.
+    pub(crate) fn forward_mouse(&mut self, wi: usize, btn: u8, col: u16, row: u16, press: bool) {
+        let (sgr, _, _) = self.pane_mouse_flags(wi);
+        let seq = encode_mouse(btn, col, row, press, sgr);
         if let Some(win) = self.windows.get_mut(wi) {
             let active = win.active;
             if let Some(tab) = win.tabs.get_mut(active) {
@@ -1050,6 +1071,66 @@ impl Gritty {
                     pane.pty.write(&seq);
                 }
             }
+        }
+    }
+
+    /// CA-34/CA-80: Forward a pointer-*motion* report to the focused mouse-mode
+    /// pane, but only when the negotiated mode actually wants motion (1002 drag /
+    /// 1003 any-motion — never click-only 1000) and only when the pointer crossed
+    /// into a *different* cell, so jitter inside one cell sends nothing.
+    pub(crate) fn forward_mouse_motion(&mut self, wi: usize, px: f64, py: f64) {
+        let (_, motion, drag) = self.pane_mouse_flags(wi);
+        let held = self.windows.get(wi).and_then(|w| w.mouse_button_held);
+        if !motion_report_allowed(motion, drag, held.is_some()) {
+            return;
+        }
+        let Some((col, row)) = self.pixel_to_term_cell(wi, px, py) else {
+            return;
+        };
+        // CA-80: coalesce per cell — skip if the reported cell didn't change.
+        if self.windows.get(wi).and_then(|w| w.last_mouse_cell) == Some((col, row)) {
+            return;
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.last_mouse_cell = Some((col, row));
+        }
+        self.forward_mouse(wi, motion_button_code(held), col, row, true);
+    }
+
+    /// CA-112: Forward a non-left button *press* (SGR `btn`: 1 = middle, 2 = right)
+    /// at the current pointer, recording it as the held button so drags report it.
+    pub(crate) fn forward_button_press(&mut self, wi: usize, btn: u8) {
+        let (mx, my) = self
+            .windows
+            .get(wi)
+            .map(|w| w.mouse_pos)
+            .unwrap_or((0.0, 0.0));
+        if let Some((col, row)) = self.pixel_to_term_cell(wi, mx, my) {
+            if let Some(win) = self.windows.get_mut(wi) {
+                win.mouse_button_held = Some(btn);
+                win.last_mouse_cell = Some((col, row));
+            }
+            self.forward_mouse(wi, btn, col, row, true);
+        }
+    }
+
+    /// CA-112: Forward a non-left button *release*, but only if that button was the
+    /// one we forwarded a press for (so a release after a Shift-bypassed or
+    /// no-mouse-mode press isn't spuriously sent), then clear the held button.
+    pub(crate) fn forward_button_release(&mut self, wi: usize, btn: u8) {
+        if self.windows.get(wi).and_then(|w| w.mouse_button_held) != Some(btn) {
+            return;
+        }
+        let (mx, my) = self
+            .windows
+            .get(wi)
+            .map(|w| w.mouse_pos)
+            .unwrap_or((0.0, 0.0));
+        if let Some((col, row)) = self.pixel_to_term_cell(wi, mx, my) {
+            self.forward_mouse(wi, btn, col, row, false);
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.mouse_button_held = None;
         }
     }
 
@@ -1233,15 +1314,15 @@ impl ApplicationHandler<Wake> for Gritty {
                     }
                 }
                 let dragging = self.windows[wi].dragging.clone();
+                // CA-202: holding Shift bypasses mouse forwarding so the user can
+                // make a local selection inside a mouse-mode app.
+                let shift = self.mods.shift_key();
                 if let Some(path) = dragging {
                     self.drag_divider(wi, &path, px, py);
                 } else if self.windows[wi].selecting {
                     self.update_selection(wi, px, py);
-                } else if self.pane_wants_mouse(wi) {
-                    if let Some((col, row)) = self.pixel_to_term_cell(wi, px, py) {
-                        // Button 35 = motion with no button held (32 + 3).
-                        self.forward_mouse_sgr(wi, 35, col, row, true);
-                    }
+                } else if !shift && self.pane_wants_mouse(wi) {
+                    self.forward_mouse_motion(wi, px, py);
                 } else {
                     self.update_cursor_shape(wi);
                 }
@@ -1268,10 +1349,15 @@ impl ApplicationHandler<Wake> for Gritty {
                         }
                         return;
                     }
-                    if self.pane_wants_mouse(wi) {
+                    // CA-202: a Shift-held press never forwarded, so its release is
+                    // a local selection finish, not a forwarded button-up.
+                    if !self.mods.shift_key() && self.windows[wi].mouse_button_held == Some(0) {
                         let (mx, my) = self.windows[wi].mouse_pos;
                         if let Some((col, row)) = self.pixel_to_term_cell(wi, mx, my) {
-                            self.forward_mouse_sgr(wi, 0, col, row, false);
+                            self.forward_mouse(wi, 0, col, row, false);
+                        }
+                        if let Some(win) = self.windows.get_mut(wi) {
+                            win.mouse_button_held = None;
                         }
                     } else {
                         let was_dragging = self.windows[wi].dragging.take().is_some();
@@ -1283,7 +1369,27 @@ impl ApplicationHandler<Wake> for Gritty {
                         win.selecting = false;
                     }
                 }
-                (ElementState::Pressed, MouseButton::Right) => self.paste(wi),
+                // CA-112/CA-202: right/middle buttons reach a mouse-mode app (right
+                // = SGR button 2, middle = 1); only fall back to the paste shortcut
+                // when no mouse mode is active, or when Shift bypasses forwarding.
+                (ElementState::Pressed, MouseButton::Right) => {
+                    if !self.mods.shift_key() && self.pane_wants_mouse(wi) {
+                        self.forward_button_press(wi, 2);
+                    } else {
+                        self.paste(wi);
+                    }
+                }
+                (ElementState::Released, MouseButton::Right) => {
+                    self.forward_button_release(wi, 2);
+                }
+                (ElementState::Pressed, MouseButton::Middle) => {
+                    if !self.mods.shift_key() && self.pane_wants_mouse(wi) {
+                        self.forward_button_press(wi, 1);
+                    }
+                }
+                (ElementState::Released, MouseButton::Middle) => {
+                    self.forward_button_release(wi, 1);
+                }
                 _ => {}
             },
 
@@ -1305,12 +1411,13 @@ impl ApplicationHandler<Wake> for Gritty {
                         self.relayout(wi);
                         self.request_redraw(wi);
                     }
-                } else if self.pane_wants_mouse(wi) {
+                } else if !self.mods.shift_key() && self.pane_wants_mouse(wi) {
+                    // CA-202: Shift held falls through to local scrollback scroll.
                     if notches != 0.0 {
                         let (mx, my) = self.windows[wi].mouse_pos;
                         if let Some((col, row)) = self.pixel_to_term_cell(wi, mx, my) {
                             let btn = if notches > 0.0 { 64u8 } else { 65u8 };
-                            self.forward_mouse_sgr(wi, btn, col, row, true);
+                            self.forward_mouse(wi, btn, col, row, true);
                         }
                     }
                 } else {
@@ -1430,7 +1537,8 @@ impl Gritty {
         }
 
         // CA-7: if the pane has mouse mode, forward the click and return early.
-        if self.pane_wants_mouse(wi) {
+        // CA-202: but Shift held bypasses forwarding to allow a local selection.
+        if !self.mods.shift_key() && self.pane_wants_mouse(wi) {
             if let Some((id, _)) = self.pane_at(wi, x, y) {
                 if let Some(win) = self.windows.get_mut(wi) {
                     if let Some(tab) = win.tabs.get_mut(win.active) {
@@ -1441,7 +1549,13 @@ impl Gritty {
                 }
             }
             if let Some((col, row)) = self.pixel_to_term_cell(wi, x, y) {
-                self.forward_mouse_sgr(wi, 0, col, row, true);
+                // CA-34/CA-80: remember the held button and seed the motion cell so
+                // a drag reports the right button and the first move isn't a dup.
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.mouse_button_held = Some(0);
+                    win.last_mouse_cell = Some((col, row));
+                }
+                self.forward_mouse(wi, 0, col, row, true);
             }
             return;
         }
@@ -1802,6 +1916,56 @@ pub(crate) fn encode_sgr_mouse(btn: u8, col: u16, row: u16, press: bool) -> Vec<
     format!("\x1b[<{};{};{}{}", btn, col, row, suffix).into_bytes()
 }
 
+/// CA-34: Encode a mouse event in the legacy X10/normal form `ESC [ M Cb Cx Cy`,
+/// used when the app enabled tracking (1000/1002/1003) but **not** SGR (1006).
+/// Each field is offset by 32. Unlike SGR there is no distinct release code per
+/// button: a normal-button (0/1/2) release reports button `3`; wheel (`>= 64`)
+/// and motion (the `32` bit) keep their `btn` code. The protocol can only address
+/// the first 223 columns/rows (`255 - 32`); beyond that the field is clamped,
+/// matching xterm — apps that need more must negotiate SGR.
+pub(crate) fn encode_legacy_mouse(btn: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
+    // A normal-button release is reported as button 3; wheel/motion keep `btn`.
+    let cb = if !press && btn < 3 { 3 } else { btn };
+    let clamp = |v: u16| (v.min(223) as u8).saturating_add(32);
+    vec![
+        0x1b,
+        b'[',
+        b'M',
+        cb.saturating_add(32),
+        clamp(col),
+        clamp(row),
+    ]
+}
+
+/// CA-34: Encode a mouse report in whichever wire form the focused app negotiated:
+/// SGR (`\x1b[<…`) when `sgr` is set, else the legacy `\x1b[M…` byte form.
+pub(crate) fn encode_mouse(btn: u8, col: u16, row: u16, press: bool, sgr: bool) -> Vec<u8> {
+    if sgr {
+        encode_sgr_mouse(btn, col, row, press)
+    } else {
+        encode_legacy_mouse(btn, col, row, press)
+    }
+}
+
+/// CA-34: Whether a pointer-*motion* report may be forwarded for the given mode.
+/// Bare motion (no button held) is only legal under any-motion tracking (1003,
+/// `MOUSE_MOTION`); motion with a button held (a drag) is legal under either
+/// button-event tracking (1002, `MOUSE_DRAG`) or any-motion tracking. Click-only
+/// tracking (1000, `MOUSE_REPORT_CLICK`) never receives motion.
+pub(crate) fn motion_report_allowed(motion: bool, drag: bool, button_held: bool) -> bool {
+    if button_held {
+        motion || drag
+    } else {
+        motion
+    }
+}
+
+/// CA-34: SGR button code for a drag-motion report — the held button's code with
+/// the motion bit (32) set; a bare hover (no button) is button-less motion (35).
+pub(crate) fn motion_button_code(button_held: Option<u8>) -> u8 {
+    32 + button_held.unwrap_or(3)
+}
+
 /// CA-42: a selection is worth copying only when it has a non-whitespace
 /// character; a whitespace-only drag must not clobber the clipboard.
 pub(crate) fn selection_is_copyable(text: &str) -> bool {
@@ -1854,6 +2018,70 @@ mod tests {
     fn sgr_mouse_large_coords() {
         let seq = encode_sgr_mouse(0, 220, 50, true);
         assert_eq!(seq, b"\x1b[<0;220;50M");
+    }
+
+    // --- CA-34 legacy/normal mouse encoding & motion gating ------------------
+
+    #[test]
+    fn legacy_mouse_left_press_offsets_by_32() {
+        // ESC [ M Cb Cx Cy, each field +32. Left press at (1,1) -> btn 0.
+        let seq = encode_legacy_mouse(0, 1, 1, true);
+        assert_eq!(seq, vec![0x1b, b'[', b'M', 32, 33, 33]);
+    }
+
+    #[test]
+    fn legacy_mouse_button_release_reports_button_3() {
+        // A normal-button release has no distinct code: it reports button 3.
+        let seq = encode_legacy_mouse(0, 5, 10, false);
+        assert_eq!(seq, vec![0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 10]);
+    }
+
+    #[test]
+    fn legacy_mouse_wheel_keeps_its_code_on_release() {
+        // Wheel (>=64) and motion keep their code even on a !press call.
+        let seq = encode_legacy_mouse(64, 2, 2, false);
+        assert_eq!(seq[3], 64 + 32);
+    }
+
+    #[test]
+    fn legacy_mouse_clamps_beyond_223() {
+        // The legacy protocol can only address cols/rows up to 223.
+        let seq = encode_legacy_mouse(0, 300, 1, true);
+        assert_eq!(seq[4], 223 + 32);
+    }
+
+    #[test]
+    fn encode_mouse_picks_form_by_negotiation() {
+        // CA-34: SGR when negotiated, legacy byte form otherwise.
+        assert_eq!(encode_mouse(0, 1, 1, true, true), b"\x1b[<0;1;1M");
+        assert_eq!(
+            encode_mouse(0, 1, 1, true, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+    }
+
+    #[test]
+    fn motion_gating_bare_hover_needs_any_motion_mode() {
+        // No button held: only 1003 (motion) accepts the report.
+        assert!(motion_report_allowed(true, false, false)); // 1003
+        assert!(!motion_report_allowed(false, true, false)); // 1002 only: no bare hover
+        assert!(!motion_report_allowed(false, false, false)); // 1000: never
+    }
+
+    #[test]
+    fn motion_gating_drag_needs_drag_or_motion_mode() {
+        // Button held (a drag): 1002 or 1003 accept it; 1000 still never.
+        assert!(motion_report_allowed(false, true, true)); // 1002
+        assert!(motion_report_allowed(true, false, true)); // 1003
+        assert!(!motion_report_allowed(false, false, true)); // 1000
+    }
+
+    #[test]
+    fn motion_button_code_reflects_held_button() {
+        // Bare hover -> 35 (32+3); a left-drag -> 32; a right-drag -> 34.
+        assert_eq!(motion_button_code(None), 35);
+        assert_eq!(motion_button_code(Some(0)), 32);
+        assert_eq!(motion_button_code(Some(2)), 34);
     }
 
     // --- CA-18 click-count classifier ----------------------------------------
