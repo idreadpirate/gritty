@@ -12,11 +12,7 @@ pub struct Cell {
 }
 
 fn buf_height(buf: &[u32], stride: usize) -> usize {
-    if stride == 0 {
-        0
-    } else {
-        buf.len() / stride
-    }
+    buf.len().checked_div(stride).unwrap_or(0)
 }
 
 /// Fill a rectangle (clamped to the buffer) with a solid color.

@@ -184,10 +184,10 @@ fn ensure_detached() {
 #[cfg(not(all(windows, not(debug_assertions))))]
 fn ensure_detached() {}
 
-/// Window/taskbar icon, baked from grittyicon.png at build time (64x64 RGBA).
+/// Window/taskbar icon, baked from grittyicon.png at build time (32x32 RGBA).
 pub(crate) fn load_icon() -> Option<winit::window::Icon> {
     let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/icon_rgba.bin"));
-    winit::window::Icon::from_rgba(bytes.to_vec(), 64, 64).ok()
+    winit::window::Icon::from_rgba(bytes.to_vec(), 32, 32).ok()
 }
 
 /// RT-22: `%LOCALAPPDATA%\gritty\crash.log` (then `%APPDATA%`, then the temp dir) —

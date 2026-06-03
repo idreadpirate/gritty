@@ -813,11 +813,7 @@ pub(crate) fn cursor_is_solid(pane_focused: bool, window_focused: bool) -> bool 
 
 /// Buffer height in pixels (stride must be > 0).
 fn buf_height(buf: &[u32], stride: usize) -> usize {
-    if stride == 0 {
-        0
-    } else {
-        buf.len() / stride
-    }
+    buf.len().checked_div(stride).unwrap_or(0)
 }
 
 /// Compute the scrollbar thumb position within a `track_len`-pixel track.
@@ -846,11 +842,12 @@ pub(crate) fn scrollbar_thumb(
     let travel = track_len.saturating_sub(thumb_h);
     // display_offset == history_size → top; 0 → bottom.
     let offset_clamped = display_offset.min(history_size);
-    let thumb_top = if history_size == 0 {
-        travel
-    } else {
-        travel - (travel * offset_clamped) / history_size
-    };
+    // checked_div: history_size==0 -> None -> 0, so thumb_top stays at `travel`
+    // (the old explicit zero-guard) and never divides by zero.
+    let thumb_top = travel
+        - (travel * offset_clamped)
+            .checked_div(history_size)
+            .unwrap_or(0);
     (thumb_top, thumb_h)
 }
 

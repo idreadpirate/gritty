@@ -4,11 +4,12 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$MaxBytes = 1550000   # binary ceiling (~1.48 MB) — bloat guard. Raised from 1.30MB
-                      # after the 2026-06 hardening campaign added real features
-                      # (HiDPI, IME, config.toml wiring, dirty-rect repaint, panic
-                      # crash-log, CJK width via unicode-width). Profile unchanged
-                      # (panic=abort+lto+strip); growth is feature code, not bloat.
+$MaxBytes = 800000    # binary ceiling — gritty is a *minimal* terminal. Held under
+                      # 800 KB even after the 2026-06 hardening features (HiDPI, IME,
+                      # config, dirty-rect, crash-log, CJK) via: opt-level=z, hand-
+                      # rolled config + session parsers (no toml / serde_json in the
+                      # runtime), a 32px icon, and nightly -Z build-std (std rebuilt
+                      # at opt=z). See .cargo/config.toml + rust-toolchain.toml.
 $MaxPkgs  = 290       # Cargo.lock package ceiling — dependency guard
 
 function Fail($m) { Write-Host "GATE FAIL: $m" -ForegroundColor Red; exit 1 }
@@ -19,7 +20,7 @@ Write-Host "[3/6] test";   cargo test --quiet;                   if ($LASTEXITCO
 Write-Host "[4/6] build";  cargo build --release --quiet;        if ($LASTEXITCODE) { Fail "build" }
 
 Write-Host "[5/6] size"
-$sz = (Get-Item target/release/gritty.exe).Length
+$sz = (Get-Item target/x86_64-pc-windows-msvc/release/gritty.exe).Length
 if ($sz -gt $MaxBytes) { Fail "binary $sz > $MaxBytes bytes (bloat)" }
 
 Write-Host "[6/6] deps"
