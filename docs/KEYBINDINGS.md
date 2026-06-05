@@ -33,13 +33,34 @@
 | Action | Keys |
 |---|---|
 | Command palette | `Ctrl+Shift+P` (fuzzy; ↑/↓, Enter, Esc) |
+| Agent overview | `Ctrl+Shift+A` (↑/↓ select, Enter/click jump, Esc close) |
 | Keybinding help | `F1` or `Ctrl+Shift+/` |
 | Broadcast / seamless mode | via the command palette |
 
 ## Command palette
 Fuzzy-searchable: split right/down, close pane, rename pane, new tab,
-next/previous tab, toggle broadcast input, toggle seamless mode, move tab to new
-window, save session, load session.
+next/previous tab, toggle broadcast input, agent overview, toggle seamless mode,
+move tab to new window, save session, load session.
+
+## Agent awareness
+gritty recognizes AI coding agents from a pane's foreground process and reads
+each one's live state from the on-screen UI — shown as a header badge:
+`●` working · `◆` needs input · `○` idle.
+
+Recognized today: **claude, codex, cursor, copilot, gemini, opencode, droid,
+aider, amp, grok, qwen, pi** (matched by binary name, including common
+`node`/`npm` wrappers).
+
+When an agent **finishes or blocks in a pane you aren't watching**, gritty marks
+it `★` and **flashes the taskbar** — and it keeps watching a backgrounded agent,
+so the flash reaches you even when gritty is minimized. **Agent overview**
+(`Ctrl+Shift+A`, or the command palette, or `F1`) lists every agent pane across
+all tabs, pre-selected on the one needing attention; `Enter` or a click jumps
+straight to it.
+
+No integration, hooks, or config required. Detection is **heuristic** — it
+matches each agent's visible UI, so it degrades gracefully: a misread shows the
+wrong badge, never a wrong action, and self-corrects on the next poll.
 
 ## Multiple windows
 Tear a tab into its own window — drag it off the bar onto another monitor, or

@@ -16,6 +16,7 @@ pub enum Cmd {
     MoveTabToNewWindow,
     SaveSession,
     LoadSession,
+    ToggleAgents,
 }
 
 pub const COMMANDS: &[(&str, Cmd)] = &[
@@ -32,6 +33,7 @@ pub const COMMANDS: &[(&str, Cmd)] = &[
         "paste clipboard to ALL panes (every window)",
         Cmd::BroadcastPasteAll,
     ),
+    ("agent overview (jump to a pane)", Cmd::ToggleAgents),
     ("toggle seamless mode", Cmd::ToggleSeamless),
     ("move tab to new window", Cmd::MoveTabToNewWindow),
     ("save session", Cmd::SaveSession),

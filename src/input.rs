@@ -120,6 +120,18 @@ impl Gritty {
             return;
         }
 
+        // Agent overview swallows input while open. Ctrl+Shift+A toggles it shut
+        // (so the open shortcut closes it instead of falling through).
+        if self.windows[wi].agents.is_some() {
+            if ctrl && shift && matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("a")) {
+                self.windows[wi].agents = None;
+                self.request_redraw(wi);
+                return;
+            }
+            self.handle_agents_key(key);
+            return;
+        }
+
         // Rename prompt swallows all input while open.
         if self.windows[wi].rename.is_some() {
             let mut commit: Option<String> = None;
@@ -203,6 +215,11 @@ impl Gritty {
                     "p" => {
                         self.windows[wi].palette = Some(Palette::new());
                         self.request_redraw(wi);
+                        return;
+                    }
+                    // Ctrl+Shift+A: agent overview (jump list of every agent pane).
+                    "a" => {
+                        self.toggle_agents(wi);
                         return;
                     }
                     "r" => {
@@ -442,7 +459,7 @@ impl Gritty {
     /// active tab without clearing it silently fans the next keystrokes out to a
     /// tab the user didn't mean to. Centralising the invariant here keeps the
     /// palette switch arms from drifting from the keyboard ones again.
-    fn switch_active_tab(&mut self, wi: usize, idx: usize) {
+    pub(crate) fn switch_active_tab(&mut self, wi: usize, idx: usize) {
         if let Some(win) = self.windows.get_mut(wi) {
             let (active, broadcast, pending) =
                 next_tab_switch_state(win.active, win.broadcast, win.broadcast_pending_signal, idx);
@@ -533,6 +550,7 @@ impl Gritty {
             }
             Cmd::SaveSession => self.persist_session(),
             Cmd::LoadSession => self.restore_session(event_loop),
+            Cmd::ToggleAgents => self.toggle_agents(self.focused),
         }
         let f = self.focused;
         self.request_redraw(f);
