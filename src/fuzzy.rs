@@ -1,5 +1,11 @@
 // Tiny subsequence fuzzy matcher for the command palette.
 
+/// Divisor for the length penalty: each `LEN_PENALTY_DIVISOR` chars of `text`
+/// costs 1 point, so a shorter command outranks a longer one on an equal-quality
+/// match. Chosen so the penalty stays small relative to the per-hit rewards
+/// (1–3 each) — it only breaks ties, it never overrides a better subsequence.
+const LEN_PENALTY_DIVISOR: i32 = 8;
+
 /// Score `text` against `query` (case-insensitive). Higher is better;
 /// None means `query` is not a subsequence of `text`.
 pub fn score(query: &str, text: &str) -> Option<i32> {
@@ -26,7 +32,7 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
         }
     }
     if qi == q.len() {
-        Some(s - (t.len() as i32) / 8) // mild penalty for longer strings
+        Some(s - (t.len() as i32) / LEN_PENALTY_DIVISOR) // mild penalty for longer strings
     } else {
         None
     }

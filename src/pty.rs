@@ -96,6 +96,74 @@ impl DsrScanner {
     }
 }
 
+/// A Windows Job Object that owns a pane's shell process with
+/// `KILL_ON_JOB_CLOSE`, so dropping it terminates the shell *and its whole
+/// descendant tree*. `killer.kill()` alone calls `TerminateProcess` on the shell
+/// only, orphaning any grandchild (a backgrounded `npm`/`ssh`/agent worker) that
+/// re-parented away — a real process leak on every pane close. The job closes
+/// that hole: the OS reaps the entire tree when the last handle drops.
+///
+/// The handle is stored as `isize` (not the raw `HANDLE` pointer) so `Pty` stays
+/// `Send`/`Sync` exactly as before, and closed once on drop.
+#[cfg(windows)]
+struct ProcessJob(isize);
+
+#[cfg(windows)]
+impl ProcessJob {
+    /// Create a kill-on-close job and assign process `pid` to it. Returns `None`
+    /// if any Win32 step fails (no job object on this OS, insufficient rights, or
+    /// the process already sits in a job that forbids nesting) — the caller then
+    /// degrades to the prior kill-the-shell-only behaviour.
+    fn assign(pid: u32) -> Option<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info) as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            // PROCESS_SET_QUOTA | PROCESS_TERMINATE are the rights
+            // AssignProcessToJobObject requires.
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if set == 0 || proc.is_null() {
+                CloseHandle(job);
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, proc);
+            CloseHandle(proc); // the job retains the process; this handle isn't needed
+            if assigned == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job as isize))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        // KILL_ON_JOB_CLOSE: closing the final handle terminates the whole tree.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0 as *mut core::ffi::c_void) };
+    }
+}
+
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -104,6 +172,11 @@ pub struct Pty {
     notified: Arc<AtomicBool>,
     pid: Option<u32>,
     pub rx: Receiver<Vec<u8>>,
+    /// CA-/RT-orphans: holds the pane's process tree in a kill-on-close job so a
+    /// pane close reaps grandchildren too, not just the shell. Held only for its
+    /// `Drop`; `None` when the job couldn't be created (degrades gracefully).
+    #[cfg(windows)]
+    _job: Option<ProcessJob>,
 }
 
 impl Pty {
@@ -139,6 +212,12 @@ impl Pty {
         let child = pair.slave.spawn_command(cmd)?;
         let killer = child.clone_killer();
         let pid = child.process_id();
+
+        // Put the shell in a kill-on-close job *immediately* after spawn so the
+        // whole pane tree dies on pane close (see ProcessJob). Done before the
+        // shell has run anything, so descendants it later spawns are covered.
+        #[cfg(windows)]
+        let _job = pid.and_then(ProcessJob::assign);
 
         // The slave handle must drop or the child never sees EOF on exit.
         drop(pair.slave);
@@ -208,6 +287,8 @@ impl Pty {
             notified,
             pid,
             rx,
+            #[cfg(windows)]
+            _job,
         })
     }
 
@@ -227,6 +308,9 @@ impl Pty {
 
     /// Send bytes to the child's stdin.
     pub fn write(&mut self, data: &[u8]) {
+        // write_all to a ConPTY blocks if the child isn't draining stdin; mark it
+        // so a UI-thread hang here (e.g. a broadcast to a stuck pane) is named.
+        crate::watchdog::mark(crate::watchdog::PTY_WRITE);
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(data);
             let _ = w.flush();
@@ -464,6 +548,21 @@ mod tests {
         // give it a moment; it should still be running (we never sent `exit`).
         std::thread::sleep(Duration::from_millis(100));
         assert!(pty.is_alive(), "shell should still be alive after I/O");
+    }
+
+    /// The orphan fix: a freshly spawned child must be held in a kill-on-close
+    /// job, so closing the pane reaps its whole descendant tree (not just the
+    /// shell). This proves the CreateJobObject→SetInformation→OpenProcess→Assign
+    /// FFI sequence succeeds end-to-end against a real ConPTY child; the
+    /// KILL_ON_JOB_CLOSE semantics themselves are guaranteed by the OS flag.
+    #[cfg(windows)]
+    #[test]
+    fn spawned_child_is_held_in_kill_on_close_job() {
+        let pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}, None).expect("spawn cmd.exe");
+        assert!(
+            pty._job.is_some(),
+            "shell should be assigned to a kill-on-close job object"
+        );
     }
 
     #[test]

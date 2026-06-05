@@ -20,6 +20,9 @@ pub const UI_TITLE_BG: u32 = 0x001e_1c28; // inactive pane title
 pub const UI_DIM: u32 = 0x00b0_8050; // inactive UI text — warm bronze, ~5.49:1 vs BG
 /// Subtle 1px separator between unfocused panes and below the tab strip (CA-24/CA-29).
 pub const PANE_SEP: u32 = 0x002d_2b3d; // muted indigo line
+/// Filled background for centred floating overlays (command palette, help card)
+/// — a touch lighter than the panes so the box reads as raised chrome.
+pub const OVERLAY_PANEL_BG: u32 = 0x0020_2030; // indigo-slate
 
 /// The three user-overridable theme colors (CA-37). Each falls back to the
 /// compiled-in default when `config.toml` omits it.

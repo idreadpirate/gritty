@@ -85,9 +85,14 @@ fn load_from(path: &std::path::Path) -> Option<Config> {
 /// blank lines, `#` comments (incl. inline), and `key = value` scalar pairs (no
 /// tables/arrays). Hand-rolled so the runtime binary doesn't link the full
 /// `toml` crate (+`toml_edit`+`winnow`) just to read six scalars — that pulled
-/// ~100 KB into a "lightweight" terminal. Returns `None` on a syntactically
-/// invalid line (mirrors the strict reject the old `toml::from_str` gave on
-/// garbage); unknown keys are ignored, as TOML would.
+/// ~100 KB into a "lightweight" terminal.
+///
+/// Parsing is *resilient*: a malformed line (no `=`), an unknown key, or an
+/// unparseable value is skipped, leaving that key at its default. One typo must
+/// not discard the whole file and silently revert every *other* setting — the
+/// app has no console in release, so a strict whole-file reject would be an
+/// invisible "why did all my settings vanish?" footgun. Returns `Some` for any
+/// in-memory text (the only `None` path is the size guard in `load_from`).
 fn parse(text: &str) -> Option<Config> {
     let mut cfg = Config::default();
     for raw in text.lines() {
@@ -95,15 +100,41 @@ fn parse(text: &str) -> Option<Config> {
         if line.is_empty() {
             continue;
         }
-        let (key, val) = line.split_once('=')?; // no '=' on a non-blank line → invalid
+        let Some((key, val)) = line.split_once('=') else {
+            continue; // not a scalar pair — skip, don't fail the file
+        };
         let (key, val) = (key.trim(), val.trim());
         match key {
-            "font_size" => cfg.font_size = val.parse().ok()?,
-            "scrollback" => cfg.scrollback = val.parse().ok()?,
-            "shell" => cfg.shell = Some(parse_string(val)?),
-            "fg" => cfg.fg = Some(parse_u32(val)?),
-            "bg" => cfg.bg = Some(parse_u32(val)?),
-            "accent" => cfg.accent = Some(parse_u32(val)?),
+            "font_size" => {
+                if let Ok(v) = val.parse() {
+                    cfg.font_size = v;
+                }
+            }
+            "scrollback" => {
+                if let Ok(v) = val.parse() {
+                    cfg.scrollback = v;
+                }
+            }
+            "shell" => {
+                if let Some(v) = parse_string(val) {
+                    cfg.shell = Some(v);
+                }
+            }
+            "fg" => {
+                if let Some(v) = parse_u32(val) {
+                    cfg.fg = Some(v);
+                }
+            }
+            "bg" => {
+                if let Some(v) = parse_u32(val) {
+                    cfg.bg = Some(v);
+                }
+            }
+            "accent" => {
+                if let Some(v) = parse_u32(val) {
+                    cfg.accent = Some(v);
+                }
+            }
             _ => {} // unknown key: ignore
         }
     }
@@ -212,12 +243,21 @@ mod tests {
         assert_eq!(cfg.shell.as_deref(), Some("C:\\a#b\\sh.exe"));
     }
 
-    /// Garbage input must not panic — `parse` returns `None`.
+    /// Resilient parsing: a malformed line (no `=`) or an unparseable value is
+    /// skipped, leaving that key at its default — it must NOT discard the whole
+    /// file and silently revert every *other* key. Garbage must never panic.
     #[test]
-    fn garbage_yields_none() {
-        assert!(parse("[[[[not valid").is_none());
-        // A known key with an unparseable value is also rejected.
-        assert!(parse("scrollback = not_a_number").is_none());
+    fn malformed_lines_are_skipped_not_fatal() {
+        let src = "font_size = 18.0\n\
+                   [[[[not valid\n\
+                   scrollback = not_a_number\n\
+                   accent = 0xFF7B00";
+        let cfg = parse(src).expect("parse is resilient, never None for in-memory text");
+        // Good keys before and after the garbage both apply.
+        assert_eq!(cfg.font_size, 18.0);
+        assert_eq!(cfg.accent, Some(0x00FF_7B00));
+        // The unparseable value falls back to its default, not the whole file.
+        assert_eq!(cfg.scrollback, Config::default().scrollback);
     }
 
     /// Unknown keys are ignored (forward-compat), not errors.

@@ -15,6 +15,16 @@ pub struct Pane {
     pub name: String,
     /// Foreground process running in the pane (e.g. "nvim"), updated periodically.
     pub proc_name: String,
+    /// The AI coding agent recognized in this pane, if any (`claude`, `codex`…),
+    /// derived from `proc_name` on each foreground-process poll (CA-54).
+    pub agent: Option<crate::agent::Agent>,
+    /// The agent's live state (working / blocked / idle), classified from the
+    /// pane's on-screen UI chrome. `Unknown` when no agent runs here.
+    pub agent_state: crate::agent::AgentState,
+    /// CA-46-style attention latch: set when this pane's agent finished or
+    /// blocked while the pane wasn't the one you were watching, cleared when you
+    /// focus it. Drives the header's `★` badge and a one-shot taskbar flash.
+    pub attention: bool,
     /// CA-40: set the first time `reap_dead` sees this pane's shell as exited, so
     /// the pane survives one extra cycle and its final drained line (an exit/
     /// farewell message) is painted once before the pane is reaped.
@@ -140,6 +150,9 @@ impl Pane {
             pty,
             name,
             proc_name: String::new(),
+            agent: None,
+            agent_state: crate::agent::AgentState::Unknown,
+            attention: false,
             dead_seen: false,
         })
     }
@@ -273,9 +286,15 @@ impl Tab {
             Some(t) => {
                 self.tree = t;
                 self.panes.remove(&target);
+                // `without` returns Some only while the tree still has leaves, so
+                // `first()` is always Some here. Guard anyway, and keep the old
+                // focus if it somehow weren't — never point focus at `target`,
+                // the pane we just removed from `panes`.
                 let mut leaves = Vec::new();
                 self.tree.leaves(&mut leaves);
-                self.focus = *leaves.first().unwrap_or(&target);
+                if let Some(&f) = leaves.first() {
+                    self.focus = f;
+                }
                 false
             }
             None => {

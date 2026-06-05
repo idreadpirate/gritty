@@ -34,6 +34,8 @@ through a bounded channel.
 | `fuzzy.rs` / `palette.rs` | Command-palette scoring + command list |
 | `persist.rs` | Session snapshot ↔ JSON (size-capped, geometry, serde) |
 | `proc.rs` | Foreground-process detection via the OS process tree |
+| `agent.rs` | Pure agent detection: identify the agent from a process name, classify its state (working/blocked/idle) from the screen tail, shared status badge |
+| `overview.rs` | Agent-overview overlay state + panel geometry/hit-testing (pure) |
 | `config.rs` | Optional `config.toml` |
 
 ## Data flow
@@ -52,6 +54,12 @@ shell ─▶ reader thread ─▶ bounded channel ──(EventLoopProxy wake)─
   ~one row, not the whole window.
 - **Share-nothing concurrency**: the UI thread owns all terminal state; threads
   only push bytes through channels ⇒ no data races by construction.
+- **Agent awareness rides the existing process poll** (no new thread/timer): each
+  cycle, a pane running a recognized agent has its screen tail classified
+  (`agent::detect_state`); a `working → idle/blocked` change in an unwatched pane
+  latches attention and flashes the taskbar. The poll normally suspends when no
+  window is visible (CA-54), but stays alive while a backgrounded agent is still
+  `Working` so its completion still notifies — then idles back down.
 
 ## Layout model
 A tab owns `HashMap<id, Pane>` plus a `layout::Node` binary tree referencing those

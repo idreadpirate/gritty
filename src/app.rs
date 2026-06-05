@@ -7,6 +7,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Cursor, CursorIcon, Window, WindowId};
 
 use crate::background::Background;
@@ -88,6 +89,8 @@ pub(crate) struct Win {
     /// While a rename prompt is open: true = renaming the active tab, false = pane.
     pub(crate) rename_is_tab: bool,
     pub(crate) palette: Option<Palette>,
+    /// Agent overview overlay (Ctrl+Shift+A): a jump list of every agent pane.
+    pub(crate) agents: Option<crate::overview::Overview>,
     pub(crate) broadcast: bool,
     /// RT-8: pending signal-byte (ETX/EOT/SUB) awaiting second-press confirmation.
     pub(crate) broadcast_pending_signal: Option<u8>,
@@ -281,6 +284,7 @@ impl Gritty {
             rename: None,
             rename_is_tab: false,
             palette: None,
+            agents: None,
             broadcast: false,
             broadcast_pending_signal: None,
             seamless,
@@ -336,11 +340,21 @@ impl Gritty {
         // across every pane, instead of rebuilding it per pane via the free
         // `proc::foreground_name` (which was O(P×N)). `Snapshot::foreground_name`
         // is O(N) per call against the prebuilt map.
+        use crate::agent::{self, AgentState};
+        crate::watchdog::mark(crate::watchdog::UPDATE_PROCS);
         let snap = proc::Snapshot::capture();
         let mut changed = false;
         for win in &mut self.windows {
-            for tab in &mut win.tabs {
-                for pane in tab.panes.values_mut() {
+            // A pane is "being watched" only when it's the focused pane of the
+            // active tab of the OS-focused, visible window. Anything else is
+            // unattended, so a finished/blocked agent there earns a notification.
+            let win_watched = win.os_focused && win.visible;
+            let active = win.active;
+            let mut want_flash = false;
+            for (ti, tab) in win.tabs.iter_mut().enumerate() {
+                let focus = tab.focus;
+                let tab_active = ti == active;
+                for (&pid, pane) in tab.panes.iter_mut() {
                     let name = pane
                         .pty
                         .pid()
@@ -348,12 +362,57 @@ impl Gritty {
                         .unwrap_or_default();
                     if name != pane.proc_name {
                         pane.proc_name = name;
+                        pane.agent = agent::identify_agent(&pane.proc_name);
+                        changed = true;
+                    }
+                    let watched = win_watched && tab_active && pid == focus;
+                    // Reclassify agent state from the live screen each poll. The
+                    // foreground program can stay `claude` while its state cycles
+                    // working→blocked→idle, so this runs even when the name is
+                    // unchanged — but only when an agent actually owns the pane.
+                    if pane.agent.is_some() {
+                        let state = agent::detect_state(pane.agent, &pane.term.screen_tail(24));
+                        if state != pane.agent_state {
+                            // Raise attention (and flash the taskbar once) when an
+                            // unwatched agent just finished or blocked.
+                            if !watched && agent::is_attention_transition(pane.agent_state, state) {
+                                pane.attention = true;
+                                want_flash = true;
+                            }
+                            pane.agent_state = state;
+                            changed = true;
+                        }
+                    } else if pane.agent_state != AgentState::Unknown {
+                        pane.agent_state = AgentState::Unknown;
+                        changed = true;
+                    }
+                    // Looking at the pane clears its latched attention.
+                    if watched && pane.attention {
+                        pane.attention = false;
                         changed = true;
                     }
                 }
             }
+            if want_flash {
+                crate::flash_taskbar(&win.window);
+            }
         }
         changed
+    }
+
+    /// Whether any pane anywhere is running an agent in the `Working` state. Used
+    /// to keep the process poll alive while a *backgrounded* agent runs, so its
+    /// finish/block still flashes the taskbar even when every window is occluded
+    /// or minimized — the poll otherwise suspends to save CPU (CA-54). Cheap, and
+    /// only evaluated when no window is visible (short-circuited at the call site).
+    pub(crate) fn any_agent_working(&self) -> bool {
+        self.windows.iter().any(|w| {
+            w.tabs.iter().any(|t| {
+                t.panes
+                    .values()
+                    .any(|p| p.agent_state == crate::agent::AgentState::Working)
+            })
+        })
     }
 
     /// CA-39: reflect each window's focused pane's OSC 0/2 title in the OS
@@ -440,6 +499,10 @@ impl Gritty {
             }
             None => 0u8.hash(&mut hh),
         }
+        // The overview's contents are redrawn every frame it's open (`redraw`
+        // forces a full repaint then), so only its open/closed state needs to be
+        // here — to repaint the frame that opens or closes it.
+        win.agents.is_some().hash(&mut hh);
         win.rename.hash(&mut hh);
         win.rename_is_tab.hash(&mut hh);
         win.preedit.hash(&mut hh);
@@ -461,6 +524,12 @@ impl Gritty {
                 if let Some(p) = tab.panes.get(&id) {
                     p.name.hash(&mut hh);
                     p.proc_name.hash(&mut hh);
+                    // The header shows an agent state badge; fold it in so a
+                    // working→blocked→idle change (or a raised/cleared attention
+                    // latch) repaints the title bar even when proc_name is
+                    // unchanged.
+                    (p.agent_state as u8).hash(&mut hh);
+                    p.attention.hash(&mut hh);
                 }
             }
         }
@@ -832,6 +901,7 @@ impl Gritty {
     /// indices of windows whose *visible* (active) tab changed, so callers only
     /// repaint windows with something new to show.
     pub(crate) fn drain_pty(&mut self) -> Vec<usize> {
+        crate::watchdog::mark(crate::watchdog::DRAIN_PTY);
         let mut dirty = Vec::new();
         for (wi, win) in self.windows.iter_mut().enumerate() {
             let active = win.active;
@@ -902,34 +972,11 @@ impl Gritty {
             let win = &mut self.windows[wi];
             let mut ti = 0;
             while ti < win.tabs.len() {
-                // CA-40: flag any newly-dead pane (keep it one more cycle so its
-                // final line paints), and only reap panes already seen dead.
-                let mut dead: Vec<usize> = Vec::new();
-                for (id, p) in win.tabs[ti].panes.iter_mut() {
-                    if p.pty.is_alive() {
-                        continue;
-                    }
-                    if should_reap_dead_pane(p.dead_seen) {
-                        dead.push(*id);
-                    } else {
-                        p.dead_seen = true;
-                        deferred = true;
-                    }
-                }
-                for id in dead {
-                    changed = true;
-                    let tab = &mut win.tabs[ti];
-                    let tree = std::mem::replace(&mut tab.tree, crate::layout::Node::Leaf(id));
-                    if let Some(t) = tree.without(id) {
-                        tab.tree = t;
-                        if tab.focus == id {
-                            let mut lv = Vec::new();
-                            tab.tree.leaves(&mut lv);
-                            tab.focus = *lv.first().unwrap_or(&id);
-                        }
-                    }
-                    tab.panes.remove(&id);
-                }
+                // CA-40: flag newly-dead panes (kept one more cycle so their
+                // final line paints) and reap those already seen dead.
+                let (reaped, def) = reap_tab_panes(&mut win.tabs[ti]);
+                changed |= reaped;
+                deferred |= def;
                 if win.tabs[ti].panes.is_empty() {
                     win.tabs.remove(ti);
                     // RT-73/CA-93: removing a tab shifts every later tab's index
@@ -1005,6 +1052,9 @@ impl Gritty {
     /// once — dispatch one command to a whole fleet of agents without going
     /// pane-by-pane. Each pane gets the text wrapped for its own bracketed-paste
     /// mode. Returns the number of panes written to.
+    /// Paste the clipboard into every pane of the focused window's active tab at
+    /// once (the visible workspace) — not other tabs or windows. Mirrors the
+    /// tab-scoped broadcast-input mode (RT-8). Returns the number of panes written.
     pub(crate) fn broadcast_paste_all(&mut self) -> usize {
         let Some(text) = self.clip.paste() else {
             return 0;
@@ -1012,15 +1062,33 @@ impl Gritty {
         if text.is_empty() {
             return 0;
         }
+        let wi = self.focused;
         let mut written = 0;
-        for win in &mut self.windows {
-            for tab in &mut win.tabs {
-                for pane in tab.panes.values_mut() {
-                    let data = crate::term::wrap_paste(&text, pane.term.bracketed_paste());
-                    pane.term.scroll_to_bottom();
-                    pane.pty.write(&data);
-                    written += 1;
-                }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for pane in tab.panes.values_mut() {
+                let data = crate::term::wrap_paste(&text, pane.term.bracketed_paste());
+                pane.term.scroll_to_bottom();
+                pane.pty.write(&data);
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// Send a carriage return (Enter) to every pane of the focused window's active
+    /// tab — the "submit" counterpart to [`broadcast_paste_all`], with the same
+    /// tab scope. Broadcast-paste a command to the tab, eyeball it, then run it
+    /// everywhere at once. Returns the number of panes written; CR (`\r`) is
+    /// exactly what the Enter key sends, so each pane's program reacts as if the
+    /// user pressed Enter there.
+    pub(crate) fn broadcast_enter_all(&mut self) -> usize {
+        let wi = self.focused;
+        let mut written = 0;
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for pane in tab.panes.values_mut() {
+                pane.term.scroll_to_bottom();
+                pane.pty.write(b"\r");
+                written += 1;
             }
         }
         written
@@ -1627,6 +1695,7 @@ impl ApplicationHandler<Wake> for Gritty {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
+        let _wd = crate::watchdog::active(crate::watchdog::USER_EVENT);
         let dirty = self.drain_pty();
         // CA-40: `reap_dead` defers a just-died pane by one cycle so its final
         // drained line paints first. When it did defer, paint now (the final
@@ -1640,9 +1709,12 @@ impl ApplicationHandler<Wake> for Gritty {
         // CA-54: skip the (full process-table) snapshot entirely when no window is
         // visible — an occluded/minimized app shows no titles, so polling is pure
         // wasted work. The timer still advances so the poll resumes promptly once
-        // a window is shown again.
-        let any_visible = self.windows.iter().any(|w| w.visible);
-        if proc_poll_due(self.last_proc_poll.elapsed(), any_visible) {
+        // a window is shown again. Exception: keep polling while a backgrounded
+        // agent is still Working, so its finish/block flashes the taskbar (the
+        // notification's whole point is to reach you when gritty isn't on screen).
+        // The `||` short-circuits, so the pane scan only runs when nothing's visible.
+        let poll_active = self.windows.iter().any(|w| w.visible) || self.any_agent_working();
+        if proc_poll_due(self.last_proc_poll.elapsed(), poll_active) {
             proc_dirty = self.update_procs(); // repaint only if a header changed
             self.last_proc_poll = Instant::now();
 
@@ -1684,6 +1756,7 @@ impl ApplicationHandler<Wake> for Gritty {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let _wd = crate::watchdog::active(crate::watchdog::ABOUT_TO_WAIT);
         // CA-52: apply any window-resize that has settled, pushing the new
         // geometry to ALL of its tabs (CA-140) as a single ConPTY resize instead
         // of one per intermediate drag size. A resize still settling is left for
@@ -1740,6 +1813,7 @@ impl ApplicationHandler<Wake> for Gritty {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let _wd = crate::watchdog::active(crate::watchdog::WINDOW_EVENT);
         let Some(wi) = self.idx_of(id) else {
             return;
         };
@@ -2082,6 +2156,136 @@ impl Gritty {
         self.request_redraw(wi);
     }
 
+    /// Every agent pane in window `wi`, across all tabs, in stable order (tab
+    /// order, then pane id) — the rows of the agent overview overlay.
+    pub(crate) fn agent_items(&self, wi: usize) -> Vec<crate::overview::Item> {
+        self.windows.get(wi).map(agent_items_of).unwrap_or_default()
+    }
+
+    /// Toggle the agent overview overlay. Opening pre-selects the first item that
+    /// wants attention, so the pane that needs you is one Enter away.
+    pub(crate) fn toggle_agents(&mut self, wi: usize) {
+        let open = self.windows.get(wi).is_some_and(|w| w.agents.is_some());
+        if open {
+            if let Some(win) = self.windows.get_mut(wi) {
+                win.agents = None;
+            }
+        } else {
+            let sel = self
+                .agent_items(wi)
+                .iter()
+                .position(|it| it.attention)
+                .unwrap_or(0);
+            if let Some(win) = self.windows.get_mut(wi) {
+                win.agents = Some(crate::overview::Overview { sel });
+            }
+        }
+        self.request_redraw(wi);
+    }
+
+    /// Keyboard handling while the overview is open: Up/Down move, Enter jumps to
+    /// the selected pane, Esc closes.
+    pub(crate) fn handle_agents_key(&mut self, key: &Key) {
+        let wi = self.focused;
+        let len = self.agent_items(wi).len();
+        match key {
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(ov) = self.windows.get_mut(wi).and_then(|w| w.agents.as_mut()) {
+                    ov.sel = crate::overview::clamp_sel(ov.sel + 1, len);
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(ov) = self.windows.get_mut(wi).and_then(|w| w.agents.as_mut()) {
+                    ov.sel = ov.sel.saturating_sub(1);
+                }
+            }
+            Key::Named(NamedKey::Escape) => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.agents = None;
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                let sel = self
+                    .windows
+                    .get(wi)
+                    .and_then(|w| w.agents.as_ref())
+                    .map_or(0, |o| o.sel);
+                if let Some(it) = self.agent_items(wi).get(sel) {
+                    let (tab, pane) = (it.tab, it.pane);
+                    self.jump_to_agent(wi, tab, pane);
+                }
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.agents = None;
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw(wi);
+    }
+
+    /// Make pane `pane` in tab `tab` the focused pane (switching the active tab),
+    /// clear its attention latch, and close the overview. Mirrors a keyboard tab
+    /// switch — `switch_active_tab` for the CA-63 broadcast-disarm invariant, then
+    /// drain + relayout so a background tab whose panes have stale geometry (the
+    /// window resized while it was hidden) reflows before it's shown.
+    pub(crate) fn jump_to_agent(&mut self, wi: usize, tab: usize, pane: usize) {
+        let valid = self
+            .windows
+            .get(wi)
+            .and_then(|w| w.tabs.get(tab))
+            .is_some_and(|t| t.panes.contains_key(&pane));
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.agents = None;
+            if valid {
+                if let Some(t) = win.tabs.get_mut(tab) {
+                    t.focus = pane;
+                    if let Some(p) = t.panes.get_mut(&pane) {
+                        p.attention = false;
+                    }
+                }
+            }
+        }
+        if valid {
+            self.switch_active_tab(wi, tab); // CA-63: also disarms broadcast.
+            self.drain_pty();
+            self.relayout(wi);
+        }
+        self.request_redraw(wi);
+    }
+
+    /// Handle a left-click while the overview is open: jump to the clicked row,
+    /// keep it open on chrome, or dismiss it on an outside click.
+    fn agents_click(&mut self, wi: usize, px: f64, py: f64) {
+        let (cw, ch) = (self.font.cell_w.max(1), self.font.cell_h.max(1));
+        let (stride, _) = self.win_size(wi);
+        let items = self.agent_items(wi);
+        let (bx, by, box_w, box_h, shown) = crate::overview::geom(stride, cw, ch, items.len());
+        match crate::overview::hit(
+            px.max(0.0) as usize,
+            py.max(0.0) as usize,
+            bx,
+            by,
+            box_w,
+            box_h,
+            ch,
+            shown,
+        ) {
+            crate::overview::Hit::Row(i) => {
+                if let Some(it) = items.get(i) {
+                    let (tab, pane) = (it.tab, it.pane);
+                    self.jump_to_agent(wi, tab, pane);
+                }
+            }
+            crate::overview::Hit::Outside => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.agents = None;
+                }
+            }
+            crate::overview::Hit::Chrome => {}
+        }
+        self.request_redraw(wi);
+    }
+
     pub(crate) fn begin_selection(&mut self, wi: usize, event_loop: &ActiveEventLoop) {
         // Clear any stale tab-drag from a previous press whose release we never
         // saw (e.g. released over another window with no pointer capture).
@@ -2098,6 +2302,10 @@ impl Gritty {
         // pane selection behind it: the palette runs the clicked row / dismisses
         // on an outside click; an open rename is cancelled by a click. Without
         // this, clicking a palette entry did nothing and left it stuck open.
+        if self.windows.get(wi).is_some_and(|w| w.agents.is_some()) {
+            self.agents_click(wi, x, y);
+            return;
+        }
         if self
             .windows
             .get(wi)
@@ -2125,51 +2333,7 @@ impl Gritty {
 
         // Click on the tab bar switches/closes/creates tabs instead of selecting.
         if (y as usize) < self.bar_h() {
-            let (w, _) = self.win_size(wi);
-            // CA-28: check for × (close) and + (new) button hits first.
-            if let Some(hit) = self.tab_button_at(wi, x as usize, w) {
-                match hit {
-                    TabHit::Close(i) => {
-                        let len = self.windows.get(wi).map(|win| win.tabs.len()).unwrap_or(0);
-                        if i < len {
-                            if let Some(win) = self.windows.get_mut(wi) {
-                                win.broadcast = false;
-                                win.broadcast_pending_signal = None;
-                            }
-                            // CA-105: the tab `×` closes the WHOLE tab `i` (all its
-                            // panes/PTYs), not the focused pane of that tab. (The
-                            // close-*pane* action stays on Ctrl+Shift+W.)
-                            self.close_tab(wi, i, event_loop);
-                        }
-                    }
-                    TabHit::New => {
-                        self.new_tab(wi);
-                        if let Some(win) = self.windows.get_mut(wi) {
-                            win.broadcast = false;
-                            win.broadcast_pending_signal = None;
-                        }
-                    }
-                }
-                self.request_redraw(wi);
-                return;
-            }
-            if let Some(i) = self.tab_at(wi, clamp_pixel(x)) {
-                if let Some(win) = self.windows.get_mut(wi) {
-                    if i != win.active {
-                        win.broadcast = false;
-                        win.broadcast_pending_signal = None;
-                    }
-                    win.active = i;
-                    // Arm a possible tear-off: dragging this tab out tears it off.
-                    win.tab_drag = Some(TabDrag {
-                        index: i,
-                        armed: false,
-                    });
-                }
-                self.drain_pty(); // RT-10: flush newly focused tab's PTY output.
-                self.relayout(wi);
-                self.request_redraw(wi);
-            }
+            self.handle_tab_bar_click(wi, x, event_loop);
             return;
         }
 
@@ -2227,6 +2391,60 @@ impl Gritty {
             return;
         }
 
+        self.start_text_selection(wi, x, y, id, grid);
+    }
+
+    /// Handle a press inside the tab-strip band: a `×`/`+` button, or selecting a
+    /// tab (which also arms a possible tear-off drag). Split out of
+    /// `begin_selection` so that method stays at the altitude of routing a click.
+    fn handle_tab_bar_click(&mut self, wi: usize, x: f64, event_loop: &ActiveEventLoop) {
+        let (w, _) = self.win_size(wi);
+        // CA-28: check for × (close) and + (new) button hits first.
+        if let Some(hit) = self.tab_button_at(wi, x as usize, w) {
+            match hit {
+                TabHit::Close(i) => {
+                    let len = self.windows.get(wi).map(|win| win.tabs.len()).unwrap_or(0);
+                    if i < len {
+                        if let Some(win) = self.windows.get_mut(wi) {
+                            win.broadcast = false;
+                            win.broadcast_pending_signal = None;
+                        }
+                        // CA-105: the tab `×` closes the WHOLE tab `i` (all its
+                        // panes/PTYs), not the focused pane of that tab. (The
+                        // close-*pane* action stays on Ctrl+Shift+W.)
+                        self.close_tab(wi, i, event_loop);
+                    }
+                }
+                TabHit::New => {
+                    self.new_tab(wi);
+                    if let Some(win) = self.windows.get_mut(wi) {
+                        win.broadcast = false;
+                        win.broadcast_pending_signal = None;
+                    }
+                }
+            }
+            self.request_redraw(wi);
+            return;
+        }
+        if let Some(i) = self.tab_at(wi, clamp_pixel(x)) {
+            // CA-63: a real switch disarms broadcast; a no-op re-click preserves it.
+            self.switch_active_tab(wi, i);
+            if let Some(win) = self.windows.get_mut(wi) {
+                // Arm a possible tear-off: dragging this tab out tears it off.
+                win.tab_drag = Some(TabDrag {
+                    index: i,
+                    armed: false,
+                });
+            }
+            self.drain_pty(); // RT-10: flush newly focused tab's PTY output.
+            self.relayout(wi);
+            self.request_redraw(wi);
+        }
+    }
+
+    /// Start (or word/line-extend) a text selection in pane `id` at pixel (x, y).
+    /// `grid` is the pane's grid rect. Split out of `begin_selection`.
+    fn start_text_selection(&mut self, wi: usize, x: f64, y: f64, id: usize, grid: Rect) {
         // CA-18: classify click count for word/line selection.
         let count = self.classify_click(wi);
 
@@ -2622,7 +2840,9 @@ pub(crate) fn atlas_px(font_px: f32, scale: f64) -> f32 {
 
 /// CA-39: the OS window caption for a focused pane whose program announced
 /// `osc_title` via OSC 0/2. An empty title (none set, or after `ResetTitle`)
-/// shows the bare app name; otherwise it's `gritty — <title>`. Pure so the
+/// shows the bare app name; otherwise it's `gritty — <title>`. The title tracks
+/// the focused pane's program (a shell reports its cwd; Claude/vim/ssh report
+/// their own status), so the caption updates as you switch panes. Pure so the
 /// composing rule is unit-tested without a window.
 pub(crate) fn window_caption(osc_title: &str) -> String {
     let t = osc_title.trim();
@@ -2743,6 +2963,31 @@ pub(crate) fn clamp_to_monitors(
     (cx as i32, cy as i32)
 }
 
+/// Every agent pane in a window, across all tabs, in stable order (tab order,
+/// then pane id — `HashMap` iteration order is otherwise nondeterministic, which
+/// would shuffle the overview rows frame to frame). Free fn so the renderer can
+/// build the list while it holds a mutable borrow of the window.
+pub(crate) fn agent_items_of(win: &Win) -> Vec<crate::overview::Item> {
+    let mut items = Vec::new();
+    for (ti, tab) in win.tabs.iter().enumerate() {
+        let mut ids: Vec<usize> = tab.panes.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let p = &tab.panes[&id];
+            if let Some(agent) = p.agent {
+                items.push(crate::overview::Item {
+                    tab: ti,
+                    pane: id,
+                    label: format!("{} / {}: {}", tab.name, p.name, agent.label()),
+                    state: p.agent_state,
+                    attention: p.attention,
+                });
+            }
+        }
+    }
+    items
+}
+
 /// CA-50: whether closing a pane/tab/window needs a confirmation prompt because
 /// its focused pane is running a non-shell foreground process (an editor, a
 /// build, an SSH session). `proc_name` is the periodically-polled foreground
@@ -2788,6 +3033,45 @@ pub(crate) fn resize_settled(since_last_resize: Duration, debounce: Duration) ->
 /// is unit-tested.
 pub(crate) fn should_reap_dead_pane(already_seen: bool) -> bool {
     already_seen
+}
+
+/// Reap a single tab's panes whose PTY has exited *and* were already seen dead a
+/// previous cycle; a newly-dead pane is only flagged (`dead_seen`) so its final
+/// line paints once more (CA-40). Returns `(reaped_any, deferred_any)` — whether
+/// a pane was removed, and whether a newly-dead pane was deferred to next cycle.
+/// Pulled out of `reap_dead`'s window→tab→pane triple loop to flatten it.
+fn reap_tab_panes(tab: &mut Tab) -> (bool, bool) {
+    let mut dead: Vec<usize> = Vec::new();
+    let mut deferred = false;
+    for (id, p) in tab.panes.iter_mut() {
+        if p.pty.is_alive() {
+            continue;
+        }
+        if should_reap_dead_pane(p.dead_seen) {
+            dead.push(*id);
+        } else {
+            p.dead_seen = true;
+            deferred = true;
+        }
+    }
+    let reaped = !dead.is_empty();
+    for id in dead {
+        let tree = std::mem::replace(&mut tab.tree, crate::layout::Node::Leaf(id));
+        if let Some(t) = tree.without(id) {
+            tab.tree = t;
+            if tab.focus == id {
+                // `without` returns Some only while leaves remain, so `first()`
+                // is the surviving pane; never leave focus on the removed `id`.
+                let mut lv = Vec::new();
+                tab.tree.leaves(&mut lv);
+                if let Some(&f) = lv.first() {
+                    tab.focus = f;
+                }
+            }
+        }
+        tab.panes.remove(&id);
+    }
+    (reaped, deferred)
 }
 
 /// CA-7: Encode an SGR mouse sequence.
@@ -2940,8 +3224,10 @@ pub(crate) fn bell_painted_live(is_active_tab: bool, window_visible: bool) -> bo
 /// when the interval has elapsed AND at least one window is visible — an
 /// occluded/minimized app shows no titles, so a full process-table snapshot is
 /// pure wasted work while hidden.
-pub(crate) fn proc_poll_due(since_last: Duration, any_window_visible: bool) -> bool {
-    any_window_visible && since_last >= PROC_POLL_INTERVAL
+/// `active` is true when polling is worthwhile: a window is visible (titles to
+/// refresh) or a backgrounded agent is still working (a notification is pending).
+pub(crate) fn proc_poll_due(since_last: Duration, active: bool) -> bool {
+    active && since_last >= PROC_POLL_INTERVAL
 }
 
 /// CA-114/CA-123: the soonest remaining cooldown across all windows that have a

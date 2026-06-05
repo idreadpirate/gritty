@@ -11,7 +11,9 @@ pub struct Cell {
     pub bg: u32,
 }
 
-fn buf_height(buf: &[u32], stride: usize) -> usize {
+/// Buffer height in pixels: `len / stride`, or 0 when `stride == 0`. Shared by
+/// the rasterizer and `paint` so both derive bounds the same way.
+pub(crate) fn buf_height(buf: &[u32], stride: usize) -> usize {
     buf.len().checked_div(stride).unwrap_or(0)
 }
 
@@ -123,6 +125,10 @@ pub fn draw_cell(
         return;
     }
 
+    // `m` and `bitmap` are produced and cached together by one `rasterize` call
+    // (font.rs), so `bitmap.len() == m.width * m.height` always holds — the
+    // `bitmap[ry * m.width + rx]` read below is in-bounds for every ry<height,
+    // rx<width and cannot panic.
     let (m, bitmap) = {
         let g = font.glyph(cell.ch);
         (g.0, &g.1)

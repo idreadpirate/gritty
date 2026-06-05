@@ -2,6 +2,7 @@
 // Multiplexer: tabs + split panes with per-pane names, scrollback, copy/paste.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod app;
 mod background;
 mod clipboard;
@@ -12,6 +13,7 @@ mod fuzzy;
 mod input;
 mod key;
 mod layout;
+mod overview;
 mod paint;
 mod palette;
 mod persist;
@@ -20,6 +22,7 @@ mod pty;
 mod render;
 mod session;
 mod term;
+mod watchdog;
 
 use winit::event_loop::EventLoop;
 use winit::window::Window;
@@ -91,6 +94,40 @@ pub(crate) fn style_caption(window: &Window) {
 
 #[cfg(not(windows))]
 pub(crate) fn style_caption(_window: &Window) {}
+
+/// Flash this window's taskbar button to signal an unattended agent finished or
+/// needs input. `FLASHW_TIMERNOFG` flashes until the window comes to the
+/// foreground and is a no-op when it already is, so focusing the window stops
+/// it; we never steal focus. Best-effort — a missing handle just skips it.
+#[cfg(windows)]
+pub(crate) fn flash_taskbar(window: &Window) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FlashWindowEx, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(w) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = w.hwnd.get() as *mut core::ffi::c_void;
+    let info = FLASHWINFO {
+        cbSize: core::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 3,
+        dwTimeout: 0,
+    };
+    // SAFETY: `info` is a correctly-sized FLASHWINFO with a live HWND.
+    unsafe {
+        FlashWindowEx(&info);
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn flash_taskbar(_window: &Window) {}
 
 /// Relaunch gritty fully detached from the terminal/job that started it, then
 /// exit the original process. Without this, closing the PowerShell/cmd window
@@ -262,6 +299,12 @@ fn main() {
     // Detach from the launching terminal before doing anything else, so closing
     // that window can't reap us (and so we never create two windows/sessions).
     ensure_detached();
+
+    // Hang watchdog: if the UI thread wedges (a blocking clipboard/PTY call, a
+    // lock deadlock), a background thread records which phase to crash.log so a
+    // silent freeze becomes diagnosable. Started after the detach re-exec so it
+    // lives in the surviving instance; it costs one mostly-sleeping thread.
+    watchdog::start(crash_log_path());
 
     let event_loop = EventLoop::<Wake>::with_user_event()
         .build()

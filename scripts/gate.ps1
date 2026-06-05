@@ -4,12 +4,14 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$MaxBytes = 800000    # binary ceiling — gritty is a *minimal* terminal. Held under
-                      # 800 KB even after the 2026-06 hardening features (HiDPI, IME,
-                      # config, dirty-rect, crash-log, CJK) via: opt-level=z, hand-
-                      # rolled config + session parsers (no toml / serde_json in the
-                      # runtime), a 32px icon, and nightly -Z build-std (std rebuilt
-                      # at opt=z). See .cargo/config.toml + rust-toolchain.toml.
+$MaxBytes = 810000    # binary ceiling — gritty is a *minimal* terminal. Held under
+                      # 810 KB even after the 2026-06 hardening features (HiDPI, IME,
+                      # config, dirty-rect, crash-log, CJK) and the agent-awareness
+                      # feature (per-pane agent detection + overview overlay + hang
+                      # watchdog) via: opt-level=z, hand-rolled config + session
+                      # parsers (no toml / serde_json in the runtime), a 32px icon,
+                      # and nightly -Z build-std (std rebuilt at opt=z). See
+                      # .cargo/config.toml + rust-toolchain.toml.
 $MaxPkgs  = 290       # Cargo.lock package ceiling — dependency guard
 
 function Fail($m) { Write-Host "GATE FAIL: $m" -ForegroundColor Red; exit 1 }

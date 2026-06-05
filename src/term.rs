@@ -83,6 +83,83 @@ fn osc7_uri_to_path(uri: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// The OSC 7 prefix as raw bytes: ESC ] 7 ;
+const OSC7_PREFIX: &[u8] = b"\x1b]7;";
+
+/// Upper bound on the carried partial-OSC-7 buffer. A real `file://…` cwd URI is
+/// well under this; the cap stops a hostile stream of `ESC ] 7 ;` with no
+/// terminator from growing the carry without limit.
+const OSC7_MAX_CARRY: usize = 4096;
+
+/// Index of an `ESC \` (ST) or `BEL` terminator within `buf`, as
+/// `(terminator_start, bytes_after)`, or `None` if `buf` holds no complete
+/// terminator (an unterminated or split sequence). A lone trailing `ESC` is
+/// treated as unterminated — it may be the first byte of a split `ESC \`.
+fn osc_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut j = 0;
+    while j < buf.len() {
+        if buf[j] == b'\x07' {
+            return Some((j, j + 1)); // BEL
+        }
+        if buf[j] == b'\x1b' && j + 1 < buf.len() && buf[j + 1] == b'\\' {
+            return Some((j, j + 2)); // ST = ESC \
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Start index of a trailing *partial* prefix: the longest non-empty proper
+/// prefix of `needle` that `buf` ends with (e.g. `buf` ends in `ESC ] 7` while
+/// `needle` is `ESC ] 7 ;`). `None` if `buf` does not end mid-prefix. A *full*
+/// prefix at the tail is not reported here — that is handled as an unterminated
+/// sequence by the caller.
+fn trailing_partial_prefix(buf: &[u8], needle: &[u8]) -> Option<usize> {
+    let maxk = needle.len().saturating_sub(1).min(buf.len());
+    (1..=maxk)
+        .rev()
+        .find(|&k| buf[buf.len() - k..] == needle[..k])
+        .map(|k| buf.len() - k)
+}
+
+/// Scan `buf` for OSC 7 sequences, updating `*cwd` (last wins), and return the
+/// trailing in-flight bytes to carry into the next chunk (empty when the chunk
+/// ended cleanly). Pure except for the `cwd` out-param, so it is unit-testable
+/// without a live `Terminal`.
+fn scan_osc7_into(buf: &[u8], cwd: &mut Option<String>) -> Vec<u8> {
+    let mut i = 0;
+    let carry_from = loop {
+        let Some(offset) = buf[i..]
+            .windows(OSC7_PREFIX.len())
+            .position(|w| w == OSC7_PREFIX)
+        else {
+            // No full prefix remains — carry only a trailing partial prefix
+            // (the prefix itself straddling the read boundary), if any.
+            break trailing_partial_prefix(&buf[i..], OSC7_PREFIX).map(|p| i + p);
+        };
+        let prefix_at = i + offset;
+        let start = prefix_at + OSC7_PREFIX.len(); // first byte of the URI
+        match osc_terminator(&buf[start..]) {
+            Some((rel_end, rel_next)) => {
+                if let Ok(uri) = std::str::from_utf8(&buf[start..start + rel_end]) {
+                    if let Some(path) = osc7_uri_to_path(uri) {
+                        *cwd = Some(path);
+                    }
+                }
+                i = start + rel_next; // continue: a later sequence may override
+            }
+            // Prefix seen but no terminator yet — carry the whole in-flight
+            // sequence (from the prefix) until the next chunk completes it.
+            None => break Some(prefix_at),
+        }
+    };
+    match carry_from {
+        // Drop a runaway (never-terminated) sequence rather than grow unbounded.
+        Some(s) if buf.len() - s <= OSC7_MAX_CARRY => buf[s..].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// Default lines of scrollback kept per pane when no config override applies.
 /// Mirrors `config::Config::default().scrollback`.
 pub const DEFAULT_SCROLLBACK: usize = 5000;
@@ -154,6 +231,12 @@ pub struct Terminal {
     /// Latest working-directory path announced via OSC 7, or `None` if none
     /// has been received yet.
     cwd: Option<String>,
+    /// RT-24-style carry for an OSC 7 sequence split across two PTY reads: the
+    /// bytes of an in-flight (not-yet-terminated) `ESC ] 7 ;…` sequence, or a
+    /// trailing partial prefix, held until the next `feed` completes it. Empty
+    /// in the common case (no allocation on the hot path). Bounded by
+    /// `OSC7_MAX_CARRY` so an unterminated sequence can't grow it without limit.
+    osc7_carry: Vec<u8>,
     /// Set to `true` by `TitleListener` when a BEL (`\x07`) is received.
     /// Consumed (cleared) by `take_bell()`.
     bell: Arc<AtomicBool>,
@@ -176,6 +259,7 @@ impl Terminal {
             size,
             title,
             cwd: None,
+            osc7_carry: Vec::new(),
             bell,
         }
     }
@@ -210,47 +294,21 @@ impl Terminal {
     /// BEL (`\x07`) or the two-byte string-terminator `\x1b\\`.  Multiple
     /// occurrences in one chunk are handled; only the last one wins (matches
     /// the order in which a shell emits them).
+    ///
+    /// A sequence split across two PTY reads — the prefix straddling the seam,
+    /// or the URI/terminator arriving in the next chunk — is carried in
+    /// `osc7_carry` and completed on the following `feed`, so a `cd` whose OSC 7
+    /// happens to land on a read boundary still updates `cwd`. The carry only
+    /// drives our own detection; it is never re-fed to the VT parser.
     fn scan_osc7(&mut self, bytes: &[u8]) {
-        // The OSC 7 prefix as raw bytes: ESC ] 7 ;
-        const PREFIX: &[u8] = b"\x1b]7;";
-        let mut i = 0;
-        while i + PREFIX.len() < bytes.len() {
-            // Find the next prefix occurrence.
-            let Some(offset) = bytes[i..].windows(PREFIX.len()).position(|w| w == PREFIX) else {
-                break;
-            };
-            let start = i + offset + PREFIX.len(); // first byte of the URI
-
-            // Collect the URI up to BEL or ST.
-            let mut end = None;
-            let mut j = start;
-            while j < bytes.len() {
-                if bytes[j] == b'\x07' {
-                    // BEL terminator
-                    end = Some((j, j + 1));
-                    break;
-                }
-                if bytes[j] == b'\x1b' && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                    // ST (String Terminator) = ESC \
-                    end = Some((j, j + 2));
-                    break;
-                }
-                j += 1;
-            }
-
-            if let Some((uri_end, next_i)) = end {
-                if let Ok(uri) = std::str::from_utf8(&bytes[start..uri_end]) {
-                    if let Some(path) = osc7_uri_to_path(uri) {
-                        self.cwd = Some(path);
-                    }
-                }
-                i = next_i;
-            } else {
-                // No terminator found; skip past this prefix to avoid an
-                // infinite loop, but stop scanning (partial sequence at end
-                // of chunk — the shell will retransmit on the next prompt).
-                break;
-            }
+        // Common case: nothing in flight, scan the chunk directly (no alloc).
+        // Otherwise splice the in-flight bytes ahead of the new chunk first.
+        if self.osc7_carry.is_empty() {
+            self.osc7_carry = scan_osc7_into(bytes, &mut self.cwd);
+        } else {
+            let mut buf = std::mem::take(&mut self.osc7_carry);
+            buf.extend_from_slice(bytes);
+            self.osc7_carry = scan_osc7_into(&buf, &mut self.cwd);
         }
     }
 
@@ -331,6 +389,31 @@ impl Terminal {
     /// avoids the `Vec` allocation `take_damage` would make for the line list.
     pub fn reset_damage(&mut self) {
         self.term.reset_damage();
+    }
+
+    /// Read the bottom `max_rows` rows of the live viewport as plain text, one
+    /// line per row with trailing blanks trimmed. Used by agent-state detection
+    /// (`agent.rs`), which matches the agent's on-screen UI chrome. Returns the
+    /// live screen regardless of scrollback position by reading grid lines
+    /// directly rather than the (possibly scrolled) renderable viewport.
+    pub fn screen_tail(&self, max_rows: usize) -> String {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        let start = rows.saturating_sub(max_rows);
+        let mut out = String::new();
+        for row in start..rows {
+            let row_start = out.len();
+            for col in 0..cols {
+                out.push(grid[Point::new(Line(row as i32), Column(col))].c);
+            }
+            // Trim this row's trailing blanks in place (no per-row allocation).
+            let kept = out[row_start..].trim_end().len();
+            out.truncate(row_start + kept);
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -629,6 +712,67 @@ mod tests {
         // Space encoded as %20.
         t.feed(b"\x1b]7;file:///my%20dir\x07");
         assert_eq!(t.cwd().as_deref(), Some("/my dir"));
+    }
+
+    #[test]
+    fn osc7_uri_split_across_reads_updates_cwd() {
+        // RT-24: the URI and terminator arrive in the next chunk.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b]7;file:///tmp/wo");
+        assert!(t.cwd().is_none(), "no terminator yet — cwd not set");
+        t.feed(b"rk\x07");
+        assert_eq!(t.cwd().as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn osc7_prefix_split_across_reads_updates_cwd() {
+        // The 4-byte prefix itself straddles the read boundary (ESC ] 7 | ; …).
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"output\x1b]7");
+        t.feed(b";file:///srv\x07");
+        assert_eq!(t.cwd().as_deref(), Some("/srv"));
+    }
+
+    #[test]
+    fn osc7_st_terminator_split_across_reads() {
+        // The two-byte ST (ESC \) is split: trailing ESC then \ next chunk.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b]7;file:///a/b\x1b");
+        assert!(
+            t.cwd().is_none(),
+            "lone trailing ESC is not yet a terminator"
+        );
+        t.feed(b"\\");
+        assert_eq!(t.cwd().as_deref(), Some("/a/b"));
+    }
+
+    #[test]
+    fn osc7_unterminated_runaway_is_bounded_and_dropped() {
+        // A prefix with a huge URI and no terminator must not grow the carry
+        // without limit; once it exceeds the cap the partial is dropped.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        let mut chunk = b"\x1b]7;file:///".to_vec();
+        chunk.extend(std::iter::repeat_n(b'a', OSC7_MAX_CARRY + 100));
+        t.feed(&chunk);
+        assert!(
+            t.osc7_carry.len() <= OSC7_MAX_CARRY,
+            "carry {} exceeded cap {OSC7_MAX_CARRY}",
+            t.osc7_carry.len()
+        );
+        // A terminator now can't recover the dropped path — but must not panic.
+        t.feed(b"\x07");
+        assert!(t.cwd().is_none());
+    }
+
+    #[test]
+    fn trailing_partial_prefix_matches_proper_prefixes_only() {
+        let p = OSC7_PREFIX;
+        assert_eq!(trailing_partial_prefix(b"x\x1b]7", p), Some(1));
+        assert_eq!(trailing_partial_prefix(b"x\x1b", p), Some(1));
+        assert_eq!(trailing_partial_prefix(b"xyz", p), None);
+        // A full prefix at the tail is NOT a partial — caller treats it as an
+        // unterminated sequence instead.
+        assert_eq!(trailing_partial_prefix(b"\x1b]7;", p), None);
     }
 
     // --- BEL / visual bell tests ---

@@ -5,7 +5,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::app::Gritty;
-use crate::color::{self, PANE_SEP, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG};
+use crate::color::{
+    self, OVERLAY_PANEL_BG, PANE_SEP, SELECTION_BG, UI_BAR_BG, UI_DIM, UI_TITLE_BG,
+};
 use crate::font::FontAtlas;
 use crate::layout::Rect;
 use crate::render::{self, draw_cell, draw_text, fill_rect, stroke_rect, Cell};
@@ -13,6 +15,7 @@ use crate::session;
 
 impl Gritty {
     pub(crate) fn redraw(&mut self, wi: usize) {
+        crate::watchdog::mark(crate::watchdog::REDRAW);
         if wi >= self.windows.len() {
             return;
         }
@@ -64,7 +67,12 @@ impl Gritty {
             || sig != win.last_sig
             || any_bell
             || any_sel
-            || any_scroll;
+            || any_scroll
+            // The agent overview lists panes across every tab, so a background
+            // pane's state change wouldn't move `sig`; redraw it fully each frame
+            // while open (a brief, user-opened overlay) so it stays live and a
+            // partial grid repaint can't corrupt it.
+            || win.agents.is_some();
         win.force_full = false;
         win.last_sig = sig;
         if size_changed {
@@ -314,7 +322,13 @@ impl Gritty {
                         .and_then(|t| t.panes.get(&id))
                         .map(|p| {
                             let proc = p.proc_name.as_str();
-                            let base = if proc.is_empty()
+                            let base = if let Some(agent) = p.agent {
+                                // An agent owns the pane: show a color-neutral
+                                // state badge (CA-25) + the agent label, so a
+                                // glance tells you which pane needs you.
+                                let badge = crate::agent::state_badge(p.agent_state, p.attention);
+                                format!("{} {}: {}", badge, p.name, agent.label())
+                            } else if proc.is_empty()
                                 || proc == "pwsh"
                                 || proc == "cmd"
                                 || proc == "powershell"
@@ -385,7 +399,7 @@ impl Gritty {
                 let box_h = (shown + 1) * ch + ch / 2;
                 let bx = (stride.saturating_sub(box_w)) / 2;
                 let by = ch * 2;
-                let panel = 0x0020_2030u32;
+                let panel = OVERLAY_PANEL_BG;
                 let rbox = Rect {
                     x: bx,
                     y: by,
@@ -444,6 +458,105 @@ impl Gritty {
                 }
             }
 
+            // Agent overview overlay (Ctrl+Shift+A): a jump list of every agent
+            // pane across all tabs, with its status badge.
+            if let Some(ov) = win.agents.as_ref() {
+                let items = crate::app::agent_items_of(win);
+                let (bx, by, box_w, box_h, shown) =
+                    crate::overview::geom(stride, cw, ch, items.len());
+                let panel = OVERLAY_PANEL_BG;
+                let rbox = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: box_h,
+                };
+                fill_rect(&mut buffer, stride, rbox, panel);
+                stroke_rect(&mut buffer, stride, rbox, accent);
+
+                let title_rect = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: ch,
+                };
+                let title = if items.is_empty() {
+                    "Agents — none running  (Esc to close)"
+                } else {
+                    "Agents  (\u{2191}\u{2193} select · Enter jump · Esc close)"
+                };
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    bx + cw,
+                    by,
+                    title,
+                    accent,
+                    panel,
+                    true,
+                    title_rect,
+                );
+
+                let first = crate::overview::first_row_y(by, ch);
+                for (i, it) in items.iter().take(shown).enumerate() {
+                    let iy = first + i * ch;
+                    let irow = Rect {
+                        x: bx,
+                        y: iy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    let (fg, bg) = if i == ov.sel {
+                        fill_rect(&mut buffer, stride, irow, accent);
+                        (color::bg(), accent)
+                    } else {
+                        (color::fg(), panel)
+                    };
+                    let line = format!(
+                        "{} {}",
+                        crate::agent::state_badge(it.state, it.attention),
+                        it.label
+                    );
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        iy,
+                        &line,
+                        fg,
+                        bg,
+                        true,
+                        irow,
+                    );
+                }
+                // Honest cap: tell the user when more agents exist than rows shown
+                // (the panel caps at VISIBLE_ROWS) rather than silently hiding them.
+                if items.len() > shown {
+                    let fy = first + shown * ch;
+                    let frow = Rect {
+                        x: bx,
+                        y: fy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    let more = format!("… +{} more", items.len() - shown);
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        fy,
+                        &more,
+                        UI_DIM,
+                        panel,
+                        true,
+                        frow,
+                    );
+                }
+            }
+
             // RT-8: broadcast pending-signal confirmation prompt.
             if win.broadcast && win.broadcast_pending_signal.is_some() {
                 let label = " [BROADCAST] press again to send signal to all panes ";
@@ -477,10 +590,15 @@ impl Gritty {
                     ("Ctrl+Shift+D", "Split pane right"),
                     ("Ctrl+Shift+E", "Split pane down"),
                     ("Ctrl+Shift+P", "Command palette"),
+                    ("Ctrl+Shift+A", "Agent overview (jump to a pane)"),
                     ("Ctrl+Shift+R", "Rename pane"),
                     ("Ctrl+Shift+C", "Copy selection"),
                     ("Ctrl+Shift+V", "Paste"),
-                    ("Ctrl+Shift+B", "Broadcast-paste clipboard to ALL panes"),
+                    (
+                        "Ctrl+Shift+B",
+                        "Broadcast-paste clipboard to all panes in tab",
+                    ),
+                    ("Ctrl+Shift+Enter", "Press Enter in all panes in tab"),
                     ("Ctrl+Tab", "Next tab"),
                     ("Ctrl+1-9", "Switch to tab N"),
                     ("Ctrl+0 / +/-", "Font zoom reset/in/out"),
@@ -497,7 +615,7 @@ impl Gritty {
                 let box_h = (shown + 2) * ch;
                 let bx = (stride.saturating_sub(box_w)) / 2;
                 let by = ch * 2;
-                let panel = 0x0020_2030u32;
+                let panel = OVERLAY_PANEL_BG;
                 let rbox = Rect {
                     x: bx,
                     y: by,
@@ -888,118 +1006,163 @@ pub(crate) fn draw_pane_grid(
     // here also keeps the transient flash from being baked into the retained
     // backbuffer (and never consumes the bell on a partial frame).
     if redraw_rows.is_none() && pane.term.take_bell() {
-        // Blend a translucent amber overlay (≈25% opacity) across the pane grid.
-        // Alpha-blend: out = src * alpha + dst * (1 - alpha), alpha = 64/255 ≈ 0.25.
-        const BELL_COLOR: u32 = 0x00ff_7b00; // molten orange (matches ACCENT)
-        const ALPHA: u32 = 64; // ~25% opacity
-        let sr = (BELL_COLOR >> 16) & 0xff;
-        let sg = (BELL_COLOR >> 8) & 0xff;
-        let sb = BELL_COLOR & 0xff;
-        let h = buf_height(buffer, stride);
-        let x1 = (grid.x + grid.w).min(stride);
-        let y1 = (grid.y + grid.h).min(h);
-        for y in grid.y..y1 {
-            let base = y * stride;
-            for x in grid.x..x1 {
-                let dst = buffer[base + x];
-                let dr = (dst >> 16) & 0xff;
-                let dg = (dst >> 8) & 0xff;
-                let db = dst & 0xff;
-                let r = (sr * ALPHA + dr * (255 - ALPHA)) / 255;
-                let g = (sg * ALPHA + dg * (255 - ALPHA)) / 255;
-                let b = (sb * ALPHA + db * (255 - ALPHA)) / 255;
-                buffer[base + x] = (r << 16) | (g << 8) | b;
-            }
-        }
+        draw_visual_bell(buffer, stride, grid);
     }
 
-    // CA-22: scrollback position indicator — thin thumb on the right edge.
-    let display_offset = pane.term.display_offset();
-    if display_offset > 0 && grid.h > 0 && grid.w > 0 {
-        let history = pane.term.term.grid().history_size();
-        let rows = pane.term.size.rows;
-        let (thumb_top, thumb_h) = scrollbar_thumb(grid.h, rows, history, display_offset);
-        // 2px wide thumb drawn at the pane's right edge, using PANE_SEP as track
-        // and a dimmed accent as thumb — visible without clashing.
-        let thumb_x = grid.x + grid.w.saturating_sub(2);
-        fill_rect(
-            buffer,
-            stride,
-            Rect {
-                x: thumb_x,
-                y: grid.y,
-                w: 2,
-                h: grid.h,
-            },
-            PANE_SEP,
-        );
-        fill_rect(
-            buffer,
-            stride,
-            Rect {
-                x: thumb_x,
-                y: grid.y + thumb_top,
-                w: 2,
-                h: thumb_h.max(2),
-            },
-            UI_DIM,
-        );
-    }
+    // CA-22: scrollback position thumb on the right edge (no-op at live bottom).
+    draw_scrollbar(buffer, stride, pane, grid);
 
     // Post-grid cursor overlays (CA-17). In partial mode only re-apply when the
     // cursor's row was repainted this frame; otherwise the retained overlay in
     // the backbuffer is already correct (the cursor only moves when its old and
     // new rows are both damaged, so a moved cursor always lands here).
     if cursor_active && cur_row >= 0 && cur_col >= 0 && row_dirty(cur_row as usize) {
-        let cur_px = grid.x + cur_col as usize * cw;
-        let cur_py = grid.y + cur_row as usize * ch;
-        if cursor_solid {
-            match cursor_shape {
-                CursorShape::Underline => {
-                    // 2px bar at the bottom of the cell.
-                    render::fill_rect(
-                        buffer,
-                        stride,
-                        Rect {
-                            x: cur_px,
-                            y: cur_py + ch.saturating_sub(2),
-                            w: cw,
-                            h: 2,
-                        },
-                        accent,
-                    );
-                }
-                CursorShape::Beam => {
-                    // 2px vertical bar at the left edge of the cell.
-                    render::fill_rect(
-                        buffer,
-                        stride,
-                        Rect {
-                            x: cur_px,
-                            y: cur_py,
-                            w: 2,
-                            h: ch,
-                        },
-                        accent,
-                    );
-                }
-                // Block is handled inline above; Hidden is excluded by cursor_active.
-                _ => {}
-            }
-        } else {
-            // Unfocused pane: hollow dim outline at cursor position (CA-17).
-            render::stroke_rect(
-                buffer,
-                stride,
-                Rect {
-                    x: cur_px,
-                    y: cur_py,
-                    w: cw,
-                    h: ch,
-                },
-                UI_DIM,
-            );
+        draw_cursor_overlay(
+            buffer,
+            stride,
+            grid,
+            cw,
+            ch,
+            accent,
+            cursor_solid,
+            cursor_shape,
+            cur_row as usize,
+            cur_col as usize,
+        );
+    }
+}
+
+/// CA-27: blend a one-frame translucent amber flash (~25% opacity) across the
+/// whole pane grid. `out = src·α + dst·(1−α)`, α = 64/255. Called only on a full
+/// repaint so the transient flash is never baked into the retained backbuffer.
+fn draw_visual_bell(buffer: &mut [u32], stride: usize, grid: Rect) {
+    const BELL_COLOR: u32 = 0x00ff_7b00; // molten orange (matches ACCENT)
+    const ALPHA: u32 = 64; // ~25% opacity
+    let sr = (BELL_COLOR >> 16) & 0xff;
+    let sg = (BELL_COLOR >> 8) & 0xff;
+    let sb = BELL_COLOR & 0xff;
+    // Bounds-safe by construction: `h` is 0 when `stride == 0` (so both loops
+    // are empty), and clamping x1≤stride, y1≤h bounds every `base + x` below to
+    // `(h-1)*stride + (stride-1) < h*stride ≤ buffer.len()`. No write escapes.
+    let h = render::buf_height(buffer, stride);
+    let x1 = (grid.x + grid.w).min(stride);
+    let y1 = (grid.y + grid.h).min(h);
+    for y in grid.y..y1 {
+        let base = y * stride;
+        for x in grid.x..x1 {
+            let dst = buffer[base + x];
+            let dr = (dst >> 16) & 0xff;
+            let dg = (dst >> 8) & 0xff;
+            let db = dst & 0xff;
+            let r = (sr * ALPHA + dr * (255 - ALPHA)) / 255;
+            let g = (sg * ALPHA + dg * (255 - ALPHA)) / 255;
+            let b = (sb * ALPHA + db * (255 - ALPHA)) / 255;
+            buffer[base + x] = (r << 16) | (g << 8) | b;
         }
+    }
+}
+
+/// CA-22: thin scrollback-position thumb on the pane's right edge (`PANE_SEP`
+/// track, `UI_DIM` thumb). No-op while viewing the live bottom or for a
+/// zero-area grid.
+fn draw_scrollbar(buffer: &mut [u32], stride: usize, pane: &session::Pane, grid: Rect) {
+    let display_offset = pane.term.display_offset();
+    if display_offset == 0 || grid.h == 0 || grid.w == 0 {
+        return;
+    }
+    let history = pane.term.term.grid().history_size();
+    let rows = pane.term.size.rows;
+    let (thumb_top, thumb_h) = scrollbar_thumb(grid.h, rows, history, display_offset);
+    let thumb_x = grid.x + grid.w.saturating_sub(2);
+    fill_rect(
+        buffer,
+        stride,
+        Rect {
+            x: thumb_x,
+            y: grid.y,
+            w: 2,
+            h: grid.h,
+        },
+        PANE_SEP,
+    );
+    fill_rect(
+        buffer,
+        stride,
+        Rect {
+            x: thumb_x,
+            y: grid.y + thumb_top,
+            w: 2,
+            h: thumb_h.max(2),
+        },
+        UI_DIM,
+    );
+}
+
+/// CA-17: post-grid cursor overlay — a solid accent beam/underline for a focused
+/// cursor, or a hollow dim outline for an unfocused one. The block cursor is
+/// drawn inline in the cell loop (cell inversion), so only Beam/Underline paint
+/// here when solid.
+#[allow(clippy::too_many_arguments)]
+fn draw_cursor_overlay(
+    buffer: &mut [u32],
+    stride: usize,
+    grid: Rect,
+    cw: usize,
+    ch: usize,
+    accent: u32,
+    cursor_solid: bool,
+    cursor_shape: CursorShape,
+    cur_row: usize,
+    cur_col: usize,
+) {
+    let cur_px = grid.x + cur_col * cw;
+    let cur_py = grid.y + cur_row * ch;
+    if cursor_solid {
+        match cursor_shape {
+            CursorShape::Underline => {
+                // 2px bar at the bottom of the cell.
+                render::fill_rect(
+                    buffer,
+                    stride,
+                    Rect {
+                        x: cur_px,
+                        y: cur_py + ch.saturating_sub(2),
+                        w: cw,
+                        h: 2,
+                    },
+                    accent,
+                );
+            }
+            CursorShape::Beam => {
+                // 2px vertical bar at the left edge of the cell.
+                render::fill_rect(
+                    buffer,
+                    stride,
+                    Rect {
+                        x: cur_px,
+                        y: cur_py,
+                        w: 2,
+                        h: ch,
+                    },
+                    accent,
+                );
+            }
+            // Block is handled inline above; Hidden is excluded by cursor_active.
+            _ => {}
+        }
+    } else {
+        // Unfocused pane: hollow dim outline at cursor position (CA-17).
+        render::stroke_rect(
+            buffer,
+            stride,
+            Rect {
+                x: cur_px,
+                y: cur_py,
+                w: cw,
+                h: ch,
+            },
+            UI_DIM,
+        );
     }
 }
 
@@ -1009,11 +1172,6 @@ pub(crate) fn draw_pane_grid(
 /// unfocused pane or an unfocused window both hollow the cursor.
 pub(crate) fn cursor_is_solid(pane_focused: bool, window_focused: bool) -> bool {
     pane_focused && window_focused
-}
-
-/// Buffer height in pixels (stride must be > 0).
-fn buf_height(buf: &[u32], stride: usize) -> usize {
-    buf.len().checked_div(stride).unwrap_or(0)
 }
 
 /// Compute the scrollbar thumb position within a `track_len`-pixel track.

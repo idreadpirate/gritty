@@ -465,12 +465,33 @@ impl JsonWriter {
         if !v.is_finite() {
             return Err(());
         }
-        let s = format!("{v}");
-        self.out.push_str(&s);
-        // serde_json renders integral floats with a trailing `.0` (e.g. `0.0`),
-        // whereas `{}` prints `0`; add it back when no fraction/exponent shows.
-        if !s.contains(['.', 'e', 'E']) {
-            self.out.push_str(".0");
+        // Format by hand to 6 decimals instead of `{}` (Display for f32), which
+        // links core's float-formatting machinery (grisu, ~4 KiB) — the binary's
+        // only float-to-string site. Layout ratios live in (0,1) and never need
+        // shortest-round-trip precision; 6 decimals is finer than a sub-pixel.
+        // Integral values keep serde_json's trailing `.0`.
+        if v.is_sign_negative() && v != 0.0 {
+            self.out.push('-');
+        }
+        let scaled = ((v.abs() as f64) * 1_000_000.0).round() as u64;
+        self.out
+            .push_str(itoa_usize((scaled / 1_000_000) as usize).as_str());
+        self.out.push('.');
+        let frac = scaled % 1_000_000;
+        if frac == 0 {
+            self.out.push('0');
+        } else {
+            // 6-digit zero-padded fraction with trailing zeros trimmed.
+            let mut digits = [0u8; 6];
+            let mut f = frac;
+            for d in digits.iter_mut().rev() {
+                *d = b'0' + (f % 10) as u8;
+                f /= 10;
+            }
+            let end = digits.iter().rposition(|&b| b != b'0').map_or(1, |i| i + 1);
+            for &b in &digits[..end] {
+                self.out.push(b as char);
+            }
         }
         Ok(())
     }

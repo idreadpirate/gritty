@@ -120,6 +120,18 @@ impl Gritty {
             return;
         }
 
+        // Agent overview swallows input while open. Ctrl+Shift+A toggles it shut
+        // (so the open shortcut closes it instead of falling through).
+        if self.windows[wi].agents.is_some() {
+            if ctrl && shift && matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("a")) {
+                self.windows[wi].agents = None;
+                self.request_redraw(wi);
+                return;
+            }
+            self.handle_agents_key(key);
+            return;
+        }
+
         // Rename prompt swallows all input while open.
         if self.windows[wi].rename.is_some() {
             let mut commit: Option<String> = None;
@@ -176,8 +188,8 @@ impl Gritty {
                 match s.to_lowercase().as_str() {
                     "c" => return self.copy_selection(wi),
                     "v" => return self.paste(wi),
-                    // Ctrl+Shift+B: broadcast-paste the clipboard to EVERY pane in
-                    // every tab/window at once (fan one command out to a fleet).
+                    // Ctrl+Shift+B: broadcast-paste the clipboard to every pane in
+                    // the active tab at once (fan one command out across the tab).
                     "b" => {
                         self.broadcast_paste_all();
                         for w in 0..self.windows.len() {
@@ -205,6 +217,11 @@ impl Gritty {
                         self.request_redraw(wi);
                         return;
                     }
+                    // Ctrl+Shift+A: agent overview (jump list of every agent pane).
+                    "a" => {
+                        self.toggle_agents(wi);
+                        return;
+                    }
                     "r" => {
                         let cur = self
                             .focused_pane(wi)
@@ -223,6 +240,16 @@ impl Gritty {
                 Key::Named(NamedKey::ArrowRight) => return self.focus_and_redraw(wi, Dir4::Right),
                 Key::Named(NamedKey::ArrowUp) => return self.focus_and_redraw(wi, Dir4::Up),
                 Key::Named(NamedKey::ArrowDown) => return self.focus_and_redraw(wi, Dir4::Down),
+                // Ctrl+Shift+Enter: send Enter (CR) to every pane in the active
+                // tab — the "submit" that pairs with Ctrl+Shift+B, so a command
+                // broadcast-pasted across the tab runs in every pane at once.
+                Key::Named(NamedKey::Enter) => {
+                    self.broadcast_enter_all();
+                    for w in 0..self.windows.len() {
+                        self.request_redraw(w);
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -272,13 +299,7 @@ impl Gritty {
                         let idx = (d as usize) - 1;
                         let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
                         if idx < len {
-                            if let Some(win) = self.windows.get_mut(wi) {
-                                if idx != win.active {
-                                    win.broadcast = false;
-                                    win.broadcast_pending_signal = None;
-                                }
-                                win.active = idx;
-                            }
+                            self.switch_active_tab(wi, idx); // CA-63: also disarms broadcast.
                             self.drain_pty(); // RT-10: flush newly focused tab.
                             self.relayout(wi);
                             self.request_redraw(wi);
@@ -292,11 +313,8 @@ impl Gritty {
             if matches!(key, Key::Named(NamedKey::Tab)) {
                 let len = self.windows.get(wi).map(|w| w.tabs.len()).unwrap_or(0);
                 if len > 0 {
-                    if let Some(win) = self.windows.get_mut(wi) {
-                        win.broadcast = false;
-                        win.broadcast_pending_signal = None;
-                        win.active = (win.active + 1) % len;
-                    }
+                    let next = (self.windows[wi].active + 1) % len;
+                    self.switch_active_tab(wi, next); // CA-63: also disarms broadcast.
                     self.drain_pty(); // RT-10: flush newly focused tab.
                     self.relayout(wi);
                     self.request_redraw(wi);
@@ -442,7 +460,7 @@ impl Gritty {
     /// active tab without clearing it silently fans the next keystrokes out to a
     /// tab the user didn't mean to. Centralising the invariant here keeps the
     /// palette switch arms from drifting from the keyboard ones again.
-    fn switch_active_tab(&mut self, wi: usize, idx: usize) {
+    pub(crate) fn switch_active_tab(&mut self, wi: usize, idx: usize) {
         if let Some(win) = self.windows.get_mut(wi) {
             let (active, broadcast, pending) =
                 next_tab_switch_state(win.active, win.broadcast, win.broadcast_pending_signal, idx);
@@ -508,6 +526,12 @@ impl Gritty {
                     self.request_redraw(w);
                 }
             }
+            Cmd::BroadcastEnterAll => {
+                self.broadcast_enter_all();
+                for w in 0..self.windows.len() {
+                    self.request_redraw(w);
+                }
+            }
             Cmd::ToggleSeamless => {
                 if let Some(win) = self.windows.get_mut(wi) {
                     win.seamless = !win.seamless;
@@ -533,6 +557,7 @@ impl Gritty {
             }
             Cmd::SaveSession => self.persist_session(),
             Cmd::LoadSession => self.restore_session(event_loop),
+            Cmd::ToggleAgents => self.toggle_agents(self.focused),
         }
         let f = self.focused;
         self.request_redraw(f);
