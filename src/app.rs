@@ -1005,6 +1005,9 @@ impl Gritty {
     /// once — dispatch one command to a whole fleet of agents without going
     /// pane-by-pane. Each pane gets the text wrapped for its own bracketed-paste
     /// mode. Returns the number of panes written to.
+    /// Paste the clipboard into every pane of the focused window's active tab at
+    /// once (the visible workspace) — not other tabs or windows. Mirrors the
+    /// tab-scoped broadcast-input mode (RT-8). Returns the number of panes written.
     pub(crate) fn broadcast_paste_all(&mut self) -> usize {
         let Some(text) = self.clip.paste() else {
             return 0;
@@ -1012,15 +1015,33 @@ impl Gritty {
         if text.is_empty() {
             return 0;
         }
+        let wi = self.focused;
         let mut written = 0;
-        for win in &mut self.windows {
-            for tab in &mut win.tabs {
-                for pane in tab.panes.values_mut() {
-                    let data = crate::term::wrap_paste(&text, pane.term.bracketed_paste());
-                    pane.term.scroll_to_bottom();
-                    pane.pty.write(&data);
-                    written += 1;
-                }
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for pane in tab.panes.values_mut() {
+                let data = crate::term::wrap_paste(&text, pane.term.bracketed_paste());
+                pane.term.scroll_to_bottom();
+                pane.pty.write(&data);
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// Send a carriage return (Enter) to every pane of the focused window's active
+    /// tab — the "submit" counterpart to [`broadcast_paste_all`], with the same
+    /// tab scope. Broadcast-paste a command to the tab, eyeball it, then run it
+    /// everywhere at once. Returns the number of panes written; CR (`\r`) is
+    /// exactly what the Enter key sends, so each pane's program reacts as if the
+    /// user pressed Enter there.
+    pub(crate) fn broadcast_enter_all(&mut self) -> usize {
+        let wi = self.focused;
+        let mut written = 0;
+        if let Some(tab) = self.active_tab_mut(wi) {
+            for pane in tab.panes.values_mut() {
+                pane.term.scroll_to_bottom();
+                pane.pty.write(b"\r");
+                written += 1;
             }
         }
         written

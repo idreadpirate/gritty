@@ -25,7 +25,8 @@
 |---|---|
 | Copy | `Ctrl+Shift+C` (or drag-select — auto-copies) |
 | Paste | `Ctrl+Shift+V`, or right-click (sanitized, bracketed-paste safe) |
-| Broadcast paste | `Ctrl+Shift+B` — paste the clipboard into **every pane in every window** at once (sanitized, per-pane bracketed-paste safe) |
+| Broadcast paste | `Ctrl+Shift+B` — paste the clipboard into **every pane in the active tab** at once (sanitized, per-pane bracketed-paste safe) |
+| Broadcast Enter | `Ctrl+Shift+Enter` — press Enter in **every pane in the active tab** at once (the "submit" for a broadcast-pasted command) |
 | Scroll | Mouse wheel (typing snaps back to the bottom) |
 | Open hyperlink | `Ctrl+Click` an OSC-8 link (http/https/file only) |
 
@@ -38,8 +39,8 @@
 
 ## Command palette
 Fuzzy-searchable: split right/down, close pane, rename pane, new tab,
-next/previous tab, toggle broadcast input, toggle seamless mode, move tab to new
-window, save session, load session.
+next/previous tab, toggle broadcast input, paste to all panes, press Enter in all
+panes, toggle seamless mode, move tab to new window, save session, load session.
 
 ## Multiple windows
 Tear a tab into its own window — drag it off the bar onto another monitor, or
