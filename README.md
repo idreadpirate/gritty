@@ -59,8 +59,9 @@ overlay** (`F1`); font zoom; **IME / dead-key composition** (CJK & accents);
 
 **Copy/paste that always works** — drag to auto-copy, `Ctrl+Shift+C/V`,
 right-click paste, **sanitized & bracketed-paste-safe** (strips control/escape
-injection); **broadcast one paste to every pane** (`Ctrl+Shift+B` — fan a command
-out to a whole fleet at once); **Ctrl-click OSC-8 hyperlinks** (http/https only).
+injection); **broadcast one paste to every pane in the tab** (`Ctrl+Shift+B` — fan
+a command across the tab at once) and **broadcast Enter** (`Ctrl+Shift+Enter`) to
+run it in every pane; **Ctrl-click OSC-8 hyperlinks** (http/https only).
 
 **Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);

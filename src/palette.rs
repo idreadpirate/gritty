@@ -12,6 +12,7 @@ pub enum Cmd {
     PrevTab,
     ToggleBroadcast,
     BroadcastPasteAll,
+    BroadcastEnterAll,
     ToggleSeamless,
     MoveTabToNewWindow,
     SaveSession,
@@ -29,8 +30,12 @@ pub const COMMANDS: &[(&str, Cmd)] = &[
     ("previous tab", Cmd::PrevTab),
     ("toggle broadcast input", Cmd::ToggleBroadcast),
     (
-        "paste clipboard to ALL panes (every window)",
+        "paste clipboard to all panes in the tab",
         Cmd::BroadcastPasteAll,
+    ),
+    (
+        "press Enter in all panes in the tab",
+        Cmd::BroadcastEnterAll,
     ),
     ("toggle seamless mode", Cmd::ToggleSeamless),
     ("move tab to new window", Cmd::MoveTabToNewWindow),

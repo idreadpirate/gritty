@@ -176,8 +176,8 @@ impl Gritty {
                 match s.to_lowercase().as_str() {
                     "c" => return self.copy_selection(wi),
                     "v" => return self.paste(wi),
-                    // Ctrl+Shift+B: broadcast-paste the clipboard to EVERY pane in
-                    // every tab/window at once (fan one command out to a fleet).
+                    // Ctrl+Shift+B: broadcast-paste the clipboard to every pane in
+                    // the active tab at once (fan one command out across the tab).
                     "b" => {
                         self.broadcast_paste_all();
                         for w in 0..self.windows.len() {
@@ -223,6 +223,16 @@ impl Gritty {
                 Key::Named(NamedKey::ArrowRight) => return self.focus_and_redraw(wi, Dir4::Right),
                 Key::Named(NamedKey::ArrowUp) => return self.focus_and_redraw(wi, Dir4::Up),
                 Key::Named(NamedKey::ArrowDown) => return self.focus_and_redraw(wi, Dir4::Down),
+                // Ctrl+Shift+Enter: send Enter (CR) to every pane in the active
+                // tab — the "submit" that pairs with Ctrl+Shift+B, so a command
+                // broadcast-pasted across the tab runs in every pane at once.
+                Key::Named(NamedKey::Enter) => {
+                    self.broadcast_enter_all();
+                    for w in 0..self.windows.len() {
+                        self.request_redraw(w);
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -504,6 +514,12 @@ impl Gritty {
             }
             Cmd::BroadcastPasteAll => {
                 self.broadcast_paste_all();
+                for w in 0..self.windows.len() {
+                    self.request_redraw(w);
+                }
+            }
+            Cmd::BroadcastEnterAll => {
+                self.broadcast_enter_all();
                 for w in 0..self.windows.len() {
                     self.request_redraw(w);
                 }
