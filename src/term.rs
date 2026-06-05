@@ -332,6 +332,31 @@ impl Terminal {
     pub fn reset_damage(&mut self) {
         self.term.reset_damage();
     }
+
+    /// Read the bottom `max_rows` rows of the live viewport as plain text, one
+    /// line per row with trailing blanks trimmed. Used by agent-state detection
+    /// (`agent.rs`), which matches the agent's on-screen UI chrome. Returns the
+    /// live screen regardless of scrollback position by reading grid lines
+    /// directly rather than the (possibly scrolled) renderable viewport.
+    pub fn screen_tail(&self, max_rows: usize) -> String {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        let start = rows.saturating_sub(max_rows);
+        let mut out = String::new();
+        for row in start..rows {
+            let row_start = out.len();
+            for col in 0..cols {
+                out.push(grid[Point::new(Line(row as i32), Column(col))].c);
+            }
+            // Trim this row's trailing blanks in place (no per-row allocation).
+            let kept = out[row_start..].trim_end().len();
+            out.truncate(row_start + kept);
+            out.push('\n');
+        }
+        out
+    }
 }
 
 /// Per-frame VT damage, in 0-based screen rows. See [`Terminal::take_damage`].
@@ -399,6 +424,30 @@ pub fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_tail_reads_live_bottom_rows_trimmed() {
+        // Agent-state detection (`agent.rs`) reads the live screen tail. Verify it
+        // returns the bottom rows as text with trailing blanks trimmed, and is
+        // bounded by `max_rows`.
+        let mut t = Terminal::new(20, 6, 100);
+        for line in ["aaa", "bbb", "ccc", "ddd", "eee", "fff"] {
+            t.feed(format!("{line}\r\n").as_bytes());
+        }
+        let tail = t.screen_tail(3);
+        let rows: Vec<&str> = tail.lines().collect();
+        assert_eq!(rows.len(), 3, "max_rows bounds the result: {tail:?}");
+        // Trailing blanks trimmed: no row keeps the unused columns as spaces.
+        assert!(
+            rows.iter().all(|r| r == &r.trim_end()),
+            "rows not trimmed: {tail:?}"
+        );
+        // The most recent output is present in the tail.
+        assert!(
+            tail.contains("fff"),
+            "tail should include the latest line: {tail:?}"
+        );
+    }
 
     /// Data probe for the wheel-scroll "grey blank band" report: after scrolling
     /// up into history, the rendered viewport (what draw_pane_grid iterates) must

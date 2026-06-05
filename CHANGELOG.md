@@ -4,6 +4,31 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Agent awareness
+- **Per-pane agent detection** — gritty recognizes ~12 AI coding agents
+  (`claude`, `codex`, `cursor`, `copilot`, `gemini`, `opencode`, `droid`,
+  `aider`, …) from the pane's foreground process, then classifies each one's
+  live state — **working · blocked · idle** — by matching the agent's on-screen
+  UI chrome (spinner, "esc to interrupt", a permission/question prompt). The
+  pane header shows a color-neutral badge: `●` busy · `◆` needs input · `○` idle.
+  Pure detector, fully unit-tested; reuses the existing process poll, so it adds
+  no new threads or timers. Ported in spirit from herdr (which doesn't run on
+  Windows), reimplemented in gritty's CPU/native model.
+- **Done / blocked notifications** — when an agent finishes (`working → idle`) or
+  stops for input (`working → blocked`) in a pane you *aren't* watching, gritty
+  latches a `★` header badge and flashes the taskbar button (`FLASHW_TIMERNOFG`
+  — never steals focus; stops when you look). Focusing the pane clears it. The
+  process poll stays alive while a *backgrounded* agent is still working, so the
+  flash reaches you even when gritty is minimized or occluded — yet still
+  suspends (CA-54) when nothing is working, preserving ~0% idle CPU.
+- **Agent overview** (`Ctrl+Shift+A`, command palette, or `F1` help) — a
+  centered jump-list of every agent pane across all tabs with its status badge,
+  pre-selected on the first pane needing attention. `↑/↓` select, `Enter`/click
+  jumps to that pane (switching tab + focus via the same broadcast-disarming path
+  as a keyboard tab switch), `Esc`/outside-click closes. Implemented as an
+  overlay (like the palette) — it never touches the grid/PTY-geometry/resize
+  paths; a `… +N more` footer is shown rather than silently capping the list.
+
 ### Rendering & performance
 - **Dirty-rect rendering** — fixed a CPU spin (~87 % of a core, which read as a
   freeze/"can't close") under a continuously updating pane (agent spinner,

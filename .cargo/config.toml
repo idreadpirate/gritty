@@ -4,8 +4,17 @@
 #
 # `std,panic_abort` — NOT `panic_immediate_abort` — so std::panic::set_hook
 # still runs before abort; the RT-22 crash-log depends on it. No behavior change.
+#
+# `build-std-features = ["optimize_for_size"]` rebuilds core/std with the
+# size-optimized feature: smaller (occasionally slower) algorithms throughout —
+# formatting, sorting, and friends. For a CPU terminal that's invisible at
+# runtime, and it is the single biggest size lever here — what keeps the
+# self-contained exe under 800 KB after adding agent awareness. It replaces
+# std's default feature set, so the size-budget gate is its prove-out;
+# `panic_abort` stays explicit above so the crash-log hook still fires.
 [unstable]
 build-std = ["std", "panic_abort"]
+build-std-features = ["optimize_for_size"]
 
 # Pinning the target makes plain `cargo build/test/clippy` use build-std. The
 # release binary lands at target/x86_64-pc-windows-msvc/release/gritty.exe.

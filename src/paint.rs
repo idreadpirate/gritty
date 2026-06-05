@@ -64,7 +64,12 @@ impl Gritty {
             || sig != win.last_sig
             || any_bell
             || any_sel
-            || any_scroll;
+            || any_scroll
+            // The agent overview lists panes across every tab, so a background
+            // pane's state change wouldn't move `sig`; redraw it fully each frame
+            // while open (a brief, user-opened overlay) so it stays live and a
+            // partial grid repaint can't corrupt it.
+            || win.agents.is_some();
         win.force_full = false;
         win.last_sig = sig;
         if size_changed {
@@ -314,7 +319,13 @@ impl Gritty {
                         .and_then(|t| t.panes.get(&id))
                         .map(|p| {
                             let proc = p.proc_name.as_str();
-                            let base = if proc.is_empty()
+                            let base = if let Some(agent) = p.agent {
+                                // An agent owns the pane: show a color-neutral
+                                // state badge (CA-25) + the agent label, so a
+                                // glance tells you which pane needs you.
+                                let badge = crate::agent::state_badge(p.agent_state, p.attention);
+                                format!("{} {}: {}", badge, p.name, agent.label())
+                            } else if proc.is_empty()
                                 || proc == "pwsh"
                                 || proc == "cmd"
                                 || proc == "powershell"
@@ -444,6 +455,105 @@ impl Gritty {
                 }
             }
 
+            // Agent overview overlay (Ctrl+Shift+A): a jump list of every agent
+            // pane across all tabs, with its status badge.
+            if let Some(ov) = win.agents.as_ref() {
+                let items = crate::app::agent_items_of(win);
+                let (bx, by, box_w, box_h, shown) =
+                    crate::overview::geom(stride, cw, ch, items.len());
+                let panel = 0x0020_2030u32; // indigo-slate, matching the palette overlay
+                let rbox = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: box_h,
+                };
+                fill_rect(&mut buffer, stride, rbox, panel);
+                stroke_rect(&mut buffer, stride, rbox, accent);
+
+                let title_rect = Rect {
+                    x: bx,
+                    y: by,
+                    w: box_w,
+                    h: ch,
+                };
+                let title = if items.is_empty() {
+                    "Agents — none running  (Esc to close)"
+                } else {
+                    "Agents  (\u{2191}\u{2193} select · Enter jump · Esc close)"
+                };
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    bx + cw,
+                    by,
+                    title,
+                    accent,
+                    panel,
+                    true,
+                    title_rect,
+                );
+
+                let first = crate::overview::first_row_y(by, ch);
+                for (i, it) in items.iter().take(shown).enumerate() {
+                    let iy = first + i * ch;
+                    let irow = Rect {
+                        x: bx,
+                        y: iy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    let (fg, bg) = if i == ov.sel {
+                        fill_rect(&mut buffer, stride, irow, accent);
+                        (color::bg(), accent)
+                    } else {
+                        (color::fg(), panel)
+                    };
+                    let line = format!(
+                        "{} {}",
+                        crate::agent::state_badge(it.state, it.attention),
+                        it.label
+                    );
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        iy,
+                        &line,
+                        fg,
+                        bg,
+                        true,
+                        irow,
+                    );
+                }
+                // Honest cap: tell the user when more agents exist than rows shown
+                // (the panel caps at VISIBLE_ROWS) rather than silently hiding them.
+                if items.len() > shown {
+                    let fy = first + shown * ch;
+                    let frow = Rect {
+                        x: bx,
+                        y: fy,
+                        w: box_w,
+                        h: ch,
+                    };
+                    let more = format!("… +{} more", items.len() - shown);
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        bx + cw,
+                        fy,
+                        &more,
+                        UI_DIM,
+                        panel,
+                        true,
+                        frow,
+                    );
+                }
+            }
+
             // RT-8: broadcast pending-signal confirmation prompt.
             if win.broadcast && win.broadcast_pending_signal.is_some() {
                 let label = " [BROADCAST] press again to send signal to all panes ";
@@ -477,6 +587,7 @@ impl Gritty {
                     ("Ctrl+Shift+D", "Split pane right"),
                     ("Ctrl+Shift+E", "Split pane down"),
                     ("Ctrl+Shift+P", "Command palette"),
+                    ("Ctrl+Shift+A", "Agent overview (jump to a pane)"),
                     ("Ctrl+Shift+R", "Rename pane"),
                     ("Ctrl+Shift+C", "Copy selection"),
                     ("Ctrl+Shift+V", "Paste"),

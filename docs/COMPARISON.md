@@ -69,6 +69,18 @@ multiplexer — and there it's in a category of its own.
 For **remote/server** multiplexing, use tmux or WezTerm. gritty doesn't host
 detachable remote sessions, and we don't pretend it does.
 
+## A newer axis: agent awareness
+
+gritty also detects which AI coding agent runs in each pane and reads its live
+state (working/blocked/idle), badging the header, flashing the taskbar when an
+unwatched agent finishes or blocks, and offering a jump-list across all panes.
+The idea comes from **herdr**, a Unix agent-multiplexer — which doesn't run on
+Windows (it's a client-server design over Unix sockets). gritty reimplements the
+useful core in its CPU-rendered, single-`.exe` native-Windows model: screen-read
+detection only, no integration hooks, no server, no extra dependencies. Among
+*native-Windows* terminals, this agent-state awareness is, as far as we can tell,
+unique to gritty.
+
 ## Sources
 
 - GPU-vs-CPU input latency on Windows (240 Hz camera): https://chadaustin.me/2024/02/windows-terminal-latency/

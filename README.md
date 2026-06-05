@@ -66,6 +66,17 @@ out to a whole fleet at once); **Ctrl-click OSC-8 hyperlinks** (http/https only)
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
 scrollback with a position indicator; visual bell.
 
+**Agent awareness** — gritty knows when a pane is running an AI coding agent
+(`claude`, `codex`, `cursor`, `copilot`, … ~12 recognized) and shows its live
+state in the header — **working `●` · needs-input `◆` · idle `○`**. When an
+unwatched agent **finishes or blocks**, gritty latches a `★` and **flashes the
+taskbar** (even while minimized — it keeps polling a backgrounded working agent,
+then idles back down). **Agent overview** (`Ctrl+Shift+P` → "agent overview", or
+`Ctrl+Shift+A`) is a jump-list of every agent pane across all tabs — pick the one
+that needs you and `Enter` jumps straight to it. State is read from the agent's
+on-screen UI — no integration, hooks, or config — and detection is heuristic, so
+a misread shows the wrong badge, never a wrong action.
+
 **Persistence & looks** — **session save/restore** (layout, names, colors, window
 geometry survive restarts); optional `config.toml`; the "gunmetal & amber"
 industrial theme; gamma-correct text; WCAG-AA UI contrast; embedded-fallback font
@@ -120,6 +131,7 @@ automatically on first build — no manual setup. Maintainers cut a release with
 | Action | Keys |
 |---|---|
 | Command palette / help | `Ctrl+Shift+P` / `F1` |
+| Agent overview (jump to a pane) | `Ctrl+Shift+A` |
 | Split right / down | `Ctrl+Shift+D` / `Ctrl+Shift+E` |
 | Move focus / resize pane | `Ctrl+Shift+Arrows` / `Ctrl+Alt+Arrows` |
 | Rename pane / close pane | `Ctrl+Shift+R` / `Ctrl+Shift+W` |
