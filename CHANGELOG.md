@@ -4,6 +4,18 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Performance (throughput / memory)
+- **Speed-first build** — the binary-size budget was deliberately traded for
+  speed. Release profile `opt-level=z → 3`; `build-std` no longer uses
+  `optimize_for_size` (std is rebuilt for speed); and `target-cpu=x86-64-v3`
+  enables AVX2/FMA/BMI2 so the compiler autovectorizes the software-raster hot
+  loops and the VT parser. Binary grows ~800 KB → ~1.1 MB. **CPU floor: Haswell
+  (2013+)** — the build will not run on older CPUs.
+- **Lower default scrollback** (`5000 → 2000` lines/pane) — scrollback is the
+  dominant per-pane RAM consumer (~7.6 MB → ~3 MB at 80 cols) and the memory that
+  grows as a pane streams. 2000 keeps generous history at ~40% of the cost; raise
+  it with the `scrollback` config key for deeper history.
+
 ### Agent awareness
 - **Per-pane agent detection** — gritty recognizes ~12 AI coding agents
   (`claude`, `codex`, `cursor`, `copilot`, `gemini`, `opencode`, `droid`,

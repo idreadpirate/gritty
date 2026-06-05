@@ -20,8 +20,8 @@ pub struct Config {
     /// `Ctrl +/-/0` or set `font_size` here.
     pub font_size: f32,
 
-    /// Lines of scrollback kept per pane.  Mirrors `scrolling_history: 5000`
-    /// in `term.rs`.
+    /// Lines of scrollback kept per pane.  Mirrors `term::DEFAULT_SCROLLBACK`
+    /// (2000).  Raise it here for deeper history at higher per-pane RAM cost.
     pub scrollback: usize,
 
     /// Override the shell launched for each pane.  `None` → let
@@ -42,7 +42,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font_size: crate::app::DEFAULT_FONT_PX,
-            scrollback: 5000,
+            scrollback: 2000,
             shell: None,
             fg: None,
             bg: None,

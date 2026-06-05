@@ -161,8 +161,12 @@ fn scan_osc7_into(buf: &[u8], cwd: &mut Option<String>) -> Vec<u8> {
 }
 
 /// Default lines of scrollback kept per pane when no config override applies.
-/// Mirrors `config::Config::default().scrollback`.
-pub const DEFAULT_SCROLLBACK: usize = 5000;
+/// Mirrors `config::Config::default().scrollback`. Lowered 5000 -> 2000 in the
+/// throughput/memory pass: at ~80 cols a line of alacritty grid is ~1.5 KB, so
+/// 5000 lines is ~7.6 MB/pane that fills as a pane streams — the dominant RAM
+/// consumer under load. 2000 keeps generous history at ~40% of the cost; power
+/// users can raise it via the `scrollback` config key.
+pub const DEFAULT_SCROLLBACK: usize = 2000;
 
 #[derive(Clone, Copy)]
 pub struct TermSize {

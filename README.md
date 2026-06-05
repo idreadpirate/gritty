@@ -25,10 +25,11 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 - **It's the terminal *and* the multiplexer, natively.** Speaks Windows **ConPTY**
   directly — one `.exe`, runs where WSL is banned (locked-down corporate boxes).
 - **Brutally lightweight, by construction.** CPU software rendering (no GPU
-  pipeline, no driver surface); a **sub-800 KB** binary (`opt-level=z` + `lto` +
-  `strip` + `panic=abort`, hand-rolled config/session parsers instead of
-  `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); **~25 MB RAM
-  per pane** (a 5000-line scrollback grid each — tunable via `config.toml`);
+  pipeline, no driver surface); a **~1.1 MB** binary (`opt-level=3` +
+  `target-cpu=x86-64-v3`/AVX2 + `lto` + `strip` + `panic=abort`, hand-rolled
+  config/session parsers instead of `toml`/`serde_json`, and a `build-std` `std`
+  rebuilt for speed); **~10 MB RAM per pane** (a 2000-line scrollback grid each —
+  tunable via `config.toml`);
   near-0% CPU when idle and bounded when busy — **damage-driven dirty-rect
   repaint** (a streaming pane redraws only its changed rows), a ~60 fps frame
   cap, and wake coalescing. A spinner or a fleet of busy panes can't peg a core.
