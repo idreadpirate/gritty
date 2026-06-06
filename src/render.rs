@@ -105,18 +105,21 @@ pub fn draw_cell(
     let ascent = font.ascent;
 
     if fill_bg {
-        for yy in 0..ch_h {
-            let y = py + yy;
-            if y < cy0 || y >= cy1 {
-                continue;
-            }
-            let base = y * stride;
-            for xx in 0..cw {
-                let x = px + xx;
-                if x < cx0 || x >= cx1 {
+        // The clipped x-span is identical for every row of the cell, so compute
+        // it once and fill each row as one contiguous slice. `slice::fill` is
+        // memset-class and autovectorizes under AVX2 — far cheaper than the old
+        // per-pixel bounds-checked write, and bg fills are a large fraction of
+        // streamed pixels (colored output, selection, inverse).
+        let x0 = px.max(cx0);
+        let x1 = (px + cw).min(cx1);
+        if x0 < x1 {
+            for yy in 0..ch_h {
+                let y = py + yy;
+                if y < cy0 || y >= cy1 {
                     continue;
                 }
-                buf[base + x] = cell.bg;
+                let base = y * stride;
+                buf[base + x0..base + x1].fill(cell.bg);
             }
         }
     }
@@ -141,23 +144,29 @@ pub fn draw_cell(
     let baseline = py as i32 + ascent.round() as i32;
     let gy_top = baseline - (m.height as i32 + m.ymin);
 
-    for ry in 0..m.height {
-        let y = gy_top + ry as i32;
-        if y < cy0 as i32 || y >= cy1 as i32 {
-            continue;
-        }
-        let row_base = y as usize * stride;
-        for rx in 0..m.width {
-            let x = gx + rx as i32;
-            if x < cx0 as i32 || x >= cx1 as i32 {
+    // Horizontal clip is row-independent (x = gx + rx), so resolve the in-bounds
+    // glyph-column span once and drop the per-pixel `x < cx0 || x >= cx1` branch
+    // from the inner loop. gx may be negative (m.xmin < 0); the span math clamps
+    // it, and gx + rx is guaranteed in [cx0, cx1) — and cx1 <= stride — inside
+    // the range, so every `buf[idx]` is in-bounds without a check.
+    let rx0 = (cx0 as i32 - gx).max(0) as usize;
+    let rx1 = ((cx1 as i32 - gx).max(0) as usize).min(m.width);
+    if rx0 < rx1 {
+        for ry in 0..m.height {
+            let y = gy_top + ry as i32;
+            if y < cy0 as i32 || y >= cy1 as i32 {
                 continue;
             }
-            let cov = bitmap[ry * m.width + rx];
-            if cov == 0 {
-                continue;
+            let row_base = y as usize * stride;
+            let cov_row = ry * m.width;
+            for rx in rx0..rx1 {
+                let cov = bitmap[cov_row + rx];
+                if cov == 0 {
+                    continue;
+                }
+                let idx = row_base + (gx + rx as i32) as usize;
+                buf[idx] = blend(cell.fg, buf[idx], cov);
             }
-            let idx = row_base + x as usize;
-            buf[idx] = blend(cell.fg, buf[idx], cov);
         }
     }
 }
@@ -669,6 +678,68 @@ mod tests {
         assert!(
             buf.iter().all(|&p| p == 0),
             "clip must prevent drawing outside it"
+        );
+    }
+
+    #[test]
+    fn glyph_blit_respects_horizontal_clip() {
+        // Guards the hoisted glyph-column clip span (rx0..rx1). fill_bg is false
+        // so only the glyph blit runs.
+        let mut font = FontAtlas::new(18.0);
+        let stride = font.cell_w * 2;
+        let height = font.cell_h;
+        let cwid = font.cell_w;
+        let mut buf = vec![0u32; stride * height];
+        // Dense glyph drawn in the RIGHT half, clip restricted to the LEFT half:
+        // nothing may be written.
+        let clip_left = Rect {
+            x: 0,
+            y: 0,
+            w: cwid,
+            h: height,
+        };
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            cwid,
+            0,
+            Cell {
+                ch: 'M',
+                fg: 0x00ff_ffff,
+                bg: 0,
+            },
+            false,
+            clip_left,
+        );
+        assert!(
+            buf.iter().all(|&p| p == 0),
+            "glyph blitted outside the clip must not write any pixel"
+        );
+        // Positive control: the same glyph fully in-clip writes at least one pixel.
+        let clip_full = Rect {
+            x: 0,
+            y: 0,
+            w: stride,
+            h: height,
+        };
+        draw_cell(
+            &mut buf,
+            stride,
+            &mut font,
+            0,
+            0,
+            Cell {
+                ch: 'M',
+                fg: 0x00ff_ffff,
+                bg: 0,
+            },
+            false,
+            clip_full,
+        );
+        assert!(
+            buf.iter().any(|&p| p != 0),
+            "glyph fully inside the clip must write at least one pixel"
         );
     }
 }
