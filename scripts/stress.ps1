@@ -21,7 +21,12 @@
 #   pwsh -File scripts/stress.ps1                       # 100 panes, idle, 60s
 #   pwsh -File scripts/stress.ps1 -Broadcast            # + stream into all panes
 #   pwsh -File scripts/stress.ps1 -Panes 64 -PerTab 16 -Seconds 90 -Broadcast
+#   pwsh -File scripts/stress.ps1 -Throughput -FloodMB 50 -Exe <path>   # speed A/B
 #   pwsh -File scripts/stress.ps1 -DryRun               # generate+validate only
+#
+# -Throughput: one pane, flood a fixed payload, report MB/s rendered + CPU-ms per
+# MB + peak RSS. Run it twice with two different -Exe builds (e.g. an opt=z
+# baseline vs the opt=3 build) to measure a speedup: higher MB/s, lower CPU-ms/MB.
 #
 # The GUI + N shells run on YOUR desktop; this is a desktop tool, not a headless
 # one. -DryRun generates and validates the files without launching anything.
@@ -34,6 +39,8 @@ param(
     [int]$IntervalMs = 1500,
     [string]$Exe     = "target/x86_64-pc-windows-msvc/release/gritty.exe",
     [switch]$Broadcast,
+    [switch]$Throughput,
+    [int]$FloodMB    = 50,
     [switch]$DryRun,
     [string]$LogDir  = "$env:TEMP\gritty-stress"
 )
@@ -47,6 +54,11 @@ function Fail($m) { Write-Host "STRESS FAIL: $m" -ForegroundColor Red; exit 1 }
 
 if ($Panes -lt 1)  { Fail "-Panes must be >= 1" }
 if ($PerTab -lt 1) { $PerTab = $Panes }
+
+# -Throughput is a focused speed A/B: one pane, flood a fixed payload, measure how
+# fast (and how cheaply) gritty renders it. Pass two different -Exe builds to
+# compare. It overrides the multi-pane leak layout.
+if ($Throughput) { $Panes = 1; $PerTab = 1 }
 
 # ---------------------------------------------------------------------------
 # JSON generation: a balanced split tree of `n` leaf panes (ids 0..n-1),
@@ -171,7 +183,62 @@ try {
     Info "gritty up (pid(s): $(($g | ForEach-Object Id) -join ', ')). Letting $Panes shells settle..."
     Start-Sleep -Seconds 5   # let all panes spawn shells before the first sample
 
-    if ($Broadcast) {
+    if ($Throughput) {
+        # Speed A/B: flood a fixed payload into the single pane and measure how
+        # fast + how cheaply gritty renders it (drain detected via CPU plateau).
+        $lineBytes = 1024
+        $lines = [int]([math]::Floor($FloodMB * 1MB / $lineBytes))
+        $fillN = $lineBytes - 15
+        # Built for Windows PowerShell 5.1 (the pinned shell): ESC = [char]27, no
+        # sleeps, a sentinel line at the end. Single-quoted so the *pane's* shell
+        # evaluates it, not this script.
+        $floodCmd = '$e=[char]27;$l=("{0}[38;5;208m{1}{0}[0m" -f $e,(''x''*' + $fillN + '));for($i=0;$i-lt ' + $lines + ';$i++){[Console]::Out.WriteLine($l)};[Console]::Out.WriteLine(''__FLOOD_DONE__'')'
+        Set-Clipboard -Value ($floodCmd + "`r`n")
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class FgT { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n); }
+"@
+        $g = Get-GrittyProcs
+        $hwnd = ($g | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1).MainWindowHandle
+        if (-not $hwnd) { Fail "no window handle; cannot drive the throughput flood" }
+        [FgT]::ShowWindow($hwnd, 9) | Out-Null   # SW_RESTORE
+        [FgT]::SetForegroundWindow($hwnd) | Out-Null
+        Start-Sleep -Milliseconds 600
+        $cpu0 = (Sample).CpuSec
+        $t0 = Get-Date
+        [System.Windows.Forms.SendKeys]::SendWait("^+b")   # Ctrl+Shift+B paste+run
+        Info ("Flooding ~{0} MB ({1} lines) into one pane; measuring drain..." -f $FloodMB, $lines)
+
+        $peakRssMB = 0.0; $lastCpu = $cpu0; $idleHits = 0; $busySeen = $false
+        $plateauAt = $null
+        $tpDeadline = $t0.AddSeconds(120)
+        while ((Get-Date) -lt $tpDeadline) {
+            Start-Sleep -Milliseconds 300
+            $s = Sample
+            if (-not $s) { break }
+            if ($s.RssMB -gt $peakRssMB) { $peakRssMB = $s.RssMB }
+            $d = $s.CpuSec - $lastCpu
+            $lastCpu = $s.CpuSec
+            if ($d -gt 0.15) { $busySeen = $true; $idleHits = 0 }
+            elseif ($busySeen) { $idleHits++; if ($idleHits -ge 3) { $plateauAt = Get-Date; break } }
+        }
+        if (-not $plateauAt) { $plateauAt = Get-Date }
+        $cpuRender = [math]::Round($lastCpu - $cpu0, 2)
+        $wall = [math]::Round(($plateauAt - $t0).TotalSeconds, 2)
+        $actualMB = [math]::Round(($lines * ($lineBytes + 2)) / 1MB, 1)   # +2 CRLF
+        $script:tp = [pscustomobject]@{
+            payloadMB  = $actualMB
+            wallS      = $wall
+            cpuRender  = $cpuRender
+            MBps       = if ($wall -gt 0)     { [math]::Round($actualMB / $wall, 1) }        else { 0 }
+            cpuMsPerMB = if ($actualMB -gt 0) { [math]::Round($cpuRender * 1000 / $actualMB, 1) } else { 0 }
+            peakRssMB  = [math]::Round($peakRssMB, 1)
+            drained    = ($idleHits -ge 3)
+        }
+    }
+    elseif ($Broadcast) {
         # Drive a self-terminating streaming spinner into EVERY pane at once.
         # CR-rewrites one line (the dirty-rect partial-repaint happy path) plus a
         # periodic newline (scroll). Bounded so orphaned panes self-exit.
@@ -196,7 +263,8 @@ public class Fg { [DllImport("user32.dll")] public static extern bool SetForegro
         }
     }
 
-    # ---- sample loop ----
+    # ---- sample loop ---- (skipped under -Throughput, which measured its own way)
+    if (-not $Throughput) {
     Info ("Sampling every {0} ms for {1}s..." -f $IntervalMs, $Seconds)
     $startTime = Get-Date
     $end = $startTime.AddSeconds($Seconds)
@@ -213,6 +281,7 @@ public class Fg { [DllImport("user32.dll")] public static extern bool SetForegro
         }
         Start-Sleep -Milliseconds $IntervalMs
     }
+    }
 }
 finally {
     Info "Cleaning up..."
@@ -226,6 +295,21 @@ finally {
 # ---------------------------------------------------------------------------
 # Verdict.
 # ---------------------------------------------------------------------------
+if ($Throughput) {
+    $t = $script:tp
+    if (-not $t) { Fail "no throughput result captured (window never came up?)" }
+    Write-Host ""
+    Write-Host "==== gritty throughput ====" -ForegroundColor White
+    Write-Host ("exe:        {0}" -f $exePath)
+    Write-Host ("payload:    {0} MB  ({1})" -f $t.payloadMB, $(if ($t.drained) { "drained" } else { "TIMEOUT - raise -FloodMB budget or window" }))
+    Write-Host ("wall:       {0} s" -f $t.wallS)
+    Write-Host ("throughput: {0} MB/s rendered" -f $t.MBps) -ForegroundColor Green
+    Write-Host ("CPU cost:   {0} CPU-s to render  =>  {1} CPU-ms per MB" -f $t.cpuRender, $t.cpuMsPerMB) -ForegroundColor Green
+    Write-Host ("peak RSS:   {0} MB" -f $t.peakRssMB)
+    Write-Host "A/B: run twice with different -Exe; higher MB/s and lower CPU-ms/MB = faster." -ForegroundColor Cyan
+    exit 0
+}
+
 if ($samples.Count -lt 4) { Fail "too few samples ($($samples.Count)) to judge" }
 
 $csv = Join-Path $LogDir ("run_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
