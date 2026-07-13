@@ -32,6 +32,46 @@ use app::Gritty;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Wake;
 
+/// App-level coalescer for PTY wakes: at most ONE `Wake` is ever in flight in
+/// winit's user-event queue, no matter how many panes are streaming.
+///
+/// The per-pane `notified` flag (pty.rs) already collapses a flood of reads
+/// into one wake per pane per drain — but with N panes, each drain cycle
+/// consumes ONE queued event while re-arming N panes, which then enqueue N new
+/// wakes: the queue grows ~(N-1) events per cycle without bound. That is heap
+/// growth (winit's user-event channel is unbounded) and, past ~10k posts, the
+/// Win32 thread message queue starts dropping messages. One shared flag makes
+/// production match consumption at any pane count.
+#[derive(Clone)]
+pub(crate) struct WakeCoalescer {
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WakeCoalescer {
+    pub(crate) fn new(proxy: winit::event_loop::EventLoopProxy<Wake>) -> Self {
+        Self {
+            proxy,
+            pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Request a wake; a no-op when one is already queued and not yet serviced.
+    pub(crate) fn wake(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let _ = self.proxy.send_event(Wake);
+        }
+    }
+
+    /// Call at the START of servicing a wake (before draining): re-arms so any
+    /// output arriving during/after the drain queues exactly one fresh wake.
+    pub(crate) fn begin_service(&self) {
+        use std::sync::atomic::Ordering;
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
 /// Industrial gunmetal/amber accents — each new tab takes the next one.
 pub(crate) const TAB_PALETTE: [u32; 6] = [
     0x00ff_7b00, // molten orange

@@ -2,12 +2,10 @@
 
 use std::collections::HashMap;
 
-use winit::event_loop::EventLoopProxy;
-
 use crate::layout::{Axis, Node};
 use crate::pty::Pty;
 use crate::term::Terminal;
-use crate::Wake;
+use crate::WakeCoalescer;
 
 pub struct Pane {
     pub term: Terminal,
@@ -122,16 +120,16 @@ impl Pane {
         name: String,
         cols: usize,
         rows: usize,
-        proxy: EventLoopProxy<Wake>,
+        wake: WakeCoalescer,
         cwd: Option<&str>,
         cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let term = Terminal::new(cols, rows, cfg.scrollback);
-        let waker = move || {
-            let _ = proxy.send_event(Wake);
-        };
+        // App-level coalescing: `wake()` is a no-op while a Wake is already
+        // queued, so N streaming panes can't grow winit's user-event queue.
+        let waker = move || wake.wake();
         let mut pty = None;
         for (path, args) in candidates_with_override(cfg.shell.as_deref()) {
             if !std::path::Path::new(&path).exists() {
@@ -191,11 +189,11 @@ impl Tab {
         color: u32,
         cols: usize,
         rows: usize,
-        proxy: EventLoopProxy<Wake>,
+        wake: WakeCoalescer,
         cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let mut panes = HashMap::new();
-        panes.insert(0, Pane::new("term 1".into(), cols, rows, proxy, None, cfg)?);
+        panes.insert(0, Pane::new("term 1".into(), cols, rows, wake, None, cfg)?);
         Ok(Self {
             panes,
             tree: Node::Leaf(0),
@@ -214,13 +212,13 @@ impl Tab {
         saved: &crate::persist::SavedTab,
         cols: usize,
         rows: usize,
-        proxy: EventLoopProxy<Wake>,
+        wake: WakeCoalescer,
         cfg: &SpawnCfg,
     ) -> Result<Self, String> {
         let (plan, focus, next_id) = plan_from_saved(saved);
         let mut panes = HashMap::new();
         for (id, name) in plan {
-            panes.insert(id, Pane::new(name, cols, rows, proxy.clone(), None, cfg)?);
+            panes.insert(id, Pane::new(name, cols, rows, wake.clone(), None, cfg)?);
         }
         Ok(Self {
             panes,
@@ -245,12 +243,7 @@ impl Tab {
     /// Split the focused pane along `axis`, focusing the new pane.
     /// The new pane inherits the focused pane's working directory (OSC 7 cwd).
     /// Returns `Err` if shell spawn fails; the tree is left unmodified in that case.
-    pub fn split(
-        &mut self,
-        axis: Axis,
-        proxy: EventLoopProxy<Wake>,
-        cfg: &SpawnCfg,
-    ) -> Result<(), String> {
+    pub fn split(&mut self, axis: Axis, wake: WakeCoalescer, cfg: &SpawnCfg) -> Result<(), String> {
         let id = self.next_id;
         // Clone the tree before mutating so we can roll back on spawn failure.
         let tree_before = self.tree.clone();
@@ -260,7 +253,7 @@ impl Tab {
             // shell starts in the same directory.
             let inherited_cwd = self.panes.get(&self.focus).and_then(|p| p.term.cwd());
             // Sized properly on the next relayout. Roll back the tree split on failure.
-            match Pane::new(name, 80, 24, proxy, inherited_cwd.as_deref(), cfg) {
+            match Pane::new(name, 80, 24, wake, inherited_cwd.as_deref(), cfg) {
                 Ok(pane) => {
                     self.next_id += 1;
                     self.panes.insert(id, pane);

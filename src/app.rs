@@ -45,6 +45,12 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 /// window is visible.
 const PROC_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
+/// Max PTY chunks (each ≤ 64 KB) parsed per pane per drain cycle. One full
+/// queue depth: a saturated pane costs at most ~2 MB of VT parsing per cycle,
+/// then the UI thread returns to the event loop (input, redraw) before the
+/// backlog continues via a self-`Wake`. See `drain_pty`.
+const DRAIN_CHUNKS_PER_PANE: usize = 32;
+
 /// Cap on simultaneously-restored windows (mirrors the per-window tab cap; guards
 /// against a crafted session mass-spawning OS windows). Also the runtime ceiling
 /// on interactively-created OS windows (RT-137).
@@ -177,7 +183,7 @@ pub(crate) struct Gritty {
     pub(crate) clip: Clip,
     pub(crate) mods: winit::keyboard::ModifiersState,
     pub(crate) last_proc_poll: Instant,
-    pub(crate) proxy: EventLoopProxy<Wake>,
+    pub(crate) wake: crate::WakeCoalescer,
     /// CA-37: shell-spawn knobs (scrollback + optional shell) read from
     /// `config.toml` at startup and threaded into every pane we create.
     pub(crate) spawn_cfg: SpawnCfg,
@@ -185,6 +191,7 @@ pub(crate) struct Gritty {
 
 impl Gritty {
     pub(crate) fn new(proxy: EventLoopProxy<Wake>) -> Self {
+        let wake = crate::WakeCoalescer::new(proxy);
         // CA-37: load the user's config once at startup and apply every knob —
         // colors via the runtime theme, font size as the initial zoom level, and
         // scrollback/shell carried in `spawn_cfg` to each pane.
@@ -206,7 +213,7 @@ impl Gritty {
             clip: Clip::new(),
             mods: winit::keyboard::ModifiersState::empty(),
             last_proc_poll: Instant::now() - Duration::from_secs(5),
-            proxy,
+            wake,
             spawn_cfg: SpawnCfg {
                 scrollback: cfg.scrollback,
                 shell: cfg.shell,
@@ -644,7 +651,7 @@ impl Gritty {
             color,
             cols,
             rows,
-            self.proxy.clone(),
+            self.wake.clone(),
             &self.spawn_cfg,
         ) {
             Ok(tab) => {
@@ -677,7 +684,7 @@ impl Gritty {
     }
 
     pub(crate) fn split_focus(&mut self, wi: usize, axis: Axis) {
-        let proxy = self.proxy.clone();
+        let wake = self.wake.clone();
         // CA-37: clone the spawn knobs before the `&mut self.windows` borrow below.
         let spawn_cfg = self.spawn_cfg.clone();
         let mut spawn_err: Option<String> = None;
@@ -692,7 +699,7 @@ impl Gritty {
             // existing pane intact — but report it instead of swallowing it
             // silently, mirroring `new_tab`'s non-fatal feedback. `split`
             // already rolled back its tree on failure, so the tab is fine.
-            if let Err(e) = tab.split(axis, proxy, &spawn_cfg) {
+            if let Err(e) = tab.split(axis, wake, &spawn_cfg) {
                 spawn_err = Some(e);
             }
         }
@@ -900,9 +907,18 @@ impl Gritty {
     /// Drain every pane's output into its grid across all windows. Returns the
     /// indices of windows whose *visible* (active) tab changed, so callers only
     /// repaint windows with something new to show.
+    ///
+    /// Bounded per cycle: at most [`DRAIN_CHUNKS_PER_PANE`] chunks are parsed
+    /// per pane per call. The old unbounded `while try_recv` raced the reader
+    /// thread — under a sustained flood the producer kept the queue non-empty
+    /// and the UI thread never left this loop, so input/redraw starved and the
+    /// app read as a hard freeze. With a budget, the leftover backlog re-wakes
+    /// us (`Wake`) after the OS event queue gets a turn; the bounded PTY queue
+    /// provides the backpressure that keeps memory flat either way.
     pub(crate) fn drain_pty(&mut self) -> Vec<usize> {
         crate::watchdog::mark(crate::watchdog::DRAIN_PTY);
         let mut dirty = Vec::new();
+        let mut backlog = false;
         for (wi, win) in self.windows.iter_mut().enumerate() {
             let active = win.active;
             let visible = win.visible;
@@ -919,9 +935,30 @@ impl Gritty {
                 for pane in tab.panes.values_mut() {
                     pane.pty.mark_drained();
                     let mut got = false;
-                    while let Ok(chunk) = pane.pty.rx.try_recv() {
-                        pane.term.feed(&chunk);
+                    let mut chunks = 0usize;
+                    while chunks < DRAIN_CHUNKS_PER_PANE {
+                        match pane.pty.rx.try_recv() {
+                            Ok(chunk) => {
+                                pane.term.feed(&chunk);
+                                got = true;
+                                chunks += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if chunks == DRAIN_CHUNKS_PER_PANE {
+                        backlog = true; // budget hit — finish in the next cycle
+                    }
+                    // A synchronized update whose deadline passed is force-
+                    // flushed so a program dying mid-`ESC[?2026h` can't leave
+                    // the pane frozen on stale content.
+                    if pane.term.flush_expired_sync() {
                         got = true;
+                    }
+                    // Write back engine-generated replies (CPR, DA1, DECRQM,
+                    // CSI 18 t, OSC color queries) the child is waiting on.
+                    for reply in pane.term.take_pty_writes() {
+                        pane.pty.write(reply.as_bytes());
                     }
                     if !painted && pane.term.take_bell() {
                         tab_belled = true;
@@ -937,6 +974,10 @@ impl Gritty {
             if win_dirty {
                 dirty.push(wi);
             }
+        }
+        if backlog {
+            // Re-queue ourselves; OS events already waiting are serviced first.
+            self.wake.wake();
         }
         dirty
     }
@@ -1240,7 +1281,7 @@ impl Gritty {
                 .tabs
                 .iter()
                 .filter_map(|st| {
-                    Tab::from_saved(st, cols, rows, self.proxy.clone(), &self.spawn_cfg).ok()
+                    Tab::from_saved(st, cols, rows, self.wake.clone(), &self.spawn_cfg).ok()
                 })
                 .collect();
             if tabs.is_empty() {
@@ -1696,6 +1737,9 @@ impl ApplicationHandler<Wake> for Gritty {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         let _wd = crate::watchdog::active(crate::watchdog::USER_EVENT);
+        // Re-arm the app-level wake coalescer BEFORE draining: output arriving
+        // from here on queues exactly one fresh Wake (see WakeCoalescer).
+        self.wake.begin_service();
         let dirty = self.drain_pty();
         // CA-40: `reap_dead` defers a just-died pane by one cycle so its final
         // drained line paints first. When it did defer, paint now (the final
@@ -1751,7 +1795,7 @@ impl ApplicationHandler<Wake> for Gritty {
         // CA-40: kick the next cycle so the deferred dead pane is actually reaped
         // (its exited reader thread will not wake us again).
         if deferred_reap {
-            let _ = self.proxy.send_event(Wake);
+            self.wake.wake();
         }
     }
 
@@ -1779,6 +1823,33 @@ impl ApplicationHandler<Wake> for Gritty {
             }
         }
 
+        // Synchronized updates (`ESC[?2026h`) are normally flushed by drain_pty
+        // as output flows; a program that dies (or stalls) mid-update produces
+        // no more output, so the expired flush must also run here, off the
+        // soonest-deadline wake armed below — otherwise the pane stays frozen
+        // on stale content.
+        let mut soonest_sync: Option<Duration> = None;
+        for wi in 0..self.windows.len() {
+            let mut flushed = false;
+            for tab in &mut self.windows[wi].tabs {
+                for pane in tab.panes.values_mut() {
+                    if pane.term.flush_expired_sync() {
+                        flushed = true;
+                    }
+                    if let Some(dl) = pane.term.sync_deadline() {
+                        let rem = dl.saturating_duration_since(Instant::now());
+                        soonest_sync = Some(match soonest_sync {
+                            Some(d) => d.min(rem),
+                            None => rem,
+                        });
+                    }
+                }
+            }
+            if flushed {
+                self.request_redraw(wi);
+            }
+        }
+
         // Windows already past their frame cooldown can paint now.
         for win in &self.windows {
             if win.redraw_pending && win.last_render.elapsed() >= FRAME {
@@ -1802,10 +1873,11 @@ impl ApplicationHandler<Wake> for Gritty {
         // again and the deferred relayout would never fire. Take the soonest of
         // the deferred-frame wake and the resize-debounce wake.
         let frame_wait = next_deferred_wait(pending, FRAME);
-        let wait = match (frame_wait, soonest_resize) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        // Soonest of: deferred frame, resize debounce, sync-update deadline.
+        let wait = [frame_wait, soonest_resize, soonest_sync]
+            .into_iter()
+            .flatten()
+            .min();
         if let Some(remaining) = wait {
             let until = Instant::now() + remaining;
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(until));
