@@ -4,6 +4,22 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Added
+- **Font fallback chain** — glyphs the primary monospace font lacks (agent
+  badges, symbols, emoji, CJK) now fall back to Segoe UI Symbol / Segoe UI /
+  Segoe UI Emoji / YaHei / MS Gothic / Malgun, each face lazily loaded the
+  first time a glyph needs it. Previously every such cell rendered blank.
+- **Scrollback search** (`Ctrl+Shift+F`) — literal, case-insensitive,
+  bottom-up with wrap; hits are highlighted through the selection machinery
+  and scrolled into view. Deliberately not regex: the engine's `RegexSearch`
+  would have added ~700 KB of DFA machinery to the binary.
+- **Tab-strip `★` attention badge** — a background tab whose agent finished
+  or blocked while unwatched shows `★` (stronger than the `•` activity dot),
+  so "which tab needs me" is visible without switching.
+- **`gate.ps1 -Stress`** — the quality gate can now run the 16-pane
+  multi-tab flood against the fresh build and fail on RSS/thread/GDI/USER
+  growth, so the fixed leak class can't regress silently.
+
 ### Fixed (stability / correctness)
 - **Multi-pane memory leak + long-session lag** — with several tabs/panes
   streaming at once, winit's unbounded user-event queue accumulated PTY wakes

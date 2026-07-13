@@ -7,10 +7,10 @@
 **A lightweight, native Windows terminal multiplexer — in Rust.**
 
 Tabs, split panes, a command palette, copy/paste that *actually works*, session
-restore, process-aware panes, HiDPI, IME — in a single **sub-800 KB** executable
+restore, process-aware panes, HiDPI, IME — in a single **~1.2 MB** executable
 with **no GPU, no Electron, no runtime, no WSL.**
 
-`300+ tests` · `259 deps` · CPU-rendered · one `gritty.exe` **under 800 KB**
+`340+ tests` · `259 deps` · CPU-rendered · one `gritty.exe` **~1.2 MB**
 
 </div>
 
@@ -66,7 +66,8 @@ run it in every pane; **Ctrl-click OSC-8 hyperlinks** (http/https only).
 
 **Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
-scrollback with a position indicator; visual bell.
+scrollback with a position indicator and **scrollback search** (`Ctrl+Shift+F`,
+case-insensitive, jumps bottom-up with wrap); visual bell.
 
 **Agent awareness** — gritty knows when a pane is running an AI coding agent
 (`claude`, `codex`, `cursor`, `copilot`, … ~12 recognized) and shows its live
@@ -80,7 +81,7 @@ on-screen UI; no integration or config required.
 
 **Persistence & looks** — **session save/restore** (layout, names, colors, window
 geometry survive restarts); optional `config.toml`; the "gunmetal & amber"
-industrial theme; gamma-correct text; WCAG-AA UI contrast; embedded-fallback font
+industrial theme; gamma-correct text; WCAG-AA UI contrast; system font-fallback chain (symbols/emoji/CJK, lazily loaded) with an embedded last-resort face
 so it never fails to start.
 
 **Resilience** — bounded PTY backpressure, graceful device-loss handling, a real
@@ -122,7 +123,8 @@ cargo build --release   # rust-toolchain.toml auto-selects nightly + rust-src;
 
 gritty pins a **nightly** toolchain (`rust-toolchain.toml`) and uses `-Z build-std`
 (`.cargo/config.toml`) to rebuild `std` for size — that, with `opt-level=z` and
-the hand-rolled parsers, keeps the self-contained `gritty.exe` **under 800 KB**.
+the hand-rolled parsers, keeps the self-contained `gritty.exe` lean (**~1.2 MB**
+after the speed-first build pass; the gate caps it at 1.5 MB).
 `rustup` installs the pinned toolchain, `rust-src`, and the MSVC target
 automatically on first build — no manual setup. Maintainers cut a release with
 `./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
@@ -136,6 +138,7 @@ automatically on first build — no manual setup. Maintainers cut a release with
 | Split right / down | `Ctrl+Shift+D` / `Ctrl+Shift+E` |
 | Move focus / resize pane | `Ctrl+Shift+Arrows` / `Ctrl+Alt+Arrows` |
 | Rename pane / close pane | `Ctrl+Shift+R` / `Ctrl+Shift+W` |
+| Search scrollback | `Ctrl+Shift+F` (Enter = previous match) |
 | New tab / switch tab | `Ctrl+Shift+T` / `Ctrl+1…9` |
 | Tear tab into new window | `Ctrl+Shift+N` / drag tab off the bar |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
