@@ -139,6 +139,21 @@ fn named(n: NamedColor, _default: u32) -> u32 {
     }
 }
 
+/// Answer an OSC 4/10/11 color query by alacritty's color-index convention:
+/// 0..=255 are the xterm palette; the named specials follow (256 = default
+/// foreground, 257 = default background, 258 = cursor). `None` for indices we
+/// have no stable answer for — the engine then sends no reply, which the
+/// querying program treats like an older terminal (its fallback path).
+pub fn query_color(idx: usize) -> Option<u32> {
+    match idx {
+        0..=255 => Some(indexed(idx as u8)),
+        256 => Some(fg()),
+        257 => Some(bg()),
+        258 => Some(CURSOR),
+        _ => None,
+    }
+}
+
 /// xterm 256-color palette.
 fn indexed(i: u8) -> u32 {
     match i {

@@ -186,23 +186,58 @@ impl Dimensions for TermSize {
     }
 }
 
-/// Captures OSC 0/2 window title events and BEL events emitted by the VT parser.
+/// Captures OSC 0/2 window title events, BEL events, and engine-generated PTY
+/// replies emitted by the VT parser.
 ///
 /// `EventListener::send_event` takes `&self`, so interior mutability is
 /// required to update state without `&mut self`.  Title uses `Arc<Mutex>`;
 /// the bell flag uses `Arc<AtomicBool>` for lock-free set/clear.
-/// Both `Arc`s are also held by `Terminal` so callers can read the state.
+/// The `Arc`s are also held by `Terminal` so callers can read the state.
 #[derive(Clone)]
 pub(crate) struct TitleListener {
     title: Arc<Mutex<String>>,
     bell: Arc<AtomicBool>,
+    /// Replies the VT engine wants written back to the child: CPR (`ESC[6n`),
+    /// DA1 (`ESC[c`), DECRQM reports, XTWINOPS size reports, OSC color queries.
+    /// Previously these events were silently dropped, so any program querying
+    /// its terminal mid-session (vim, pwsh reflow, TUIs) hung or misrendered
+    /// waiting for an answer that never came. Drained by
+    /// [`Terminal::take_pty_writes`] after each `feed` and written to the PTY.
+    pty_writes: Arc<Mutex<Vec<String>>>,
+    /// Live grid size for `TextAreaSizeRequest` (CSI 18 t): the reply is built
+    /// inside the event callback, which has no access to `Terminal`.
+    size: Arc<Mutex<(u16, u16)>>,
 }
 
 impl TitleListener {
-    fn new(title: Arc<Mutex<String>>, bell: Arc<AtomicBool>) -> Self {
-        Self { title, bell }
+    fn new(
+        title: Arc<Mutex<String>>,
+        bell: Arc<AtomicBool>,
+        pty_writes: Arc<Mutex<Vec<String>>>,
+        size: Arc<Mutex<(u16, u16)>>,
+    ) -> Self {
+        Self {
+            title,
+            bell,
+            pty_writes,
+            size,
+        }
+    }
+
+    fn push_write(&self, s: String) {
+        if let Ok(mut w) = self.pty_writes.lock() {
+            // Hard cap: a hostile stream spamming queries between drains must not
+            // grow the reply queue without limit. Real handshakes are a handful
+            // of tiny strings per drain cycle.
+            if w.len() < MAX_PENDING_PTY_WRITES {
+                w.push(s);
+            }
+        }
     }
 }
+
+/// Cap on engine-generated replies buffered between drains (see `push_write`).
+const MAX_PENDING_PTY_WRITES: usize = 64;
 
 impl EventListener for TitleListener {
     fn send_event(&self, event: Event) {
@@ -219,6 +254,33 @@ impl EventListener for TitleListener {
             }
             Event::Bell => {
                 self.bell.store(true, Ordering::Relaxed);
+            }
+            // Engine-generated replies to in-band queries (CPR, DA1, DECRQM…).
+            Event::PtyWrite(text) => self.push_write(text),
+            // CSI 14/18 t — report the text-area size. Pixel sizes are reported
+            // as 0 (unknown to this layer); rows/cols are what programs use.
+            Event::TextAreaSizeRequest(fmt) => {
+                let (cols, rows) = self.size.lock().map(|g| *g).unwrap_or((80, 24));
+                let reply = fmt(alacritty_terminal::event::WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width: 0,
+                    cell_height: 0,
+                });
+                self.push_write(reply);
+            }
+            // OSC 4/10/11 color queries — vim and friends probe the palette and
+            // background to pick a colorscheme; an unanswered query stalls them
+            // until their fallback timeout.
+            Event::ColorRequest(idx, fmt) => {
+                if let Some(rgb) = crate::color::query_color(idx) {
+                    let c = alacritty_terminal::vte::ansi::Rgb {
+                        r: ((rgb >> 16) & 0xff) as u8,
+                        g: ((rgb >> 8) & 0xff) as u8,
+                        b: (rgb & 0xff) as u8,
+                    };
+                    self.push_write(fmt(c));
+                }
             }
             _ => {}
         }
@@ -244,6 +306,13 @@ pub struct Terminal {
     /// Set to `true` by `TitleListener` when a BEL (`\x07`) is received.
     /// Consumed (cleared) by `take_bell()`.
     bell: Arc<AtomicBool>,
+    /// Engine-generated replies awaiting a write to the PTY (see
+    /// `TitleListener::pty_writes`). Drained via [`take_pty_writes`].
+    ///
+    /// [`take_pty_writes`]: Self::take_pty_writes
+    pty_writes: Arc<Mutex<Vec<String>>>,
+    /// Mirror of `size` shared with the listener for CSI 18 t replies.
+    shared_size: Arc<Mutex<(u16, u16)>>,
 }
 
 impl Terminal {
@@ -255,7 +324,14 @@ impl Terminal {
         };
         let title = Arc::new(Mutex::new(String::new()));
         let bell = Arc::new(AtomicBool::new(false));
-        let listener = TitleListener::new(Arc::clone(&title), Arc::clone(&bell));
+        let pty_writes = Arc::new(Mutex::new(Vec::new()));
+        let shared_size = Arc::new(Mutex::new((cols as u16, rows as u16)));
+        let listener = TitleListener::new(
+            Arc::clone(&title),
+            Arc::clone(&bell),
+            Arc::clone(&pty_writes),
+            Arc::clone(&shared_size),
+        );
         let term = Term::new(config, &size, listener);
         Self {
             term,
@@ -265,6 +341,8 @@ impl Terminal {
             cwd: None,
             osc7_carry: Vec::new(),
             bell,
+            pty_writes,
+            shared_size,
         }
     }
 
@@ -319,6 +397,41 @@ impl Terminal {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.size = TermSize { cols, rows };
         self.term.resize(self.size);
+        if let Ok(mut s) = self.shared_size.lock() {
+            *s = (cols as u16, rows as u16);
+        }
+    }
+
+    /// Drain the engine-generated replies (CPR/DA1/DECRQM/size/color reports)
+    /// queued since the last call. The caller writes them to the pane's PTY —
+    /// they are answers to in-band queries the child is blocking on.
+    pub fn take_pty_writes(&mut self) -> Vec<String> {
+        self.pty_writes
+            .lock()
+            .map(|mut w| std::mem::take(&mut *w))
+            .unwrap_or_default()
+    }
+
+    /// Deadline of an in-flight synchronized update (`ESC[?2026h`), if any.
+    /// vte buffers ALL output during a sync update; the embedder must flush
+    /// when the deadline passes or a program that dies mid-update (or never
+    /// sends the closing `ESC[?2026l`) leaves the pane frozen on stale content
+    /// until 2 MiB more output arrives.
+    pub fn sync_deadline(&self) -> Option<std::time::Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Force-flush an expired synchronized update: applies the buffered bytes
+    /// to the grid and clears the sync state. Returns `true` if a flush
+    /// happened (the caller should repaint).
+    pub fn flush_expired_sync(&mut self) -> bool {
+        match self.sync_deadline() {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                self.parser.stop_sync(&mut self.term);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Lines scrolled up into history (0 = viewing the bottom).
@@ -777,6 +890,112 @@ mod tests {
         // A full prefix at the tail is NOT a partial — caller treats it as an
         // unterminated sequence instead.
         assert_eq!(trailing_partial_prefix(b"\x1b]7;", p), None);
+    }
+
+    // --- engine reply plumbing (PtyWrite) ---
+
+    #[test]
+    fn da1_query_generates_a_pty_reply() {
+        // ESC [ c — Primary Device Attributes. The engine's reply used to be
+        // dropped on the floor; programs block on it.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b[c");
+        let w = t.take_pty_writes();
+        assert!(
+            w.iter()
+                .any(|s| s.starts_with("\x1b[?") && s.ends_with('c')),
+            "DA1 must yield a device-attributes reply, got {w:?}"
+        );
+        assert!(t.take_pty_writes().is_empty(), "drained once, then empty");
+    }
+
+    #[test]
+    fn csi_18t_reports_grid_size() {
+        let mut t = Terminal::new(100, 30, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b[18t");
+        let w = t.take_pty_writes();
+        assert!(
+            w.iter().any(|s| s.contains(";30;100t")),
+            "CSI 18 t must report rows;cols, got {w:?}"
+        );
+        // After a resize the report must reflect the new geometry.
+        t.resize(90, 40);
+        t.feed(b"\x1b[18t");
+        let w = t.take_pty_writes();
+        assert!(
+            w.iter().any(|s| s.contains(";40;90t")),
+            "post-resize CSI 18 t must report the new size, got {w:?}"
+        );
+    }
+
+    #[test]
+    fn osc_11_background_query_is_answered() {
+        // vim probes OSC 11 to pick light/dark; unanswered = stall + fallback.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b]11;?\x07");
+        let w = t.take_pty_writes();
+        assert!(
+            w.iter().any(|s| s.contains("rgb:")),
+            "OSC 11 ? must yield an rgb: reply, got {w:?}"
+        );
+    }
+
+    #[test]
+    fn pending_pty_writes_are_capped() {
+        // A hostile stream spamming queries between drains must not grow the
+        // reply queue without limit.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        for _ in 0..(MAX_PENDING_PTY_WRITES + 100) {
+            t.feed(b"\x1b[c");
+        }
+        let w = t.take_pty_writes();
+        assert!(
+            w.len() <= MAX_PENDING_PTY_WRITES,
+            "reply queue {} exceeded cap {MAX_PENDING_PTY_WRITES}",
+            w.len()
+        );
+    }
+
+    // --- synchronized updates (ESC[?2026h) ---
+
+    #[test]
+    fn sync_update_buffers_then_esu_applies() {
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b[?2026h");
+        t.feed(b"hidden");
+        assert!(t.sync_deadline().is_some(), "BSU must arm a deadline");
+        // Content is withheld from the grid while the update is open.
+        let tail = t.screen_tail(24);
+        assert!(
+            !tail.contains("hidden"),
+            "sync content applied early: {tail:?}"
+        );
+        t.feed(b"\x1b[?2026l");
+        assert!(t.sync_deadline().is_none(), "ESU must clear the deadline");
+        let tail = t.screen_tail(24);
+        assert!(
+            tail.contains("hidden"),
+            "ESU must apply the buffer: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn expired_sync_update_is_force_flushed() {
+        // A program that dies mid-update never sends ESU; after the deadline
+        // the buffered content must be applied instead of freezing the pane.
+        let mut t = Terminal::new(80, 24, DEFAULT_SCROLLBACK);
+        t.feed(b"\x1b[?2026h");
+        t.feed(b"orphaned");
+        assert!(!t.flush_expired_sync(), "deadline not yet passed");
+        // vte's sync timeout is 150 ms; wait it out.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(t.flush_expired_sync(), "expired update must flush");
+        assert!(t.sync_deadline().is_none(), "flush clears the deadline");
+        let tail = t.screen_tail(24);
+        assert!(
+            tail.contains("orphaned"),
+            "buffer must be applied: {tail:?}"
+        );
     }
 
     // --- BEL / visual bell tests ---
