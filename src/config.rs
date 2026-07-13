@@ -95,6 +95,10 @@ fn load_from(path: &std::path::Path) -> Option<Config> {
 /// in-memory text (the only `None` path is the size guard in `load_from`).
 fn parse(text: &str) -> Option<Config> {
     let mut cfg = Config::default();
+    // Tolerate a UTF-8 BOM: Windows editors and PowerShell 5.1's
+    // `Set-Content -Encoding UTF8` prepend U+FEFF, which `.trim()` does NOT
+    // remove (it is not whitespace) — the first key would silently not match.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for raw in text.lines() {
         let line = strip_comment(raw).trim();
         if line.is_empty() {
@@ -258,6 +262,15 @@ mod tests {
         assert_eq!(cfg.accent, Some(0x00FF_7B00));
         // The unparseable value falls back to its default, not the whole file.
         assert_eq!(cfg.scrollback, Config::default().scrollback);
+    }
+
+    /// A UTF-8 BOM (PowerShell 5.1 `Set-Content -Encoding UTF8`, Notepad) must
+    /// not make the first key silently unrecognized.
+    #[test]
+    fn bom_prefixed_config_parses() {
+        let cfg = parse("\u{feff}scrollback = 777\nfont_size = 11.0").expect("parse");
+        assert_eq!(cfg.scrollback, 777, "BOM must not hide the first key");
+        assert_eq!(cfg.font_size, 11.0);
     }
 
     /// Unknown keys are ignored (forward-compat), not errors.
