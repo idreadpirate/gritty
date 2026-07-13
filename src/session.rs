@@ -302,6 +302,13 @@ impl Tab {
             p.name = name;
         }
     }
+
+    /// Whether any pane in this tab has its attention latch raised (an agent
+    /// finished or blocked while unwatched). Drives the tab-strip `★` badge so
+    /// a background tab tells you an agent needs you without switching to it.
+    pub fn needs_attention(&self) -> bool {
+        self.panes.values().any(|p| p.attention)
+    }
 }
 
 #[cfg(test)]

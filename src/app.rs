@@ -529,6 +529,10 @@ impl Gritty {
             tab.name.hash(&mut hh);
             tab.color.hash(&mut hh);
             tab.activity.hash(&mut hh);
+            // The ★ badge for a background tab whose agent needs attention —
+            // per-pane attention is only hashed for the ACTIVE tab below, so
+            // without this a background latch wouldn't repaint the tab bar.
+            tab.needs_attention().hash(&mut hh);
         }
         // Active tab: focus + layout + per-pane header text.
         if let Some(tab) = win.tabs.get(win.active) {
@@ -2603,18 +2607,17 @@ impl Gritty {
     /// Ctrl+Shift+F search: find the previous match (bottom-up through the
     /// focused pane's viewport + scrollback), highlight it via the pane's
     /// selection, and scroll it into view. Repeated Enters resume one cell
-    /// before the last hit; the engine's search wraps at the top. An invalid
-    /// regex or no match simply clears the highlight (nothing to jump to).
+    /// before the last hit, wrapping at the top. Literal, case-insensitive,
+    /// per-row matching — deliberately NOT the engine's `RegexSearch`, which
+    /// links regex-automata's DFA machinery for ~700 KB of binary (gate-fail
+    /// bloat) to serve a use case that is overwhelmingly literal substrings.
     pub(crate) fn run_search(&mut self, wi: usize) {
-        use alacritty_terminal::index::Direction;
-        use alacritty_terminal::term::search::RegexSearch;
-
         let Some(query) = self.windows.get(wi).and_then(|w| w.search.clone()) else {
             return;
         };
         let prev = self.windows.get(wi).and_then(|w| w.search_origin);
         let mut hit = None;
-        if let Ok(mut regex) = RegexSearch::new(&query) {
+        if !query.is_empty() {
             if let Some(pane) = self.focused_pane_mut(wi) {
                 let term = &mut pane.term.term;
                 let (top, bottom, cols) = {
@@ -2622,10 +2625,7 @@ impl Gritty {
                     (g.topmost_line(), g.bottommost_line(), g.columns())
                 };
                 let origin = search_resume_origin(prev, top, bottom, cols);
-                if let Some(m) =
-                    term.search_next(&mut regex, origin, Direction::Left, Side::Left, None)
-                {
-                    let (s, e) = (*m.start(), *m.end());
+                if let Some((s, e)) = find_prev_literal(term.grid(), &query, origin, top, bottom) {
                     // Highlight through the existing selection machinery: it
                     // renders, forces full repaints, and Esc/click clears it.
                     let mut sel = Selection::new(SelectionType::Simple, s, Side::Left);
@@ -2662,6 +2662,78 @@ impl Gritty {
         }
         self.request_redraw(wi);
     }
+}
+
+/// Literal, case-insensitive, bottom-up search over grid rows: the previous
+/// occurrence of `query` at or before `origin`, scanning up through scrollback
+/// and wrapping from the top back to the bottom. Returns the match's
+/// `(first_cell, last_cell)` grid points. Matches do not cross row boundaries
+/// (a soft-wrapped occurrence split over two rows is not found) — the honest
+/// cost of staying ~700 KB of regex machinery lighter.
+pub(crate) fn find_prev_literal(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    query: &str,
+    origin: Point,
+    top: Line,
+    bottom: Line,
+) -> Option<(Point, Point)> {
+    use alacritty_terminal::term::cell::Flags;
+    let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let cols = grid.columns();
+    // Visit rows bottom-up starting at the origin row, wrapping past the top.
+    let total = (bottom.0 - top.0 + 1).max(0) as usize;
+    for step in 0..total {
+        let line = Line(origin.line.0 - step as i32);
+        let line = if line < top {
+            Line(line.0 + total as i32) // wrap: continue from the bottom
+        } else {
+            line
+        };
+        // Row text with wide-char spacers skipped; `col_of[i]` maps the i-th
+        // collected char back to its grid column so the match points land on
+        // real cells (a CJK query would otherwise trip over spacer cells).
+        let mut text: Vec<char> = Vec::with_capacity(cols);
+        let mut col_of: Vec<usize> = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let cell = &grid[line][Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            // One col_of entry per EMITTED char: some chars lowercase to more
+            // than one char (e.g. 'İ'), and text/col_of must stay in lockstep.
+            for lc in cell.c.to_lowercase() {
+                text.push(lc);
+                col_of.push(col);
+            }
+        }
+        // On the origin row only matches STARTING at or left of the origin
+        // column count (later ones were already visited or are excluded).
+        let limit = if line == origin.line {
+            match col_of.iter().rposition(|&c| c <= origin.column.0) {
+                Some(i) => i,
+                None => continue,
+            }
+        } else {
+            text.len().saturating_sub(1)
+        };
+        // Rightmost occurrence with start index <= limit.
+        let mut start = limit.min(text.len().saturating_sub(needle.len()));
+        loop {
+            if text[start..].starts_with(&needle[..]) {
+                let s = Point::new(line, Column(col_of[start]));
+                let e = Point::new(line, Column(col_of[start + needle.len() - 1]));
+                return Some((s, e));
+            }
+            if start == 0 {
+                break;
+            }
+            start -= 1;
+        }
+    }
+    None
 }
 
 /// Where a repeated search resumes: one cell to the left of the previous hit
@@ -3489,39 +3561,58 @@ mod tests {
         assert_eq!(search_scroll_delta(23, 24, 1), -1);
     }
 
-    /// End-to-end against a real grid: the exact search_next call run_search
-    /// makes must find text in scrollback, and the resume origin must step to
-    /// an earlier occurrence on the next call.
+    /// End-to-end against a real grid: the exact lookup run_search makes must
+    /// find text in scrollback (bottom-up, case-insensitive), and the resume
+    /// origin must step to a strictly earlier occurrence on the next call.
     #[test]
-    fn search_next_finds_scrollback_matches_bottom_up() {
-        use alacritty_terminal::index::Direction;
-        use alacritty_terminal::term::search::RegexSearch;
+    fn literal_search_finds_scrollback_matches_bottom_up() {
+        use alacritty_terminal::grid::Dimensions;
         let mut t = crate::term::Terminal::new(40, 5, 200);
         for i in 0..50 {
-            t.feed(format!("line {i} needle{i}\r\n").as_bytes());
+            t.feed(format!("line {i} NEEDLE{i}\r\n").as_bytes());
         }
-        let mut regex = RegexSearch::new("needle").expect("valid regex");
-        let term = &mut t.term;
-        let (top, bottom, cols) = {
-            use alacritty_terminal::grid::Dimensions;
-            let g = term.grid();
-            (g.topmost_line(), g.bottommost_line(), g.columns())
-        };
+        let term = &t.term;
+        let g = term.grid();
+        let (top, bottom, cols) = (g.topmost_line(), g.bottommost_line(), g.columns());
         let origin = search_resume_origin(None, top, bottom, cols);
-        let first = term
-            .search_next(&mut regex, origin, Direction::Left, Side::Left, None)
-            .expect("a match exists");
-        // Resume before the first hit: the next match is strictly earlier.
-        let origin2 = search_resume_origin(Some(*first.start()), top, bottom, cols);
-        let second = term
-            .search_next(&mut regex, origin2, Direction::Left, Side::Left, None)
-            .expect("an earlier match exists");
+        // Case-insensitive: lowercase query matches the uppercase output.
+        let (s1, e1) = find_prev_literal(g, "needle", origin, top, bottom).expect("a match exists");
+        assert!(e1 >= s1);
+        // The bottom-most occurrence is the LAST line written (needle49).
+        let origin2 = search_resume_origin(Some(s1), top, bottom, cols);
+        let (s2, _) =
+            find_prev_literal(g, "needle", origin2, top, bottom).expect("an earlier match");
         assert!(
-            second.start() < first.start(),
-            "second hit {:?} should be before first {:?}",
-            second.start(),
-            first.start()
+            s2 < s1,
+            "second hit {s2:?} should be strictly before first {s1:?}"
         );
+        // A query that appears nowhere returns None (no panic, no wrap loop).
+        assert!(find_prev_literal(g, "zzz-not-present", origin, top, bottom).is_none());
+    }
+
+    /// Wrap-around: resuming from the earliest occurrence finds the latest
+    /// one again (search wraps from the top back to the bottom).
+    #[test]
+    fn literal_search_wraps_from_top_to_bottom() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut t = crate::term::Terminal::new(40, 5, 100);
+        t.feed(b"unique-marker first\r\n");
+        for _ in 0..20 {
+            t.feed(b"filler\r\n");
+        }
+        t.feed(b"unique-marker last\r\n");
+        let g = t.term.grid();
+        let (top, bottom, cols) = (g.topmost_line(), g.bottommost_line(), g.columns());
+        // Find the bottom-most hit, then the earlier one...
+        let o1 = search_resume_origin(None, top, bottom, cols);
+        let (s_last, _) = find_prev_literal(g, "unique-marker", o1, top, bottom).unwrap();
+        let o2 = search_resume_origin(Some(s_last), top, bottom, cols);
+        let (s_first, _) = find_prev_literal(g, "unique-marker", o2, top, bottom).unwrap();
+        assert!(s_first < s_last);
+        // ...then resuming past the earliest must wrap back to the latest.
+        let o3 = search_resume_origin(Some(s_first), top, bottom, cols);
+        let (s_wrapped, _) = find_prev_literal(g, "unique-marker", o3, top, bottom).unwrap();
+        assert_eq!(s_wrapped, s_last, "search must wrap around to the bottom");
     }
 
     #[test]

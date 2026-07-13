@@ -153,6 +153,11 @@ impl Gritty {
                 // the tab geometry the hit-tests depend on.
                 let label = if i == active {
                     format!(" ▸{} ", tab.name)
+                } else if tab.needs_attention() {
+                    // An agent in this background tab finished or blocked —
+                    // stronger than plain output activity, same one-cell slot
+                    // so tab geometry (and the hit-tests) are unchanged.
+                    format!("★{} ", tab.name)
                 } else if tab.activity {
                     format!("•{} ", tab.name)
                 } else {
