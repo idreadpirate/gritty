@@ -219,6 +219,7 @@ impl Gritty {
             || (ctrl && shift && matches!(key, Key::Character(s) if s == "/"))
         {
             self.windows[wi].show_help = !self.windows[wi].show_help;
+            self.windows[wi].discovered = true; // hint served its purpose
             self.request_redraw(wi);
             return;
         }
@@ -254,6 +255,7 @@ impl Gritty {
                     }
                     "p" => {
                         self.windows[wi].palette = Some(Palette::new());
+                        self.windows[wi].discovered = true; // hint served its purpose
                         self.request_redraw(wi);
                         return;
                     }
@@ -614,6 +616,17 @@ impl Gritty {
             Cmd::SaveSession => self.persist_session(),
             Cmd::LoadSession => self.restore_session(event_loop),
             Cmd::ToggleAgents => self.toggle_agents(self.focused),
+            Cmd::SearchScrollback => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.search = Some(String::new());
+                    win.search_origin = None;
+                }
+            }
+            Cmd::ShowHelp => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.show_help = true;
+                }
+            }
         }
         let f = self.focused;
         self.request_redraw(f);

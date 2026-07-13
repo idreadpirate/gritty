@@ -158,7 +158,7 @@ if ($DryRun) {
     exit 0
 }
 
-$exePath = if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path (Get-Location) $Exe }
+$exePath = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path (Get-Location) $Exe }))
 if (-not (Test-Path $exePath)) { Fail "gritty exe not found: $exePath  (build it: cargo build --release)" }
 
 # ---------------------------------------------------------------------------
@@ -166,7 +166,13 @@ if (-not (Test-Path $exePath)) { Fail "gritty exe not found: $exePath  (build it
 # the launched process exits and a new detached gritty.exe is the real one, so
 # we find it by name, not by the Start-Process handle.
 # ---------------------------------------------------------------------------
-function Get-GrittyProcs { Get-Process -Name gritty -ErrorAction SilentlyContinue }
+# Only gritty processes launched from OUR exe path. The user may have a real
+# gritty session running from the installed location; sampling it pollutes the
+# leak verdict and — far worse — the cleanup would force-kill their session.
+function Get-GrittyProcs {
+    Get-Process -Name gritty -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $script:exePath }
+}
 
 # GDI/USER object counts per process (GetGuiResources). A GDI leak is the classic
 # "lags badly after an hour" failure on Windows — rendering slows to a crawl as
@@ -262,6 +268,13 @@ try {
     WriteNoBom $sessionPath $sessionJson
     WriteNoBom $configPath  $configText
 
+    $preexisting = Get-Process -Name gritty -ErrorAction SilentlyContinue
+    if ($preexisting | Where-Object { $_.Path -eq $exePath }) {
+        Fail "a gritty from $exePath is already running - close it or pass a different -Exe (cannot isolate measurements)"
+    }
+    if ($preexisting) {
+        Info "note: other gritty instance(s) running from a different path - ignored and left untouched."
+    }
     Info "Launching $exePath  ($Panes panes)..."
     $script:launchedAt = Get-Date
     Start-Process -FilePath $exePath | Out-Null

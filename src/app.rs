@@ -167,6 +167,11 @@ pub(crate) struct Win {
     /// grid cell content). When it changes the next frame is a full repaint; when
     /// it is unchanged only per-pane VT damage drives a partial repaint.
     pub(crate) last_sig: u64,
+    /// First-run discoverability: false until the user has opened the help
+    /// overlay or the command palette once this session. While false, the tab
+    /// bar shows a dim `F1 help · Ctrl+Shift+P commands` hint in its unused
+    /// right side — the one thing a fresh install never tells you.
+    pub(crate) discovered: bool,
     /// Force the next frame to be a full repaint regardless of the signature.
     /// Set on creation (the backbuffer is empty) and for one frame after a bell
     /// flash (so the transient amber overlay is cleared from the backbuffer).
@@ -329,6 +334,7 @@ impl Gritty {
             bb_w: 0,
             bb_h: 0,
             last_sig: 0,
+            discovered: false,
             force_full: true,
         })
     }
@@ -523,6 +529,7 @@ impl Gritty {
         win.rename.hash(&mut hh);
         win.rename_is_tab.hash(&mut hh);
         win.search.hash(&mut hh);
+        win.discovered.hash(&mut hh);
         win.preedit.hash(&mut hh);
         // Tab bar.
         for tab in &win.tabs {
@@ -2227,7 +2234,7 @@ impl Gritty {
             shown,
         ) {
             PaletteHit::Row(i) => {
-                let cmd = matches[i].1;
+                let cmd = matches[i].2;
                 if let Some(win) = self.windows.get_mut(wi) {
                     win.palette = None;
                 }

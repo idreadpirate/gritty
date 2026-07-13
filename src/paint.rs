@@ -251,6 +251,36 @@ impl Gritty {
                 .map(|t| t.color)
                 .unwrap_or(color::accent());
 
+            // First-run discoverability hint in the tab bar's unused right
+            // side, until the user opens help or the palette once (then it
+            // retires for the session). Suppressed while the broadcast
+            // indicator needs that space; skipped when tabs already fill it.
+            if !win.discovered && !win.broadcast {
+                let hint = "F1 help \u{b7} Ctrl+Shift+P commands ";
+                let hw = hint.chars().count() * cw;
+                let hx = stride.saturating_sub(hw);
+                if hx > tx + cw * 2 {
+                    let r = Rect {
+                        x: hx,
+                        y: 0,
+                        w: hw,
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        hx,
+                        0,
+                        hint,
+                        UI_DIM,
+                        UI_BAR_BG,
+                        false,
+                        r,
+                    );
+                }
+            }
+
             // Broadcast indicator at the right of the tab bar.
             if win.broadcast {
                 let label = " BROADCAST ";
@@ -434,7 +464,7 @@ impl Gritty {
                     qrect,
                 );
 
-                for (i, (label, _)) in matches.iter().take(shown).enumerate() {
+                for (i, (label, keys, _)) in matches.iter().take(shown).enumerate() {
                     let iy = by + ch + ch / 2 + i * ch;
                     let irow = Rect {
                         x: bx,
@@ -460,6 +490,26 @@ impl Gritty {
                         false,
                         irow,
                     );
+                    // Right-aligned dim shortcut column: every palette use
+                    // teaches the direct keybinding for next time.
+                    if !keys.is_empty() {
+                        let kw = keys.chars().count() * cw;
+                        if kw + (label.chars().count() + 3) * cw < box_w {
+                            let kfg = if i == sel { color::bg() } else { UI_DIM };
+                            draw_text(
+                                &mut buffer,
+                                stride,
+                                font,
+                                bx + box_w.saturating_sub(kw + cw),
+                                iy,
+                                keys,
+                                kfg,
+                                bg,
+                                false,
+                                irow,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -727,7 +777,8 @@ impl Gritty {
             // Rename overlay.
             if let Some(buf_str) = win.rename.clone() {
                 let what = if win.rename_is_tab { "tab" } else { "pane" };
-                let line = format!(" rename {what}: {buf_str}_ ");
+                let line =
+                    format!(" rename {what}: {buf_str}_  (Enter = save \u{b7} Esc = cancel) ");
                 let r = Rect {
                     x: 0,
                     y: height.saturating_sub(ch),
