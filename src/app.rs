@@ -94,6 +94,14 @@ pub(crate) struct Win {
     pub(crate) rename: Option<String>,
     /// While a rename prompt is open: true = renaming the active tab, false = pane.
     pub(crate) rename_is_tab: bool,
+    /// Scrollback-search prompt (Ctrl+Shift+F): the live query, or `None` when
+    /// closed. Enter jumps to the previous match (bottom-up); the hit is
+    /// highlighted via the pane's selection, so the existing selection
+    /// rendering and full-repaint forcing apply unchanged.
+    pub(crate) search: Option<String>,
+    /// Start of the last search hit, so the next Enter resumes one cell before
+    /// it instead of re-finding the same match. Reset when the query changes.
+    pub(crate) search_origin: Option<Point>,
     pub(crate) palette: Option<Palette>,
     /// Agent overview overlay (Ctrl+Shift+A): a jump list of every agent pane.
     pub(crate) agents: Option<crate::overview::Overview>,
@@ -290,6 +298,8 @@ impl Gritty {
             tab_drag: None,
             rename: None,
             rename_is_tab: false,
+            search: None,
+            search_origin: None,
             palette: None,
             agents: None,
             broadcast: false,
@@ -512,6 +522,7 @@ impl Gritty {
         win.agents.is_some().hash(&mut hh);
         win.rename.hash(&mut hh);
         win.rename_is_tab.hash(&mut hh);
+        win.search.hash(&mut hh);
         win.preedit.hash(&mut hh);
         // Tab bar.
         for tab in &win.tabs {
@@ -2588,6 +2599,105 @@ impl Gritty {
         }
         self.request_redraw(wi);
     }
+
+    /// Ctrl+Shift+F search: find the previous match (bottom-up through the
+    /// focused pane's viewport + scrollback), highlight it via the pane's
+    /// selection, and scroll it into view. Repeated Enters resume one cell
+    /// before the last hit; the engine's search wraps at the top. An invalid
+    /// regex or no match simply clears the highlight (nothing to jump to).
+    pub(crate) fn run_search(&mut self, wi: usize) {
+        use alacritty_terminal::index::Direction;
+        use alacritty_terminal::term::search::RegexSearch;
+
+        let Some(query) = self.windows.get(wi).and_then(|w| w.search.clone()) else {
+            return;
+        };
+        let prev = self.windows.get(wi).and_then(|w| w.search_origin);
+        let mut hit = None;
+        if let Ok(mut regex) = RegexSearch::new(&query) {
+            if let Some(pane) = self.focused_pane_mut(wi) {
+                let term = &mut pane.term.term;
+                let (top, bottom, cols) = {
+                    let g = term.grid();
+                    (g.topmost_line(), g.bottommost_line(), g.columns())
+                };
+                let origin = search_resume_origin(prev, top, bottom, cols);
+                if let Some(m) =
+                    term.search_next(&mut regex, origin, Direction::Left, Side::Left, None)
+                {
+                    let (s, e) = (*m.start(), *m.end());
+                    // Highlight through the existing selection machinery: it
+                    // renders, forces full repaints, and Esc/click clears it.
+                    let mut sel = Selection::new(SelectionType::Simple, s, Side::Left);
+                    sel.update(e, Side::Right);
+                    term.selection = Some(sel);
+                    // Scroll the hit into view (Delta clamps to history bounds).
+                    let rows = term.grid().screen_lines();
+                    let offset = term.grid().display_offset();
+                    let delta = search_scroll_delta(s.line.0, rows, offset);
+                    if delta != 0 {
+                        use alacritty_terminal::grid::Scroll;
+                        term.scroll_display(Scroll::Delta(delta));
+                    }
+                    hit = Some(s);
+                } else {
+                    term.selection = None;
+                }
+            }
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.search_origin = hit;
+        }
+        self.request_redraw(wi);
+    }
+
+    /// Close the search prompt, clearing the highlight and the resume point.
+    pub(crate) fn close_search(&mut self, wi: usize) {
+        if let Some(pane) = self.focused_pane_mut(wi) {
+            pane.term.term.selection = None;
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.search = None;
+            win.search_origin = None;
+        }
+        self.request_redraw(wi);
+    }
+}
+
+/// Where a repeated search resumes: one cell to the left of the previous hit
+/// (wrapping to the end of the previous line, and from the very top back to
+/// the viewport bottom), or the viewport's bottom-right for a fresh search.
+/// Pure so the stepping/wrapping is unit-tested without a live terminal.
+pub(crate) fn search_resume_origin(
+    prev: Option<Point>,
+    top: Line,
+    bottom: Line,
+    cols: usize,
+) -> Point {
+    let last_col = Column(cols.saturating_sub(1));
+    let fresh = Point::new(bottom, last_col);
+    match prev {
+        None => fresh,
+        Some(p) if p.column.0 > 0 => Point::new(p.line, Column(p.column.0 - 1)),
+        Some(p) if p.line > top => Point::new(p.line - 1, last_col),
+        Some(_) => fresh, // hit started at the very first cell — wrap around
+    }
+}
+
+/// Display-offset change needed to bring grid line `line` (negative = history)
+/// into a viewport of `rows` lines currently scrolled up by `offset`. Zero when
+/// already visible. Pure for unit tests; `Scroll::Delta` clamps the result.
+pub(crate) fn search_scroll_delta(line: i32, rows: usize, offset: usize) -> i32 {
+    let o = offset as i32;
+    let top_visible = -o;
+    let bottom_visible = rows as i32 - 1 - o;
+    if line < top_visible {
+        -line - o // scroll further up until `line` is the top row
+    } else if line > bottom_visible {
+        (rows as i32 - 1 - line).max(0) - o // scroll back down until visible
+    } else {
+        0
+    }
 }
 
 // --- Cursor position (for placing torn-off windows) --------------------------
@@ -3338,6 +3448,81 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- scrollback search -----------------------------------------------
+
+    #[test]
+    fn search_resume_origin_steps_and_wraps() {
+        let (top, bottom, cols) = (Line(-100), Line(23), 80usize);
+        // Fresh search starts at the viewport's bottom-right.
+        assert_eq!(
+            search_resume_origin(None, top, bottom, cols),
+            Point::new(Line(23), Column(79))
+        );
+        // Mid-line hit resumes one cell left.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(Line(5), Column(10))), top, bottom, cols),
+            Point::new(Line(5), Column(9))
+        );
+        // Column 0 wraps to the end of the previous line.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(Line(5), Column(0))), top, bottom, cols),
+            Point::new(Line(4), Column(79))
+        );
+        // A hit at the very first cell wraps back to the bottom.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(top, Column(0))), top, bottom, cols),
+            Point::new(bottom, Column(79))
+        );
+    }
+
+    #[test]
+    fn search_scroll_delta_brings_line_into_view() {
+        // Already visible → no scroll.
+        assert_eq!(search_scroll_delta(5, 24, 0), 0);
+        assert_eq!(search_scroll_delta(-3, 24, 10), 0);
+        // Above the viewport → scroll up until it's the top row.
+        assert_eq!(search_scroll_delta(-50, 24, 0), 50);
+        assert_eq!(search_scroll_delta(-50, 24, 10), 40);
+        // Below the viewport (scrolled far up) → scroll back down.
+        assert_eq!(search_scroll_delta(5, 24, 100), 18 - 100);
+        assert_eq!(search_scroll_delta(23, 24, 1), -1);
+    }
+
+    /// End-to-end against a real grid: the exact search_next call run_search
+    /// makes must find text in scrollback, and the resume origin must step to
+    /// an earlier occurrence on the next call.
+    #[test]
+    fn search_next_finds_scrollback_matches_bottom_up() {
+        use alacritty_terminal::index::Direction;
+        use alacritty_terminal::term::search::RegexSearch;
+        let mut t = crate::term::Terminal::new(40, 5, 200);
+        for i in 0..50 {
+            t.feed(format!("line {i} needle{i}\r\n").as_bytes());
+        }
+        let mut regex = RegexSearch::new("needle").expect("valid regex");
+        let term = &mut t.term;
+        let (top, bottom, cols) = {
+            use alacritty_terminal::grid::Dimensions;
+            let g = term.grid();
+            (g.topmost_line(), g.bottommost_line(), g.columns())
+        };
+        let origin = search_resume_origin(None, top, bottom, cols);
+        let first = term
+            .search_next(&mut regex, origin, Direction::Left, Side::Left, None)
+            .expect("a match exists");
+        // Resume before the first hit: the next match is strictly earlier.
+        let origin2 = search_resume_origin(Some(*first.start()), top, bottom, cols);
+        let second = term
+            .search_next(&mut regex, origin2, Direction::Left, Side::Left, None)
+            .expect("an earlier match exists");
+        assert!(
+            second.start() < first.start(),
+            "second hit {:?} should be before first {:?}",
+            second.start(),
+            first.start()
+        );
+    }
 
     #[test]
     fn restored_win_size_honors_sane_and_rejects_out_of_range() {

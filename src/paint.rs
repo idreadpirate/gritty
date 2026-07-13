@@ -592,6 +592,7 @@ impl Gritty {
                     ("Ctrl+Shift+P", "Command palette"),
                     ("Ctrl+Shift+A", "Agent overview (jump to a pane)"),
                     ("Ctrl+Shift+R", "Rename pane"),
+                    ("Ctrl+Shift+F", "Search scrollback (Enter = prev match)"),
                     ("Ctrl+Shift+C", "Copy selection"),
                     ("Ctrl+Shift+V", "Paste"),
                     (
@@ -690,6 +691,32 @@ impl Gritty {
                         val_rect,
                     );
                 }
+            }
+
+            // Scrollback-search overlay (Ctrl+Shift+F): a one-line prompt at the
+            // bottom, like rename. The hit itself is highlighted through the
+            // pane's selection, so no extra grid painting is needed here.
+            if let Some(q) = win.search.clone() {
+                let line = format!(" search: {q}_  (Enter = previous match · Esc = close) ");
+                let r = Rect {
+                    x: 0,
+                    y: height.saturating_sub(ch),
+                    w: stride,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, accent);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    0,
+                    r.y,
+                    &line,
+                    color::bg(),
+                    accent,
+                    true,
+                    r,
+                );
             }
 
             // Rename overlay.
