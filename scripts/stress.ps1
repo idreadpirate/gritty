@@ -214,7 +214,23 @@ Backup $configPath
 # named by GRITTY_STRESS_CMD, which panes inherit from the harness-launched
 # gritty. Restored (or removed) in the finally block like session/config.
 $profPath = $null
-if ($MultiTab -or $Solo -ge 0) {
+if ($Throughput) {
+    # Fixed-payload flood, injected at shell spawn via the profile (below) —
+    # no clipboard/SendKeys/foreground dependency, so A/B runs are identical
+    # and unattended-safe. Timing starts at process detection.
+    $lineBytes = 1024
+    $lines = [int]([math]::Floor($FloodMB * 1MB / $lineBytes))
+    $fillN = $lineBytes - 15
+    $floodCmd = '$e=[char]27;$l=("{0}[38;5;208m{1}{0}[0m" -f $e,(''x''*' + $fillN + '));for($i=0;$i-lt ' + $lines + ';$i++){[Console]::Out.WriteLine($l)};[Console]::Out.WriteLine(''__FLOOD_DONE__'')'
+    WriteNoBom (Join-Path $LogDir "wflood.ps1") $floodCmd
+    $profDir  = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell'
+    $profPath = Join-Path $profDir 'Microsoft.PowerShell_profile.ps1'
+    New-Item -ItemType Directory -Force -Path $profDir | Out-Null
+    Backup $profPath
+    WriteNoBom $profPath 'if ($env:GRITTY_STRESS_CMD) { Invoke-Expression $env:GRITTY_STRESS_CMD }'
+    $env:GRITTY_STRESS_CMD = ". '$(Join-Path $LogDir "wflood.ps1")'"
+}
+elseif ($MultiTab -or $Solo -ge 0) {
     $runFor = $Seconds + 20
     $workloads = @(
         # 0: CR spinner - dirty-rect single-row repaint path.
@@ -247,6 +263,7 @@ try {
     WriteNoBom $configPath  $configText
 
     Info "Launching $exePath  ($Panes panes)..."
+    $script:launchedAt = Get-Date
     Start-Process -FilePath $exePath | Out-Null
 
     # Wait for the detached gritty to appear.
@@ -255,34 +272,14 @@ try {
     $g = Get-GrittyProcs
     if (-not $g) { Fail "gritty did not start within 15s" }
     Info "gritty up (pid(s): $(($g | ForEach-Object Id) -join ', ')). Letting $Panes shells settle..."
-    Start-Sleep -Seconds 5   # let all panes spawn shells before the first sample
+    if (-not $Throughput) { Start-Sleep -Seconds 5 }   # settle; Throughput floods from spawn
 
     if ($Throughput) {
-        # Speed A/B: flood a fixed payload into the single pane and measure how
-        # fast + how cheaply gritty renders it (drain detected via CPU plateau).
-        $lineBytes = 1024
-        $lines = [int]([math]::Floor($FloodMB * 1MB / $lineBytes))
-        $fillN = $lineBytes - 15
-        # Built for Windows PowerShell 5.1 (the pinned shell): ESC = [char]27, no
-        # sleeps, a sentinel line at the end. Single-quoted so the *pane's* shell
-        # evaluates it, not this script.
-        $floodCmd = '$e=[char]27;$l=("{0}[38;5;208m{1}{0}[0m" -f $e,(''x''*' + $fillN + '));for($i=0;$i-lt ' + $lines + ';$i++){[Console]::Out.WriteLine($l)};[Console]::Out.WriteLine(''__FLOOD_DONE__'')'
-        Set-Clipboard -Value ($floodCmd + "`r`n")
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type @"
-using System;using System.Runtime.InteropServices;
-public class FgT { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n); }
-"@
-        $g = Get-GrittyProcs
-        $hwnd = ($g | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1).MainWindowHandle
-        if (-not $hwnd) { Fail "no window handle; cannot drive the throughput flood" }
-        [FgT]::ShowWindow($hwnd, 9) | Out-Null   # SW_RESTORE
-        [FgT]::SetForegroundWindow($hwnd) | Out-Null
-        Start-Sleep -Milliseconds 600
-        $cpu0 = (Sample).CpuSec
-        $t0 = Get-Date
-        [System.Windows.Forms.SendKeys]::SendWait("^+b")   # Ctrl+Shift+B paste+run
+        # Speed A/B: the profile-injected flood started when the pane's shell
+        # spawned. Measure from launch to the CPU plateau (drained); shell boot
+        # (~1 s) is included identically in every run, so A/B stays fair.
+        $cpu0 = 0.0
+        $t0 = $script:launchedAt
         Info ("Flooding ~{0} MB ({1} lines) into one pane; measuring drain..." -f $FloodMB, $lines)
 
         $peakRssMB = 0.0; $lastCpu = $cpu0; $idleHits = 0; $busySeen = $false

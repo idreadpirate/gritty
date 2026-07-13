@@ -4,6 +4,33 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Fixed (stability / correctness)
+- **Multi-pane memory leak + long-session lag** — with several tabs/panes
+  streaming at once, winit's unbounded user-event queue accumulated PTY wakes
+  faster than they were consumed (per-pane coalescing still let N panes enqueue
+  N wakes per consumed event): linear RSS growth (~+21%/2 min at 16 flooding
+  panes) plus, past the 10k Win32 message cap, silently dropped posts. A new
+  app-wide `WakeCoalescer` keeps at most **one** Wake in flight. Proved by A/B
+  stress: same 16-pane flood, before +21.3% RSS (linear, no plateau) → after
+  +1.3% (flat); 10-minute mixed multi-tab run +0.8%, PASS.
+- **Hard freeze under sustained floods** — `drain_pty` raced the reader threads
+  unboundedly, so a flood could pin the UI thread inside one drain and starve
+  input/redraw. Draining is now budgeted (~2 MB/pane/cycle) with a self-wake
+  for the backlog; throughput unchanged (5.6 vs 5.5 MB/s A/B).
+- **In-band queries were never answered** — the engine's replies to CPR
+  (`ESC[6n`), DA1, DECRQM, `CSI 18 t` size reports, and OSC 4/10/11 color
+  probes were dropped; programs querying their terminal (vim background
+  detection, prompt reflow) hung or misrendered. Replies are now written back
+  to the pane's PTY.
+- **Synchronized-update freeze** — a program dying mid-`ESC[?2026h` left its
+  pane frozen on stale content (vte buffers everything until ESU or a timeout
+  gritty never enforced). Expired updates are now force-flushed after vte's
+  150 ms deadline.
+- **UTF-8 BOM rejection** — a BOM (PowerShell 5.1 `Set-Content`, Notepad) made
+  gritty silently discard the whole `session.json` (startup fell back to a
+  fresh single tab) and ignore the first `config.toml` key. Both loaders now
+  strip it.
+
 ### Performance (throughput / memory)
 - **Speed-first build** — the binary-size budget was deliberately traded for
   speed. Release profile `opt-level=z → 3`; `build-std` no longer uses
