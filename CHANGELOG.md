@@ -5,6 +5,11 @@ All notable changes to gritty.
 ## [Unreleased]
 
 ### Added
+- **Discoverability polish** — palette rows show their keyboard shortcut
+  (dim, right-aligned); the palette gains `search scrollback` and
+  `keybinding help` entries; a dim `F1 help · Ctrl+Shift+P commands` hint
+  sits in the tab bar until either is opened once per session; the rename
+  prompt gains an `Enter = save · Esc = cancel` footer like search's.
 - **Font fallback chain** — glyphs the primary monospace font lacks (agent
   badges, symbols, emoji, CJK) now fall back to Segoe UI Symbol / Segoe UI /
   Segoe UI Emoji / YaHei / MS Gothic / Malgun, each face lazily loaded the
