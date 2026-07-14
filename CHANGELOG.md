@@ -2,6 +2,23 @@
 
 All notable changes to gritty.
 
+## [Unreleased]
+
+### Fixed (stability / correctness)
+- **Double CPR reply corrupted pane input / agent-UI anchor** — the ConPTY
+  startup cursor probe (`ESC[6n`) was answered twice: the PTY reader thread
+  synthesized a hardcoded `ESC[1;1R` *and* the VT engine answered the same
+  probe with the real position. ConPTY consumed one and forwarded the
+  duplicate to the child as stray input, where PSReadLine could swallow the
+  next typed character and a starting agent UI (claude/Ink) could read the
+  stale `1;1` as the answer to its *own* cursor query — anchoring its whole
+  UI at the wrong row ("claude renders mid-pane / stale text at the top
+  until a window resize forces a re-query"). The engine is now the single
+  replier; the reader thread forwards bytes verbatim. Reproduced and fixed
+  under the `claude_startup_grid_probe` diagnostic: typed input arrived as
+  `laude` before the fix, `claude` after; one reply on the wire; welcome UI
+  anchored at the top row.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added

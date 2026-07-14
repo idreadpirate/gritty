@@ -24,24 +24,28 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 
 /// The ANSI DSR cursor-position query (ESC [ 6 n). portable-pty ≥ 0.9 enables
 /// PSUEDOCONSOLE_INHERIT_CURSOR, which causes the ConPTY layer to emit this
-/// sequence at startup; the child process blocks until it receives a CPR reply
-/// (ESC [ row ; col R).
+/// sequence at startup; the child's output is withheld until a CPR reply
+/// (ESC [ row ; col R) arrives.
+///
+/// In the app the VT engine is the ONLY replier: `drain_pty` feeds the chunk to
+/// alacritty, which answers every CPR query (this startup probe included) with
+/// the real cursor position via `take_pty_writes`. The reader thread used to
+/// ALSO synthesize `ESC[1;1R` here — a DOUBLE reply. ConPTY consumed one and
+/// forwarded the duplicate to the child as stray input, where it corrupted the
+/// input stream: PSReadLine swallowed the next typed character, and an agent UI
+/// (claude/Ink) starting in the pane could read the stale `1;1` as the answer to
+/// its own cursor query and anchor its whole UI at the wrong row — the
+/// "renders mid-pane / stale text at top until a window resize" bug.
+#[cfg(test)]
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 
-/// Scans the PTY output stream for the startup DSR cursor-position query,
-/// carrying a small tail across read-chunk boundaries so a query split across
-/// two `read` calls is still detected (RT-24). The query is only 4 bytes, so a
-/// carry of at most `DSR_QUERY.len() - 1` bytes is enough: any real match either
-/// lies wholly inside one chunk or straddles the join, and the join window is
-/// fully covered by `carry || chunk`.
-///
-/// CA-44: the scanner also owns the one-shot reply decision. Only the *first*
-/// probe — the ConPTY `PSEUDOCONSOLE_INHERIT_CURSOR` startup query that the child
-/// blocks on — should be auto-answered with a synthetic `ESC[1;1R`. Any later CPR
-/// query (readline/zsh/pwsh prompt reflow, progress UIs, TUIs) must NOT get a
-/// hardcoded `1;1`, which would corrupt the program's wrap/redraw math. Folding
-/// both behaviours into one type keeps the carry and the one-shot flag in lockstep
-/// and makes the whole decision unit-testable.
+/// Test-only scanner for the startup DSR probe (see `DSR_QUERY`). PTY unit tests
+/// have no VT engine attached, so without a reply the child's output stays
+/// withheld forever; each test's drain loop uses this to answer the first probe
+/// itself. It carries a small tail across read-chunk boundaries so a query split
+/// across two `read` calls is still detected (RT-24), and replies exactly once
+/// (CA-44) — later CPR queries are a real program's business, not the harness's.
+#[cfg(test)]
 #[derive(Default)]
 struct DsrScanner {
     /// Trailing bytes of the previous chunk that could be the prefix of a
@@ -52,6 +56,7 @@ struct DsrScanner {
     answered: bool,
 }
 
+#[cfg(test)]
 impl DsrScanner {
     /// Feed the next read chunk and decide whether to send the one-shot startup
     /// CPR reply. Returns `true` exactly once — for the first chunk in which a
@@ -240,38 +245,19 @@ impl Pty {
         let notified = Arc::new(AtomicBool::new(false));
         let notified_reader = notified.clone();
 
-        // Share the writer with the reader thread so it can reply to DSR queries.
-        // portable-pty 0.9 sets PSUEDOCONSOLE_INHERIT_CURSOR which causes the
-        // ConPTY to emit ESC[6n (cursor position request) immediately; the child
-        // blocks until it receives a reply.  We synthesise ESC[1;1R here so the
-        // child starts without waiting for the real terminal emulator to answer.
-        let writer_for_dsr = Arc::clone(&writer);
-
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         thread::spawn(move || {
             // Heap-allocated once at thread start (64 KB is large for a stack frame).
             let mut buf = vec![0u8; READ_BUF];
-            // Owns both the RT-24 boundary-straddle carry and the CA-44 one-shot
-            // reply flag: it answers only the first startup probe, then stops.
-            let mut dsr = DsrScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // Forwarded verbatim: the ConPTY startup DSR probe in this
+                        // stream is answered by the VT engine after `drain_pty`
+                        // feeds it (see DSR_QUERY) — never synthesized here, so
+                        // the child gets exactly ONE reply per query.
                         let chunk = &buf[..n];
-                        // Auto-reply ONCE to the startup cursor-position DSR
-                        // (ESC [ 6 n) so the child shell does not block waiting
-                        // for a position report before the UI is live. RT-24: the
-                        // scanner carries a tail across reads so a query split
-                        // across two chunks is still detected. CA-44: only the
-                        // first probe is answered; later CPR queries flow through
-                        // to the term engine untouched.
-                        if dsr.should_reply(chunk) {
-                            if let Ok(mut w) = writer_for_dsr.lock() {
-                                let _ = w.write_all(b"\x1b[1;1R");
-                                let _ = w.flush();
-                            }
-                        }
                         if tx.send(chunk.to_vec()).is_err() {
                             break;
                         }
@@ -346,6 +332,30 @@ impl Drop for Pty {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Live-child tests have no VT engine attached, so the ConPTY startup DSR
+    /// probe would withhold the child's output forever. Each drain loop calls
+    /// this per chunk to answer the first probe (and only the first — CA-44).
+    fn reply_startup_dsr(dsr: &mut DsrScanner, pty: &mut Pty, chunk: &[u8]) {
+        if dsr.should_reply(chunk) {
+            pty.write(b"\x1b[1;1R");
+        }
+    }
+
+    /// Drain (and discard) output for `ms`, answering the startup DSR probe.
+    /// Tests that never read `rx` still need this: an unanswered ConPTY
+    /// withholds child output and can hang teardown at drop.
+    fn settle_probe(pty: &mut Pty, ms: u64) {
+        let mut dsr = DsrScanner::default();
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            pty.mark_drained();
+            while let Ok(c) = pty.rx.try_recv() {
+                reply_startup_dsr(&mut dsr, pty, &c);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn dsr_detected_within_a_single_chunk() {
@@ -477,7 +487,7 @@ mod tests {
 
         let wakes = Arc::new(AtomicUsize::new(0));
         let wakes_w = Arc::clone(&wakes);
-        let pty = Pty::spawn(
+        let mut pty = Pty::spawn(
             &shell,
             &[],
             24,
@@ -490,10 +500,13 @@ mod tests {
         .expect("spawn shell");
 
         // Drain startup output for 1.5s so we measure the steady state, not boot.
+        let mut dsr = DsrScanner::default();
         let settle = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < settle {
             pty.mark_drained();
-            while pty.rx.try_recv().is_ok() {}
+            while let Ok(c) = pty.rx.try_recv() {
+                reply_startup_dsr(&mut dsr, &mut pty, &c);
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -522,15 +535,68 @@ mod tests {
         );
     }
 
+    /// Diagnostic for the "claude renders mid-pane / stale text at top" report:
+    /// spawn a real pwsh over ConPTY, run `claude`, and mirror drain_pty's loop
+    /// (feed → engine replies → expired-sync flush) into a real Terminal grid.
+    /// Dumps the final grid and the raw byte stream so a divergence between
+    /// ConPTY's buffer and our VT state can be seen without the GUI.
+    #[test]
+    #[ignore = "diagnostic: reproduces claude startup against the real VT stack"]
+    fn claude_startup_grid_probe() {
+        use crate::term::Terminal;
+
+        let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        let shell = format!(r"{pf}\PowerShell\7\pwsh.exe");
+        let (cols, rows) = (120usize, 40usize);
+        let mut pty = Pty::spawn(&shell, &["-NoLogo"], rows as u16, cols as u16, || {}, None)
+            .expect("spawn pwsh");
+        let mut term = Terminal::new(cols, rows, 2000);
+        let mut raw: Vec<u8> = Vec::new();
+
+        let drain = |pty: &mut Pty, term: &mut Terminal, raw: &mut Vec<u8>, ms: u64| {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < end {
+                pty.mark_drained();
+                while let Ok(c) = pty.rx.try_recv() {
+                    raw.extend_from_slice(&c);
+                    term.feed(&c);
+                }
+                term.flush_expired_sync();
+                for reply in term.take_pty_writes() {
+                    eprintln!("[probe] engine reply -> pty: {:?}", reply);
+                    pty.write(reply.as_bytes());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        drain(&mut pty, &mut term, &mut raw, 4000); // let the prompt settle
+        pty.write(b"claude\r");
+        drain(&mut pty, &mut term, &mut raw, 20000); // claude boot + welcome UI
+
+        let dump = std::env::temp_dir().join("gritty-claude-probe.bin");
+        let _ = std::fs::write(&dump, &raw);
+        eprintln!("[probe] raw bytes: {} -> {}", raw.len(), dump.display());
+        eprintln!(
+            "[probe] final grid ({cols}x{rows}), display_offset={}:",
+            term.display_offset()
+        );
+        for (i, line) in term.screen_tail(rows).lines().enumerate() {
+            eprintln!("{i:3}|{line}");
+        }
+    }
+
     #[test]
     fn conpty_echo_roundtrips() {
-        let pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {}, None)
+        let mut pty = Pty::spawn("cmd.exe", &["/c", "echo", "gritty_ok"], 24, 80, || {}, None)
             .expect("spawn cmd.exe over ConPTY");
 
+        let mut dsr = DsrScanner::default();
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if let Ok(chunk) = pty.rx.recv_timeout(Duration::from_millis(200)) {
+                reply_startup_dsr(&mut dsr, &mut pty, &chunk);
                 out.extend_from_slice(&chunk);
                 if String::from_utf8_lossy(&out).contains("gritty_ok") {
                     return; // success
@@ -550,6 +616,8 @@ mod tests {
         assert!(pty.is_alive(), "freshly spawned shell should be alive");
         assert!(pty.pid().is_some(), "a spawned child has a pid");
 
+        settle_probe(&mut pty, 1000);
+
         // write + resize must not panic and must leave the child alive.
         pty.resize(40, 120);
         pty.write(b"echo hi\r\n");
@@ -566,17 +634,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn spawned_child_is_held_in_kill_on_close_job() {
-        let pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}, None).expect("spawn cmd.exe");
+        let mut pty = Pty::spawn("cmd.exe", &[], 24, 80, || {}, None).expect("spawn cmd.exe");
         assert!(
             pty._job.is_some(),
             "shell should be assigned to a kill-on-close job object"
         );
+        settle_probe(&mut pty, 500);
     }
 
     #[test]
     fn high_volume_no_loss_or_deadlock() {
         // 2000 numbered lines: exercises sustained draining without loss/hang.
-        let pty = Pty::spawn(
+        let mut pty = Pty::spawn(
             "cmd.exe",
             &["/c", "for /L %i in (1,1,2000) do @echo line%i"],
             24,
@@ -586,11 +655,13 @@ mod tests {
         )
         .expect("spawn");
 
+        let mut dsr = DsrScanner::default();
         let mut out = String::new();
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             pty.mark_drained();
             while let Ok(c) = pty.rx.try_recv() {
+                reply_startup_dsr(&mut dsr, &mut pty, &c);
                 out.push_str(&String::from_utf8_lossy(&c));
             }
             if out.contains("line2000") {
