@@ -1,4 +1,4 @@
-# release.ps1 — build, gate, and publish a gritty release to GitHub.
+# release.ps1 - build, gate, and publish a gritty release to GitHub.
 #
 #   ./scripts/release.ps1            # tag from Cargo.toml version (v<version>)
 #   ./scripts/release.ps1 -Tag v0.2.0
@@ -34,7 +34,7 @@ Step "Releasing $Tag"
 # --- Quality gate (fmt + clippy + tests + budgets) + release build ----------
 Step "Running quality gate"
 & "$PSScriptRoot\gate.ps1"
-if ($LASTEXITCODE) { Die "Quality gate failed — release aborted." }
+if ($LASTEXITCODE) { Die "Quality gate failed - release aborted." }
 
 # build-std pins the MSVC target, so the release exe lands under the target triple.
 $exe = "target/x86_64-pc-windows-msvc/release/gritty.exe"
