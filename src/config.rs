@@ -36,6 +36,12 @@ pub struct Config {
 
     /// Accent / border colour as `0x00RRGGBB`.  `None` → built-in default.
     pub accent: Option<u32>,
+
+    /// RT-138: OS-enforced cap on gritty's own commit charge, in MB (a Job
+    /// Object `ProcessMemoryLimit` on the gritty process only — pane children
+    /// are exempt via silent breakaway). `0` disables; values below 512 are
+    /// clamped up. Defaults to `memguard::DEFAULT_LIMIT_MB` (4096).
+    pub mem_limit_mb: usize,
 }
 
 impl Default for Config {
@@ -47,6 +53,7 @@ impl Default for Config {
             fg: None,
             bg: None,
             accent: None,
+            mem_limit_mb: crate::memguard::DEFAULT_LIMIT_MB,
         }
     }
 }
@@ -139,6 +146,11 @@ fn parse(text: &str) -> Option<Config> {
                     cfg.accent = Some(v);
                 }
             }
+            "mem_limit_mb" => {
+                if let Ok(v) = val.parse() {
+                    cfg.mem_limit_mb = v;
+                }
+            }
             _ => {} // unknown key: ignore
         }
     }
@@ -219,10 +231,12 @@ mod tests {
             fg = 0xF0F0F0
             bg = 0x181818
             accent = 0xFF7B00
+            mem_limit_mb = 8192
         "#;
         let cfg = parse(src).expect("parse");
         assert_eq!(cfg.font_size, 16.0);
         assert_eq!(cfg.scrollback, 10000);
+        assert_eq!(cfg.mem_limit_mb, 8192);
         assert_eq!(
             cfg.shell.as_deref(),
             Some("C:\\Windows\\System32\\pwsh.exe")
@@ -237,6 +251,15 @@ mod tests {
     fn empty_config_gives_defaults() {
         let cfg = parse("").expect("parse");
         assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.mem_limit_mb, crate::memguard::DEFAULT_LIMIT_MB);
+    }
+
+    /// RT-138: `mem_limit_mb = 0` is the documented opt-out and must survive
+    /// parsing (the clamping itself lives in memguard::effective_limit).
+    #[test]
+    fn mem_limit_zero_parses_as_opt_out() {
+        let cfg = parse("mem_limit_mb = 0").expect("parse");
+        assert_eq!(cfg.mem_limit_mb, 0);
     }
 
     /// An inline `#` comment is ignored; a `#` inside a quoted string is kept.

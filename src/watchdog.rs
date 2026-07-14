@@ -85,6 +85,9 @@ pub fn start(log_path: std::path::PathBuf) {
         .name("gritty-watchdog".into())
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
+            // RT-138: commit-growth curve logging lives on this thread so it
+            // still fires while the UI thread is wedged mid-runaway.
+            crate::memguard::poll(&log_path);
             let since = BUSY_SINCE.load(Ordering::Relaxed);
             if since == 0 {
                 continue; // idle / waiting — not a hang
@@ -102,11 +105,20 @@ pub fn start(log_path: std::path::PathBuf) {
 }
 
 fn log_hang(path: &std::path::Path, phase: &str, elapsed_ms: u64) {
+    append_line(
+        path,
+        &format!("HANG: UI thread stuck in {phase} for {elapsed_ms}ms"),
+    );
+}
+
+/// Best-effort timestamped append to the crash log — shared by the hang
+/// logger above and the memory guard (RT-138). Never panics.
+pub(crate) fn append_line(path: &std::path::Path, msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let secs = now_ms() / 1000;
-    let line = format!("[{secs}] HANG: UI thread stuck in {phase} for {elapsed_ms}ms\n");
+    let line = format!("[{secs}] {msg}\n");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

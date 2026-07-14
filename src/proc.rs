@@ -194,6 +194,38 @@ pub fn self_usage() -> Option<(u64, u64)> {
     None
 }
 
+/// This process's commit charge (PagefileUsage — private bytes backed by
+/// RAM+pagefile) and working set, in bytes. The commit number is what the
+/// memory guard (RT-138) caps and logs: it is the resource whose exhaustion
+/// took the machine down in the field, and it grows even when pages are
+/// swapped out (unlike the working set).
+#[cfg(windows)]
+pub fn self_commit() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            std::ptr::addr_of_mut!(pmc) as *mut PROCESS_MEMORY_COUNTERS,
+            pmc.cb,
+        ) == 0
+        {
+            return None;
+        }
+        Some((pmc.PagefileUsage as u64, pmc.WorkingSetSize as u64))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn self_commit() -> Option<(u64, u64)> {
+    None
+}
+
 /// Debug-only self-instrumentation: this process's working-set (RSS) in bytes
 /// and its live OS thread count. Lets us tell a real heap/thread leak apart from
 /// a CPU spin while diagnosing freezes — compare RSS and `os_threads` against the

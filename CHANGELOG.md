@@ -4,6 +4,19 @@ All notable changes to gritty.
 
 ## [Unreleased]
 
+### Added
+- **Self memory guard (RT-138)** — after a field incident (2026-07-14) where a
+  gritty instance's commit charge grew to 242 GB, exhausted the pagefile, and
+  hard-locked the machine (Windows event 2004 named gritty.exe; every
+  in-process buffer is audited/capped, growth path still unidentified), gritty
+  now caps its *own* commit with an OS-enforced Job Object limit
+  (`mem_limit_mb`, default 4096, `0` disables, floor 512). Pane children
+  (shells, compilers, agents) are exempt via `SILENT_BREAKAWAY_OK`, so a big
+  build in a pane is unaffected — worst case gritty aborts; Windows survives.
+  The watchdog thread additionally appends a timestamped `MEMGUARD commit/ws`
+  line to `crash.log` at every 256 MB crossing past 1 GiB, so a recurrence
+  leaves a growth curve for the postmortem instead of a mystery.
+
 ### Fixed (stability / correctness)
 - **Double CPR reply corrupted pane input / agent-UI anchor** — the ConPTY
   startup cursor probe (`ESC[6n`) was answered twice: the PTY reader thread

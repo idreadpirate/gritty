@@ -13,6 +13,7 @@ mod fuzzy;
 mod input;
 mod key;
 mod layout;
+mod memguard;
 mod overview;
 mod paint;
 mod palette;
@@ -345,6 +346,12 @@ fn main() {
     // silent freeze becomes diagnosable. Started after the detach re-exec so it
     // lives in the surviving instance; it costs one mostly-sleeping thread.
     watchdog::start(crash_log_path());
+
+    // RT-138: cap this process's commit charge with an OS-enforced job limit
+    // (panes exempt via silent breakaway) so a runaway allocation kills gritty,
+    // not the machine. After the detach re-exec so the cap binds the surviving
+    // instance; before the event loop so no allocation path predates it.
+    memguard::install(config::load().mem_limit_mb);
 
     let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
