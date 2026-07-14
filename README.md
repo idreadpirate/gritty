@@ -67,7 +67,9 @@ run it in every pane; **Ctrl-click OSC-8 hyperlinks** (http/https only).
 **Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
 scrollback with a position indicator and **scrollback search** (`Ctrl+Shift+F`,
-case-insensitive, jumps bottom-up with wrap); visual bell.
+case-insensitive, jumps bottom-up with wrap); visual bell; a **live
+`mem · cpu` readout** in the tab bar — gritty's own footprint, always visible,
+so a leak or a spin is user-visible without Task Manager.
 
 **Agent awareness** — gritty knows when a pane is running an AI coding agent
 (`claude`, `codex`, `cursor`, `copilot`, … ~12 recognized) and shows its live

@@ -155,6 +155,45 @@ pub fn snapshot() -> Vec<Proc> {
     Vec::new()
 }
 
+/// This process's working-set (RSS) in bytes and total CPU time consumed, in
+/// 100 ns ticks (kernel + user). Two cheap syscalls — no snapshots, no handles
+/// opened (`GetCurrentProcess` is a pseudo-handle). Feeds the tab bar's live
+/// `mem · cpu` readout, sampled on the existing 750 ms process poll.
+#[cfg(windows)]
+pub fn self_usage() -> Option<(u64, u64)> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    unsafe {
+        let me = GetCurrentProcess();
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if GetProcessMemoryInfo(me, &mut pmc, pmc.cb) == 0 {
+            return None;
+        }
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        if GetProcessTimes(me, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let ticks = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        Some((
+            pmc.WorkingSetSize as u64,
+            ticks(kernel).saturating_add(ticks(user)),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn self_usage() -> Option<(u64, u64)> {
+    None
+}
+
 /// Debug-only self-instrumentation: this process's working-set (RSS) in bytes
 /// and its live OS thread count. Lets us tell a real heap/thread leak apart from
 /// a CPU spin while diagnosing freezes — compare RSS and `os_threads` against the

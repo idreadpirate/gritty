@@ -31,6 +31,7 @@ impl Gritty {
         let sig = self.render_sig(wi, w, h);
         let (any_bell, any_sel, any_scroll) = self.active_grid_flags(wi);
         let rects = self.pane_rects(wi, w, h);
+        let stats = self.stats_text.clone();
 
         // Phase 2 — mutable borrows. The glyph atlas is shared across windows; the
         // surface/backbuffer/state belong to this window. Distinct fields of
@@ -251,15 +252,66 @@ impl Gritty {
                 .map(|t| t.color)
                 .unwrap_or(color::accent());
 
-            // First-run discoverability hint in the tab bar's unused right
-            // side, until the user opens help or the palette once (then it
-            // retires for the session). Suppressed while the broadcast
-            // indicator needs that space; skipped when tabs already fill it.
-            if !win.discovered && !win.broadcast {
+            // Right side of the tab bar, laid right-to-left and width-guarded
+            // against the tab strip: the live self-usage readout sits at the
+            // far right (always, dim — watch gritty's own mem/cpu without Task
+            // Manager); to its left, the BROADCAST indicator when armed, else
+            // the first-run `F1 help` hint until the user has opened help or
+            // the palette once this session.
+            let mut right_x = stride;
+            if !stats.is_empty() {
+                let sw = (stats.chars().count() + 1) * cw;
+                if right_x > sw && right_x - sw > tx + cw {
+                    right_x -= sw;
+                    let r = Rect {
+                        x: right_x,
+                        y: 0,
+                        w: sw,
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        right_x,
+                        0,
+                        &stats,
+                        UI_DIM,
+                        UI_BAR_BG,
+                        false,
+                        r,
+                    );
+                }
+            }
+            if win.broadcast {
+                let label = " BROADCAST ";
+                let lw = label.chars().count() * cw;
+                if right_x > lw && right_x - lw > tx + cw {
+                    let r = Rect {
+                        x: right_x - lw,
+                        y: 0,
+                        w: lw,
+                        h: ch,
+                    };
+                    fill_rect(&mut buffer, stride, r, accent);
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        r.x,
+                        0,
+                        label,
+                        color::bg(),
+                        accent,
+                        true,
+                        r,
+                    );
+                }
+            } else if !win.discovered {
                 let hint = "F1 help \u{b7} Ctrl+Shift+P commands ";
                 let hw = hint.chars().count() * cw;
-                let hx = stride.saturating_sub(hw);
-                if hx > tx + cw * 2 {
+                if right_x > hw && right_x - hw > tx + cw {
+                    let hx = right_x - hw;
                     let r = Rect {
                         x: hx,
                         y: 0,
@@ -279,31 +331,6 @@ impl Gritty {
                         r,
                     );
                 }
-            }
-
-            // Broadcast indicator at the right of the tab bar.
-            if win.broadcast {
-                let label = " BROADCAST ";
-                let lw = label.chars().count() * cw;
-                let r = Rect {
-                    x: stride.saturating_sub(lw),
-                    y: 0,
-                    w: lw,
-                    h: ch,
-                };
-                fill_rect(&mut buffer, stride, r, accent);
-                draw_text(
-                    &mut buffer,
-                    stride,
-                    font,
-                    r.x,
-                    0,
-                    label,
-                    color::bg(),
-                    accent,
-                    true,
-                    r,
-                );
             }
 
             // Tab strip bottom separator — faint 1px line between tabs and content (CA-29).

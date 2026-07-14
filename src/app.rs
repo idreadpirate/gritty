@@ -200,6 +200,13 @@ pub(crate) struct Gritty {
     /// CA-37: shell-spawn knobs (scrollback + optional shell) read from
     /// `config.toml` at startup and threaded into every pane we create.
     pub(crate) spawn_cfg: SpawnCfg,
+    /// Live self-usage readout for the tab bar ("mem 96 MB · cpu 2%"), so a
+    /// user can watch for leaks/spins without Task Manager. Refreshed on the
+    /// 750 ms process poll; repaints only when the rounded text changes, so
+    /// the readout itself costs nothing at idle.
+    pub(crate) stats_text: String,
+    /// Previous (instant, cpu-ticks) sample for the CPU% delta.
+    pub(crate) last_self_cpu: Option<(Instant, u64)>,
 }
 
 impl Gritty {
@@ -231,6 +238,31 @@ impl Gritty {
                 scrollback: cfg.scrollback,
                 shell: cfg.shell,
             },
+            stats_text: String::new(),
+            last_self_cpu: None,
+        }
+    }
+
+    /// Refresh the tab-bar self-usage readout (see `stats_text`). Returns
+    /// `true` when the displayed text changed and a repaint is warranted.
+    pub(crate) fn update_self_stats(&mut self) -> bool {
+        let Some((rss, ticks)) = proc::self_usage() else {
+            return false;
+        };
+        let now = Instant::now();
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cpu = self
+            .last_self_cpu
+            .map(|(t, prev)| cpu_percent(ticks.saturating_sub(prev), now - t, cores));
+        self.last_self_cpu = Some((now, ticks));
+        let text = format_self_stats(rss, cpu);
+        if text != self.stats_text {
+            self.stats_text = text;
+            true
+        } else {
+            false
         }
     }
 
@@ -530,6 +562,8 @@ impl Gritty {
         win.rename_is_tab.hash(&mut hh);
         win.search.hash(&mut hh);
         win.discovered.hash(&mut hh);
+        // Live self-usage readout in the tab bar.
+        self.stats_text.hash(&mut hh);
         win.preedit.hash(&mut hh);
         // Tab bar.
         for tab in &win.tabs {
@@ -1783,6 +1817,10 @@ impl ApplicationHandler<Wake> for Gritty {
         if proc_poll_due(self.last_proc_poll.elapsed(), poll_active) {
             proc_dirty = self.update_procs(); // repaint only if a header changed
             self.last_proc_poll = Instant::now();
+            // Tab-bar self-usage readout (mem/cpu), same cadence, no new timer.
+            if self.update_self_stats() {
+                proc_dirty = true;
+            }
 
             // Leak probe (debug only): RSS + OS thread count vs. live pane count.
             // RSS climbing → heap leak; os_threads growing while panes flat →
@@ -3524,9 +3562,66 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
     }
 }
 
+/// Task-Manager-style CPU percentage: 100 ns CPU ticks consumed over `wall`,
+/// normalized across `cores` logical processors (so 100% = the whole machine,
+/// matching what users see in Task Manager). Pure for unit tests.
+pub(crate) fn cpu_percent(delta_ticks: u64, wall: Duration, cores: usize) -> f64 {
+    let wall_ticks = wall.as_nanos() as f64 / 100.0;
+    if wall_ticks <= 0.0 || cores == 0 {
+        return 0.0;
+    }
+    (delta_ticks as f64 * 100.0) / (wall_ticks * cores as f64)
+}
+
+/// Human format for the tab-bar readout: `mem 96 MB · cpu 2%`. Whole MB below
+/// 1 GiB, one decimal of GB above (a leak reads as steadily climbing mem).
+/// CPU is omitted until a second sample exists to delta against.
+pub(crate) fn format_self_stats(rss: u64, cpu: Option<f64>) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let mem = if rss >= GIB {
+        format!("{:.1} GB", rss as f64 / GIB as f64)
+    } else {
+        format!("{} MB", rss / (1024 * 1024))
+    };
+    match cpu {
+        Some(p) => format!("mem {mem} \u{b7} cpu {:.0}%", p.clamp(0.0, 100.0)),
+        None => format!("mem {mem}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- tab-bar self-usage readout ---------------------------------------
+
+    #[test]
+    fn cpu_percent_matches_task_manager_semantics() {
+        // 1 s of CPU over 1 s of wall on 1 core = 100%.
+        let ticks_1s = 10_000_000u64; // 100 ns ticks
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 1), 100.0);
+        // Same on 4 cores = 25% of the machine.
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 4), 25.0);
+        // Degenerate inputs never divide by zero.
+        assert_eq!(cpu_percent(ticks_1s, Duration::ZERO, 4), 0.0);
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 0), 0.0);
+    }
+
+    #[test]
+    fn format_self_stats_is_human_readable() {
+        let mb = 1024 * 1024;
+        assert_eq!(
+            format_self_stats(96 * mb, Some(2.4)),
+            "mem 96 MB \u{b7} cpu 2%"
+        );
+        // First sample has no CPU delta yet: memory only.
+        assert_eq!(format_self_stats(96 * mb, None), "mem 96 MB");
+        // Past 1 GiB the unit flips so a leak reads as climbing GB.
+        assert_eq!(
+            format_self_stats(1536 * mb, Some(150.0)),
+            "mem 1.5 GB \u{b7} cpu 100%"
+        );
+    }
 
     // --- scrollback search -----------------------------------------------
 
