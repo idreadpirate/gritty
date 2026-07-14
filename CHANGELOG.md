@@ -2,6 +2,29 @@
 
 All notable changes to gritty.
 
+## [0.2.2] - 2026-07-14
+
+### Fixed (user-facing hardening)
+- **Installer preflight for AVX2** — the release exe targets `x86-64-v3`
+  (AVX2); on a pre-2013 CPU it crashed at launch with no message. `install.ps1`
+  now refuses up front with a clear explanation where the runtime can detect
+  support (pwsh 7+), and warns on ARM64 (x64 emulation lacks AVX2 before
+  Windows 11 24H2). README gains an explicit Requirements block (incl. the
+  unsigned-binary SmartScreen note).
+- **`Get-FileHash` fallback in install.ps1 / release.ps1** — hosting
+  environments that override `PSModulePath` (nested shells, CI, IDE tasks)
+  hide the module that provides `Get-FileHash`, killing the install mid-flow;
+  both scripts now fall back to `certutil -hashfile` (ships with Windows).
+- **MEMGUARD log lines name the cap** — crash.log growth lines now carry
+  `(cap N MB)` and say "abort at cap imminent" inside the last 10%, so a
+  gritty that aborted at its own memory cap reads as exactly that in the log
+  instead of an unexplained disappearance.
+- **README de-staled** — build-from-source section still described the old
+  size-first (`opt-level=z`) build; it now matches the speed-first pass and
+  points at the one-line `target-cpu` edit for older CPUs. Added a
+  Configuration section documenting every `config.toml` key (none were
+  user-documented) and the crash.log location.
+
 ## [0.2.1] - 2026-07-14
 
 ### Added

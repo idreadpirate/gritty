@@ -58,6 +58,26 @@ fn log_step(commit: u64, last_step: u64) -> Option<u64> {
 /// steps start at `LOG_START_MB / LOG_STEP_MB` = 4, so 0 is a safe sentinel).
 static LAST_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The installed cap in MB (0 = disabled), stashed by `install` so the log
+/// lines can say how far from the abort the process is — a user whose gritty
+/// "just vanished" reads the last line and knows the cap killed it, not a bug
+/// in Windows or a random crash.
+static CAP_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log-line tail describing the distance to the cap. Within 10% of the cap
+/// the line says plainly that an abort is imminent — that sentence is the
+/// difference between "gritty disappeared, wtf" and a self-explaining log.
+fn cap_suffix(commit_mb: u64, cap_mb: u64) -> String {
+    if cap_mb == 0 {
+        return String::new();
+    }
+    if commit_mb * 10 >= cap_mb * 9 {
+        format!(" (cap {cap_mb} MB — abort at cap imminent)")
+    } else {
+        format!(" (cap {cap_mb} MB)")
+    }
+}
+
 /// Watchdog-thread hook: append a `MEMGUARD` growth-curve line to `log_path`
 /// whenever commit crosses another `LOG_STEP_MB` boundary past `LOG_START_MB`.
 pub fn poll(log_path: &std::path::Path) {
@@ -75,10 +95,11 @@ pub fn poll(log_path: &std::path::Path) {
         .compare_exchange(last, step, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
+        let commit_mb = commit / (1024 * 1024);
         let line = format!(
-            "MEMGUARD: commit={} MB ws={} MB",
-            commit / (1024 * 1024),
-            ws / (1024 * 1024)
+            "MEMGUARD: commit={commit_mb} MB ws={} MB{}",
+            ws / (1024 * 1024),
+            cap_suffix(commit_mb, CAP_MB.load(Ordering::Relaxed))
         );
         crate::watchdog::append_line(log_path, &line);
     }
@@ -93,8 +114,8 @@ pub fn install(mb: usize) {
         return;
     };
     #[cfg(windows)]
-    {
-        let _ = assign_self_capped_job(bytes);
+    if assign_self_capped_job(bytes).is_some() {
+        CAP_MB.store(bytes / (1024 * 1024), std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(windows))]
     let _ = bytes;
@@ -150,6 +171,18 @@ mod tests {
             "tiny caps clamp up to the floor, not brick startup"
         );
         assert_eq!(effective_limit(4096), Some(4096 * 1024 * 1024));
+    }
+
+    #[test]
+    fn cap_suffix_names_the_cap_and_flags_imminent_abort() {
+        assert_eq!(cap_suffix(1500, 0), "", "disabled cap adds nothing");
+        assert_eq!(cap_suffix(1500, 4096), " (cap 4096 MB)");
+        // 90% of 4096 = 3686.4 → 3687 is inside the imminent band.
+        assert_eq!(
+            cap_suffix(3687, 4096),
+            " (cap 4096 MB — abort at cap imminent)"
+        );
+        assert_eq!(cap_suffix(3686, 4096), " (cap 4096 MB)");
     }
 
     #[test]

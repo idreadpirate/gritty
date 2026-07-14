@@ -46,7 +46,17 @@ $staging = Join-Path ([IO.Path]::GetTempPath()) "gritty-release-$Tag"
 New-Item -ItemType Directory -Force -Path $staging | Out-Null
 $stagedExe = Join-Path $staging 'gritty.exe'
 Copy-Item -Force $exe $stagedExe
-$hash = (Get-FileHash -Algorithm SHA256 $stagedExe).Hash.ToLower()
+# Get-FileHash can vanish when PSModulePath is overridden by a hosting
+# environment (nested shells, CI, IDE tasks) — certutil always ships.
+$hash = if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+    (Get-FileHash -Algorithm SHA256 $stagedExe).Hash.ToLower()
+} else {
+    $line = & certutil -hashfile $stagedExe SHA256 2>$null |
+        Where-Object { ($_ -replace '\s', '') -match '^[0-9a-fA-F]{64}$' } |
+        Select-Object -First 1
+    if (-not $line) { Die "Could not compute SHA256 (no Get-FileHash; certutil failed)." }
+    ($line -replace '\s', '').ToLower()
+}
 "$hash  gritty.exe" | Set-Content -NoNewline (Join-Path $staging 'gritty.exe.sha256')
 Write-Host "  sha256 $hash" -ForegroundColor Gray
 

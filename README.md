@@ -106,6 +106,12 @@ window (not the near-full-screen pre-maximize size).
 
 ## Install
 
+**Requirements:** Windows 10 1809+ (ConPTY) on an x86-64 CPU with AVX2
+(Haswell 2013 or newer — the release build targets `x86-64-v3`; the installer
+refuses cleanly on unsupported CPUs where it can detect them, and building
+from source with a lower `target-cpu` always works). The binary is unsigned,
+so SmartScreen may warn on first launch — "More info -> Run anyway".
+
 **One line, no toolchain** (Windows 10/11, PowerShell):
 
 ```powershell
@@ -129,17 +135,35 @@ irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/uninsta
 git clone https://github.com/idreadpirate/gritty
 cd gritty
 cargo build --release   # rust-toolchain.toml auto-selects nightly + rust-src;
-                        # .cargo/config.toml rebuilds std at opt=z (-Z build-std)
+                        # .cargo/config.toml rebuilds std for speed (-Z build-std)
 ./target/x86_64-pc-windows-msvc/release/gritty.exe
 ```
 
 gritty pins a **nightly** toolchain (`rust-toolchain.toml`) and uses `-Z build-std`
-(`.cargo/config.toml`) to rebuild `std` for size — that, with `opt-level=z` and
-the hand-rolled parsers, keeps the self-contained `gritty.exe` lean (**~1.2 MB**
-after the speed-first build pass; the gate caps it at 1.5 MB).
+(`.cargo/config.toml`) to rebuild `std` at `opt-level=3` + `target-cpu=x86-64-v3`
+(the speed-first pass) — that, with the hand-rolled parsers, still keeps the
+self-contained `gritty.exe` lean (**~1.2 MB**; the gate caps it at 1.5 MB).
+Editing `.cargo/config.toml`'s `target-cpu` line is all it takes to build for
+an older CPU.
 `rustup` installs the pinned toolchain, `rust-src`, and the MSVC target
 automatically on first build — no manual setup. Maintainers cut a release with
 `./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
+
+## Configuration
+
+Optional `%APPDATA%\gritty\config.toml` — every key optional, missing file =
+sensible defaults, a typo skips that line instead of discarding the file:
+
+| Key | Default | What it does |
+|---|---|---|
+| `font_size` | `18.0` | Font size in logical px (live: `Ctrl +/-/0`) |
+| `scrollback` | `2000` | History lines per pane (~1.5 KB/line/pane) |
+| `shell` | system default | Absolute path to the shell spawned per pane |
+| `fg` / `bg` / `accent` | built-in theme | `0xRRGGBB` color overrides |
+| `mem_limit_mb` | `4096` | OS-enforced cap on gritty's own memory (`0` = off, floor 512). Pane programs are exempt. If gritty ever hits the cap it aborts instead of taking the machine down; `%LOCALAPPDATA%\gritty\crash.log` explains what happened |
+
+Diagnostics land in `%LOCALAPPDATA%\gritty\crash.log`: panics, UI-thread
+hangs (with the stuck phase), and `MEMGUARD` memory-growth lines.
 
 ## Keybindings (essentials)
 

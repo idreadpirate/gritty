@@ -1,4 +1,6 @@
-# uninstall.ps1 — remove a gritty installation made by install.ps1.
+# uninstall.ps1 - remove a gritty installation made by install.ps1.
+# ASCII-only strings: Windows PowerShell 5.1 reads BOM-less files as ANSI, and
+# a UTF-8 em-dash decodes to a cp1252 curly quote that terminates the string.
 #
 #   irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/uninstall.ps1 | iex
 #
@@ -32,7 +34,7 @@ if (Test-Path $InstallDir) {
     try {
         Remove-Item $InstallDir -Recurse -Force
     } catch {
-        Write-Host "[warn] could not remove $InstallDir — close any running gritty and retry." -ForegroundColor Yellow
+        Write-Host "[warn] could not remove $InstallDir - close any running gritty and retry." -ForegroundColor Yellow
     }
 }
 

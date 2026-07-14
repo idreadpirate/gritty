@@ -24,11 +24,43 @@ $Headers    = @{ 'User-Agent' = 'gritty-installer' }
 function Info($m) { Write-Host "  $m" -ForegroundColor Gray }
 function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Done($m) { Write-Host "[ok] $m" -ForegroundColor Green }
+function Warn($m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[error] $m" -ForegroundColor Red; exit 1 }
+
+# SHA256 of a file. Get-FileHash can be unavailable when PSModulePath is
+# overridden by a hosting environment (nested shells, CI, IDE tasks) — fall
+# back to certutil, which ships with every Windows.
+function Get-Sha256([string]$Path) {
+    if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLower()
+    }
+    $line = & certutil -hashfile $Path SHA256 2>$null |
+        Where-Object { ($_ -replace '\s', '') -match '^[0-9a-fA-F]{64}$' } |
+        Select-Object -First 1
+    if (-not $line) { Die "Could not compute SHA256 (no Get-FileHash; certutil failed)." }
+    return ($line -replace '\s', '').ToLower()
+}
 
 Write-Host ""
 Write-Host "  gritty installer" -ForegroundColor White
 Write-Host ""
+
+# --- 0. CPU preflight ---------------------------------------------------------
+# The released exe targets x86-64-v3 (AVX2, Haswell 2013+). A CPU without AVX2
+# would die on launch with an illegal-instruction crash and no message — refuse
+# up front where the runtime can tell us (pwsh 7+). Windows PowerShell 5.1 has
+# no reliable check, so it proceeds (AVX2 is near-universal on Win10/11-era
+# hardware). Building from source with a lower target-cpu always works.
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+if ($arch -eq 'ARM64') {
+    Warn "ARM64 Windows detected: gritty.exe is x64 + AVX2; x64 emulation without AVX2 (before Windows 11 24H2) will crash on launch."
+} elseif ($PSVersionTable.PSEdition -eq 'Core') {
+    try {
+        if (-not [System.Runtime.Intrinsics.X86.Avx2]::IsSupported) {
+            Die "This CPU reports no AVX2 support; the released gritty.exe requires it (x86-64-v3, ~2013+). Build from source with a lower target-cpu instead."
+        }
+    } catch { <# intrinsics API unavailable — proceed like 5.1 #> }
+}
 
 # --- 1. Resolve the release to install --------------------------------------
 Step "Finding release"
@@ -64,7 +96,7 @@ if ($shaAsset) {
     $shaTmp = "$tmp.sha256"
     Invoke-WebRequest -Headers $Headers -Uri $shaAsset.browser_download_url -OutFile $shaTmp
     $expected = ((Get-Content $shaTmp -Raw).Trim() -split '\s+')[0].ToLower()
-    $actual   = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLower()
+    $actual   = Get-Sha256 $tmp
     Remove-Item $shaTmp -Force -ErrorAction SilentlyContinue
     if ($expected -ne $actual) {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
