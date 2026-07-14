@@ -45,6 +45,12 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(80);
 /// window is visible.
 const PROC_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
+/// Max PTY chunks (each ≤ 64 KB) parsed per pane per drain cycle. One full
+/// queue depth: a saturated pane costs at most ~2 MB of VT parsing per cycle,
+/// then the UI thread returns to the event loop (input, redraw) before the
+/// backlog continues via a self-`Wake`. See `drain_pty`.
+const DRAIN_CHUNKS_PER_PANE: usize = 32;
+
 /// Cap on simultaneously-restored windows (mirrors the per-window tab cap; guards
 /// against a crafted session mass-spawning OS windows). Also the runtime ceiling
 /// on interactively-created OS windows (RT-137).
@@ -88,6 +94,14 @@ pub(crate) struct Win {
     pub(crate) rename: Option<String>,
     /// While a rename prompt is open: true = renaming the active tab, false = pane.
     pub(crate) rename_is_tab: bool,
+    /// Scrollback-search prompt (Ctrl+Shift+F): the live query, or `None` when
+    /// closed. Enter jumps to the previous match (bottom-up); the hit is
+    /// highlighted via the pane's selection, so the existing selection
+    /// rendering and full-repaint forcing apply unchanged.
+    pub(crate) search: Option<String>,
+    /// Start of the last search hit, so the next Enter resumes one cell before
+    /// it instead of re-finding the same match. Reset when the query changes.
+    pub(crate) search_origin: Option<Point>,
     pub(crate) palette: Option<Palette>,
     /// Agent overview overlay (Ctrl+Shift+A): a jump list of every agent pane.
     pub(crate) agents: Option<crate::overview::Overview>,
@@ -153,6 +167,11 @@ pub(crate) struct Win {
     /// grid cell content). When it changes the next frame is a full repaint; when
     /// it is unchanged only per-pane VT damage drives a partial repaint.
     pub(crate) last_sig: u64,
+    /// First-run discoverability: false until the user has opened the help
+    /// overlay or the command palette once this session. While false, the tab
+    /// bar shows a dim `F1 help · Ctrl+Shift+P commands` hint in its unused
+    /// right side — the one thing a fresh install never tells you.
+    pub(crate) discovered: bool,
     /// Force the next frame to be a full repaint regardless of the signature.
     /// Set on creation (the backbuffer is empty) and for one frame after a bell
     /// flash (so the transient amber overlay is cleared from the backbuffer).
@@ -177,14 +196,22 @@ pub(crate) struct Gritty {
     pub(crate) clip: Clip,
     pub(crate) mods: winit::keyboard::ModifiersState,
     pub(crate) last_proc_poll: Instant,
-    pub(crate) proxy: EventLoopProxy<Wake>,
+    pub(crate) wake: crate::WakeCoalescer,
     /// CA-37: shell-spawn knobs (scrollback + optional shell) read from
     /// `config.toml` at startup and threaded into every pane we create.
     pub(crate) spawn_cfg: SpawnCfg,
+    /// Live self-usage readout for the tab bar ("mem 96 MB · cpu 2%"), so a
+    /// user can watch for leaks/spins without Task Manager. Refreshed on the
+    /// 750 ms process poll; repaints only when the rounded text changes, so
+    /// the readout itself costs nothing at idle.
+    pub(crate) stats_text: String,
+    /// Previous (instant, cpu-ticks) sample for the CPU% delta.
+    pub(crate) last_self_cpu: Option<(Instant, u64)>,
 }
 
 impl Gritty {
     pub(crate) fn new(proxy: EventLoopProxy<Wake>) -> Self {
+        let wake = crate::WakeCoalescer::new(proxy);
         // CA-37: load the user's config once at startup and apply every knob —
         // colors via the runtime theme, font size as the initial zoom level, and
         // scrollback/shell carried in `spawn_cfg` to each pane.
@@ -206,11 +233,36 @@ impl Gritty {
             clip: Clip::new(),
             mods: winit::keyboard::ModifiersState::empty(),
             last_proc_poll: Instant::now() - Duration::from_secs(5),
-            proxy,
+            wake,
             spawn_cfg: SpawnCfg {
                 scrollback: cfg.scrollback,
                 shell: cfg.shell,
             },
+            stats_text: String::new(),
+            last_self_cpu: None,
+        }
+    }
+
+    /// Refresh the tab-bar self-usage readout (see `stats_text`). Returns
+    /// `true` when the displayed text changed and a repaint is warranted.
+    pub(crate) fn update_self_stats(&mut self) -> bool {
+        let Some((rss, ticks)) = proc::self_usage() else {
+            return false;
+        };
+        let now = Instant::now();
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cpu = self
+            .last_self_cpu
+            .map(|(t, prev)| cpu_percent(ticks.saturating_sub(prev), now - t, cores));
+        self.last_self_cpu = Some((now, ticks));
+        let text = format_self_stats(rss, cpu);
+        if text != self.stats_text {
+            self.stats_text = text;
+            true
+        } else {
+            false
         }
     }
 
@@ -283,6 +335,8 @@ impl Gritty {
             tab_drag: None,
             rename: None,
             rename_is_tab: false,
+            search: None,
+            search_origin: None,
             palette: None,
             agents: None,
             broadcast: false,
@@ -312,6 +366,7 @@ impl Gritty {
             bb_w: 0,
             bb_h: 0,
             last_sig: 0,
+            discovered: false,
             force_full: true,
         })
     }
@@ -505,12 +560,20 @@ impl Gritty {
         win.agents.is_some().hash(&mut hh);
         win.rename.hash(&mut hh);
         win.rename_is_tab.hash(&mut hh);
+        win.search.hash(&mut hh);
+        win.discovered.hash(&mut hh);
+        // Live self-usage readout in the tab bar.
+        self.stats_text.hash(&mut hh);
         win.preedit.hash(&mut hh);
         // Tab bar.
         for tab in &win.tabs {
             tab.name.hash(&mut hh);
             tab.color.hash(&mut hh);
             tab.activity.hash(&mut hh);
+            // The ★ badge for a background tab whose agent needs attention —
+            // per-pane attention is only hashed for the ACTIVE tab below, so
+            // without this a background latch wouldn't repaint the tab bar.
+            tab.needs_attention().hash(&mut hh);
         }
         // Active tab: focus + layout + per-pane header text.
         if let Some(tab) = win.tabs.get(win.active) {
@@ -644,7 +707,7 @@ impl Gritty {
             color,
             cols,
             rows,
-            self.proxy.clone(),
+            self.wake.clone(),
             &self.spawn_cfg,
         ) {
             Ok(tab) => {
@@ -677,7 +740,7 @@ impl Gritty {
     }
 
     pub(crate) fn split_focus(&mut self, wi: usize, axis: Axis) {
-        let proxy = self.proxy.clone();
+        let wake = self.wake.clone();
         // CA-37: clone the spawn knobs before the `&mut self.windows` borrow below.
         let spawn_cfg = self.spawn_cfg.clone();
         let mut spawn_err: Option<String> = None;
@@ -692,7 +755,7 @@ impl Gritty {
             // existing pane intact — but report it instead of swallowing it
             // silently, mirroring `new_tab`'s non-fatal feedback. `split`
             // already rolled back its tree on failure, so the tab is fine.
-            if let Err(e) = tab.split(axis, proxy, &spawn_cfg) {
+            if let Err(e) = tab.split(axis, wake, &spawn_cfg) {
                 spawn_err = Some(e);
             }
         }
@@ -900,9 +963,18 @@ impl Gritty {
     /// Drain every pane's output into its grid across all windows. Returns the
     /// indices of windows whose *visible* (active) tab changed, so callers only
     /// repaint windows with something new to show.
+    ///
+    /// Bounded per cycle: at most [`DRAIN_CHUNKS_PER_PANE`] chunks are parsed
+    /// per pane per call. The old unbounded `while try_recv` raced the reader
+    /// thread — under a sustained flood the producer kept the queue non-empty
+    /// and the UI thread never left this loop, so input/redraw starved and the
+    /// app read as a hard freeze. With a budget, the leftover backlog re-wakes
+    /// us (`Wake`) after the OS event queue gets a turn; the bounded PTY queue
+    /// provides the backpressure that keeps memory flat either way.
     pub(crate) fn drain_pty(&mut self) -> Vec<usize> {
         crate::watchdog::mark(crate::watchdog::DRAIN_PTY);
         let mut dirty = Vec::new();
+        let mut backlog = false;
         for (wi, win) in self.windows.iter_mut().enumerate() {
             let active = win.active;
             let visible = win.visible;
@@ -919,9 +991,30 @@ impl Gritty {
                 for pane in tab.panes.values_mut() {
                     pane.pty.mark_drained();
                     let mut got = false;
-                    while let Ok(chunk) = pane.pty.rx.try_recv() {
-                        pane.term.feed(&chunk);
+                    let mut chunks = 0usize;
+                    while chunks < DRAIN_CHUNKS_PER_PANE {
+                        match pane.pty.rx.try_recv() {
+                            Ok(chunk) => {
+                                pane.term.feed(&chunk);
+                                got = true;
+                                chunks += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if chunks == DRAIN_CHUNKS_PER_PANE {
+                        backlog = true; // budget hit — finish in the next cycle
+                    }
+                    // A synchronized update whose deadline passed is force-
+                    // flushed so a program dying mid-`ESC[?2026h` can't leave
+                    // the pane frozen on stale content.
+                    if pane.term.flush_expired_sync() {
                         got = true;
+                    }
+                    // Write back engine-generated replies (CPR, DA1, DECRQM,
+                    // CSI 18 t, OSC color queries) the child is waiting on.
+                    for reply in pane.term.take_pty_writes() {
+                        pane.pty.write(reply.as_bytes());
                     }
                     if !painted && pane.term.take_bell() {
                         tab_belled = true;
@@ -937,6 +1030,10 @@ impl Gritty {
             if win_dirty {
                 dirty.push(wi);
             }
+        }
+        if backlog {
+            // Re-queue ourselves; OS events already waiting are serviced first.
+            self.wake.wake();
         }
         dirty
     }
@@ -1240,7 +1337,7 @@ impl Gritty {
                 .tabs
                 .iter()
                 .filter_map(|st| {
-                    Tab::from_saved(st, cols, rows, self.proxy.clone(), &self.spawn_cfg).ok()
+                    Tab::from_saved(st, cols, rows, self.wake.clone(), &self.spawn_cfg).ok()
                 })
                 .collect();
             if tabs.is_empty() {
@@ -1696,6 +1793,9 @@ impl ApplicationHandler<Wake> for Gritty {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         let _wd = crate::watchdog::active(crate::watchdog::USER_EVENT);
+        // Re-arm the app-level wake coalescer BEFORE draining: output arriving
+        // from here on queues exactly one fresh Wake (see WakeCoalescer).
+        self.wake.begin_service();
         let dirty = self.drain_pty();
         // CA-40: `reap_dead` defers a just-died pane by one cycle so its final
         // drained line paints first. When it did defer, paint now (the final
@@ -1717,6 +1817,10 @@ impl ApplicationHandler<Wake> for Gritty {
         if proc_poll_due(self.last_proc_poll.elapsed(), poll_active) {
             proc_dirty = self.update_procs(); // repaint only if a header changed
             self.last_proc_poll = Instant::now();
+            // Tab-bar self-usage readout (mem/cpu), same cadence, no new timer.
+            if self.update_self_stats() {
+                proc_dirty = true;
+            }
 
             // Leak probe (debug only): RSS + OS thread count vs. live pane count.
             // RSS climbing → heap leak; os_threads growing while panes flat →
@@ -1751,7 +1855,7 @@ impl ApplicationHandler<Wake> for Gritty {
         // CA-40: kick the next cycle so the deferred dead pane is actually reaped
         // (its exited reader thread will not wake us again).
         if deferred_reap {
-            let _ = self.proxy.send_event(Wake);
+            self.wake.wake();
         }
     }
 
@@ -1779,6 +1883,33 @@ impl ApplicationHandler<Wake> for Gritty {
             }
         }
 
+        // Synchronized updates (`ESC[?2026h`) are normally flushed by drain_pty
+        // as output flows; a program that dies (or stalls) mid-update produces
+        // no more output, so the expired flush must also run here, off the
+        // soonest-deadline wake armed below — otherwise the pane stays frozen
+        // on stale content.
+        let mut soonest_sync: Option<Duration> = None;
+        for wi in 0..self.windows.len() {
+            let mut flushed = false;
+            for tab in &mut self.windows[wi].tabs {
+                for pane in tab.panes.values_mut() {
+                    if pane.term.flush_expired_sync() {
+                        flushed = true;
+                    }
+                    if let Some(dl) = pane.term.sync_deadline() {
+                        let rem = dl.saturating_duration_since(Instant::now());
+                        soonest_sync = Some(match soonest_sync {
+                            Some(d) => d.min(rem),
+                            None => rem,
+                        });
+                    }
+                }
+            }
+            if flushed {
+                self.request_redraw(wi);
+            }
+        }
+
         // Windows already past their frame cooldown can paint now.
         for win in &self.windows {
             if win.redraw_pending && win.last_render.elapsed() >= FRAME {
@@ -1802,10 +1933,11 @@ impl ApplicationHandler<Wake> for Gritty {
         // again and the deferred relayout would never fire. Take the soonest of
         // the deferred-frame wake and the resize-debounce wake.
         let frame_wait = next_deferred_wait(pending, FRAME);
-        let wait = match (frame_wait, soonest_resize) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        // Soonest of: deferred frame, resize debounce, sync-update deadline.
+        let wait = [frame_wait, soonest_resize, soonest_sync]
+            .into_iter()
+            .flatten()
+            .min();
         if let Some(remaining) = wait {
             let until = Instant::now() + remaining;
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(until));
@@ -2140,7 +2272,7 @@ impl Gritty {
             shown,
         ) {
             PaletteHit::Row(i) => {
-                let cmd = matches[i].1;
+                let cmd = matches[i].2;
                 if let Some(win) = self.windows.get_mut(wi) {
                     win.palette = None;
                 }
@@ -2515,6 +2647,173 @@ impl Gritty {
             }
         }
         self.request_redraw(wi);
+    }
+
+    /// Ctrl+Shift+F search: find the previous match (bottom-up through the
+    /// focused pane's viewport + scrollback), highlight it via the pane's
+    /// selection, and scroll it into view. Repeated Enters resume one cell
+    /// before the last hit, wrapping at the top. Literal, case-insensitive,
+    /// per-row matching — deliberately NOT the engine's `RegexSearch`, which
+    /// links regex-automata's DFA machinery for ~700 KB of binary (gate-fail
+    /// bloat) to serve a use case that is overwhelmingly literal substrings.
+    pub(crate) fn run_search(&mut self, wi: usize) {
+        let Some(query) = self.windows.get(wi).and_then(|w| w.search.clone()) else {
+            return;
+        };
+        let prev = self.windows.get(wi).and_then(|w| w.search_origin);
+        let mut hit = None;
+        if !query.is_empty() {
+            if let Some(pane) = self.focused_pane_mut(wi) {
+                let term = &mut pane.term.term;
+                let (top, bottom, cols) = {
+                    let g = term.grid();
+                    (g.topmost_line(), g.bottommost_line(), g.columns())
+                };
+                let origin = search_resume_origin(prev, top, bottom, cols);
+                if let Some((s, e)) = find_prev_literal(term.grid(), &query, origin, top, bottom) {
+                    // Highlight through the existing selection machinery: it
+                    // renders, forces full repaints, and Esc/click clears it.
+                    let mut sel = Selection::new(SelectionType::Simple, s, Side::Left);
+                    sel.update(e, Side::Right);
+                    term.selection = Some(sel);
+                    // Scroll the hit into view (Delta clamps to history bounds).
+                    let rows = term.grid().screen_lines();
+                    let offset = term.grid().display_offset();
+                    let delta = search_scroll_delta(s.line.0, rows, offset);
+                    if delta != 0 {
+                        use alacritty_terminal::grid::Scroll;
+                        term.scroll_display(Scroll::Delta(delta));
+                    }
+                    hit = Some(s);
+                } else {
+                    term.selection = None;
+                }
+            }
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.search_origin = hit;
+        }
+        self.request_redraw(wi);
+    }
+
+    /// Close the search prompt, clearing the highlight and the resume point.
+    pub(crate) fn close_search(&mut self, wi: usize) {
+        if let Some(pane) = self.focused_pane_mut(wi) {
+            pane.term.term.selection = None;
+        }
+        if let Some(win) = self.windows.get_mut(wi) {
+            win.search = None;
+            win.search_origin = None;
+        }
+        self.request_redraw(wi);
+    }
+}
+
+/// Literal, case-insensitive, bottom-up search over grid rows: the previous
+/// occurrence of `query` at or before `origin`, scanning up through scrollback
+/// and wrapping from the top back to the bottom. Returns the match's
+/// `(first_cell, last_cell)` grid points. Matches do not cross row boundaries
+/// (a soft-wrapped occurrence split over two rows is not found) — the honest
+/// cost of staying ~700 KB of regex machinery lighter.
+pub(crate) fn find_prev_literal(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    query: &str,
+    origin: Point,
+    top: Line,
+    bottom: Line,
+) -> Option<(Point, Point)> {
+    use alacritty_terminal::term::cell::Flags;
+    let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let cols = grid.columns();
+    // Visit rows bottom-up starting at the origin row, wrapping past the top.
+    let total = (bottom.0 - top.0 + 1).max(0) as usize;
+    for step in 0..total {
+        let line = Line(origin.line.0 - step as i32);
+        let line = if line < top {
+            Line(line.0 + total as i32) // wrap: continue from the bottom
+        } else {
+            line
+        };
+        // Row text with wide-char spacers skipped; `col_of[i]` maps the i-th
+        // collected char back to its grid column so the match points land on
+        // real cells (a CJK query would otherwise trip over spacer cells).
+        let mut text: Vec<char> = Vec::with_capacity(cols);
+        let mut col_of: Vec<usize> = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let cell = &grid[line][Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            // One col_of entry per EMITTED char: some chars lowercase to more
+            // than one char (e.g. 'İ'), and text/col_of must stay in lockstep.
+            for lc in cell.c.to_lowercase() {
+                text.push(lc);
+                col_of.push(col);
+            }
+        }
+        // On the origin row only matches STARTING at or left of the origin
+        // column count (later ones were already visited or are excluded).
+        let limit = if line == origin.line {
+            match col_of.iter().rposition(|&c| c <= origin.column.0) {
+                Some(i) => i,
+                None => continue,
+            }
+        } else {
+            text.len().saturating_sub(1)
+        };
+        // Rightmost occurrence with start index <= limit.
+        let mut start = limit.min(text.len().saturating_sub(needle.len()));
+        loop {
+            if text[start..].starts_with(&needle[..]) {
+                let s = Point::new(line, Column(col_of[start]));
+                let e = Point::new(line, Column(col_of[start + needle.len() - 1]));
+                return Some((s, e));
+            }
+            if start == 0 {
+                break;
+            }
+            start -= 1;
+        }
+    }
+    None
+}
+
+/// Where a repeated search resumes: one cell to the left of the previous hit
+/// (wrapping to the end of the previous line, and from the very top back to
+/// the viewport bottom), or the viewport's bottom-right for a fresh search.
+/// Pure so the stepping/wrapping is unit-tested without a live terminal.
+pub(crate) fn search_resume_origin(
+    prev: Option<Point>,
+    top: Line,
+    bottom: Line,
+    cols: usize,
+) -> Point {
+    let last_col = Column(cols.saturating_sub(1));
+    let fresh = Point::new(bottom, last_col);
+    match prev {
+        None => fresh,
+        Some(p) if p.column.0 > 0 => Point::new(p.line, Column(p.column.0 - 1)),
+        Some(p) if p.line > top => Point::new(p.line - 1, last_col),
+        Some(_) => fresh, // hit started at the very first cell — wrap around
+    }
+}
+
+/// Display-offset change needed to bring grid line `line` (negative = history)
+/// into a viewport of `rows` lines currently scrolled up by `offset`. Zero when
+/// already visible. Pure for unit tests; `Scroll::Delta` clamps the result.
+pub(crate) fn search_scroll_delta(line: i32, rows: usize, offset: usize) -> i32 {
+    let o = offset as i32;
+    let top_visible = -o;
+    let bottom_visible = rows as i32 - 1 - o;
+    if line < top_visible {
+        -line - o // scroll further up until `line` is the top row
+    } else if line > bottom_visible {
+        (rows as i32 - 1 - line).max(0) - o // scroll back down until visible
+    } else {
+        0
     }
 }
 
@@ -3263,9 +3562,160 @@ pub(crate) fn next_click_count(elapsed_ms: u64, moved_far: bool, prev_count: u32
     }
 }
 
+/// Task-Manager-style CPU percentage: 100 ns CPU ticks consumed over `wall`,
+/// normalized across `cores` logical processors (so 100% = the whole machine,
+/// matching what users see in Task Manager). Pure for unit tests.
+pub(crate) fn cpu_percent(delta_ticks: u64, wall: Duration, cores: usize) -> f64 {
+    let wall_ticks = wall.as_nanos() as f64 / 100.0;
+    if wall_ticks <= 0.0 || cores == 0 {
+        return 0.0;
+    }
+    (delta_ticks as f64 * 100.0) / (wall_ticks * cores as f64)
+}
+
+/// Human format for the tab-bar readout: `mem 96 MB · cpu 2%`. Whole MB below
+/// 1 GiB, one decimal of GB above (a leak reads as steadily climbing mem).
+/// CPU is omitted until a second sample exists to delta against.
+pub(crate) fn format_self_stats(rss: u64, cpu: Option<f64>) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let mem = if rss >= GIB {
+        format!("{:.1} GB", rss as f64 / GIB as f64)
+    } else {
+        format!("{} MB", rss / (1024 * 1024))
+    };
+    match cpu {
+        Some(p) => format!("mem {mem} \u{b7} cpu {:.0}%", p.clamp(0.0, 100.0)),
+        None => format!("mem {mem}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- tab-bar self-usage readout ---------------------------------------
+
+    #[test]
+    fn cpu_percent_matches_task_manager_semantics() {
+        // 1 s of CPU over 1 s of wall on 1 core = 100%.
+        let ticks_1s = 10_000_000u64; // 100 ns ticks
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 1), 100.0);
+        // Same on 4 cores = 25% of the machine.
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 4), 25.0);
+        // Degenerate inputs never divide by zero.
+        assert_eq!(cpu_percent(ticks_1s, Duration::ZERO, 4), 0.0);
+        assert_eq!(cpu_percent(ticks_1s, Duration::from_secs(1), 0), 0.0);
+    }
+
+    #[test]
+    fn format_self_stats_is_human_readable() {
+        let mb = 1024 * 1024;
+        assert_eq!(
+            format_self_stats(96 * mb, Some(2.4)),
+            "mem 96 MB \u{b7} cpu 2%"
+        );
+        // First sample has no CPU delta yet: memory only.
+        assert_eq!(format_self_stats(96 * mb, None), "mem 96 MB");
+        // Past 1 GiB the unit flips so a leak reads as climbing GB.
+        assert_eq!(
+            format_self_stats(1536 * mb, Some(150.0)),
+            "mem 1.5 GB \u{b7} cpu 100%"
+        );
+    }
+
+    // --- scrollback search -----------------------------------------------
+
+    #[test]
+    fn search_resume_origin_steps_and_wraps() {
+        let (top, bottom, cols) = (Line(-100), Line(23), 80usize);
+        // Fresh search starts at the viewport's bottom-right.
+        assert_eq!(
+            search_resume_origin(None, top, bottom, cols),
+            Point::new(Line(23), Column(79))
+        );
+        // Mid-line hit resumes one cell left.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(Line(5), Column(10))), top, bottom, cols),
+            Point::new(Line(5), Column(9))
+        );
+        // Column 0 wraps to the end of the previous line.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(Line(5), Column(0))), top, bottom, cols),
+            Point::new(Line(4), Column(79))
+        );
+        // A hit at the very first cell wraps back to the bottom.
+        assert_eq!(
+            search_resume_origin(Some(Point::new(top, Column(0))), top, bottom, cols),
+            Point::new(bottom, Column(79))
+        );
+    }
+
+    #[test]
+    fn search_scroll_delta_brings_line_into_view() {
+        // Already visible → no scroll.
+        assert_eq!(search_scroll_delta(5, 24, 0), 0);
+        assert_eq!(search_scroll_delta(-3, 24, 10), 0);
+        // Above the viewport → scroll up until it's the top row.
+        assert_eq!(search_scroll_delta(-50, 24, 0), 50);
+        assert_eq!(search_scroll_delta(-50, 24, 10), 40);
+        // Below the viewport (scrolled far up) → scroll back down.
+        assert_eq!(search_scroll_delta(5, 24, 100), 18 - 100);
+        assert_eq!(search_scroll_delta(23, 24, 1), -1);
+    }
+
+    /// End-to-end against a real grid: the exact lookup run_search makes must
+    /// find text in scrollback (bottom-up, case-insensitive), and the resume
+    /// origin must step to a strictly earlier occurrence on the next call.
+    #[test]
+    fn literal_search_finds_scrollback_matches_bottom_up() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut t = crate::term::Terminal::new(40, 5, 200);
+        for i in 0..50 {
+            t.feed(format!("line {i} NEEDLE{i}\r\n").as_bytes());
+        }
+        let term = &t.term;
+        let g = term.grid();
+        let (top, bottom, cols) = (g.topmost_line(), g.bottommost_line(), g.columns());
+        let origin = search_resume_origin(None, top, bottom, cols);
+        // Case-insensitive: lowercase query matches the uppercase output.
+        let (s1, e1) = find_prev_literal(g, "needle", origin, top, bottom).expect("a match exists");
+        assert!(e1 >= s1);
+        // The bottom-most occurrence is the LAST line written (needle49).
+        let origin2 = search_resume_origin(Some(s1), top, bottom, cols);
+        let (s2, _) =
+            find_prev_literal(g, "needle", origin2, top, bottom).expect("an earlier match");
+        assert!(
+            s2 < s1,
+            "second hit {s2:?} should be strictly before first {s1:?}"
+        );
+        // A query that appears nowhere returns None (no panic, no wrap loop).
+        assert!(find_prev_literal(g, "zzz-not-present", origin, top, bottom).is_none());
+    }
+
+    /// Wrap-around: resuming from the earliest occurrence finds the latest
+    /// one again (search wraps from the top back to the bottom).
+    #[test]
+    fn literal_search_wraps_from_top_to_bottom() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut t = crate::term::Terminal::new(40, 5, 100);
+        t.feed(b"unique-marker first\r\n");
+        for _ in 0..20 {
+            t.feed(b"filler\r\n");
+        }
+        t.feed(b"unique-marker last\r\n");
+        let g = t.term.grid();
+        let (top, bottom, cols) = (g.topmost_line(), g.bottommost_line(), g.columns());
+        // Find the bottom-most hit, then the earlier one...
+        let o1 = search_resume_origin(None, top, bottom, cols);
+        let (s_last, _) = find_prev_literal(g, "unique-marker", o1, top, bottom).unwrap();
+        let o2 = search_resume_origin(Some(s_last), top, bottom, cols);
+        let (s_first, _) = find_prev_literal(g, "unique-marker", o2, top, bottom).unwrap();
+        assert!(s_first < s_last);
+        // ...then resuming past the earliest must wrap back to the latest.
+        let o3 = search_resume_origin(Some(s_first), top, bottom, cols);
+        let (s_wrapped, _) = find_prev_literal(g, "unique-marker", o3, top, bottom).unwrap();
+        assert_eq!(s_wrapped, s_last, "search must wrap around to the bottom");
+    }
 
     #[test]
     fn restored_win_size_honors_sane_and_rejects_out_of_range() {

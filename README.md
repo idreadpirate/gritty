@@ -7,12 +7,19 @@
 **A lightweight, native Windows terminal multiplexer — in Rust.**
 
 Tabs, split panes, a command palette, copy/paste that *actually works*, session
-restore, process-aware panes, HiDPI, IME — in a single **sub-800 KB** executable
+restore, process-aware panes, HiDPI, IME — in a single **~1.2 MB** executable
 with **no GPU, no Electron, no runtime, no WSL.**
 
-`300+ tests` · `259 deps` · CPU-rendered · one `gritty.exe` **under 800 KB**
+`340+ tests` · `259 deps` · CPU-rendered · one `gritty.exe` **~1.2 MB**
 
 </div>
+
+---
+
+> ### A note from the creator
+> gritty is the Windows-native terminal multiplexer that lets you run an **army
+> of AI agents** — and still play video games with **all** of your GPU memory.
+> CPU-rendered on purpose: your GPU belongs to you, not your terminal. 🎮
 
 ---
 
@@ -25,10 +32,11 @@ Windows (it needs WSL/Cygwin). gritty refuses both compromises:
 - **It's the terminal *and* the multiplexer, natively.** Speaks Windows **ConPTY**
   directly — one `.exe`, runs where WSL is banned (locked-down corporate boxes).
 - **Brutally lightweight, by construction.** CPU software rendering (no GPU
-  pipeline, no driver surface); a **sub-800 KB** binary (`opt-level=z` + `lto` +
-  `strip` + `panic=abort`, hand-rolled config/session parsers instead of
-  `toml`/`serde_json`, and a `build-std` `std` rebuilt for size); **~25 MB RAM
-  per pane** (a 5000-line scrollback grid each — tunable via `config.toml`);
+  pipeline, no driver surface); a **~1.1 MB** binary (`opt-level=3` +
+  `target-cpu=x86-64-v3`/AVX2 + `lto` + `strip` + `panic=abort`, hand-rolled
+  config/session parsers instead of `toml`/`serde_json`, and a `build-std` `std`
+  rebuilt for speed); **~10 MB RAM per pane** (a 2000-line scrollback grid each —
+  tunable via `config.toml`);
   near-0% CPU when idle and bounded when busy — **damage-driven dirty-rect
   repaint** (a streaming pane redraws only its changed rows), a ~60 fps frame
   cap, and wake coalescing. A spinner or a fleet of busy panes can't peg a core.
@@ -65,7 +73,10 @@ run it in every pane; **Ctrl-click OSC-8 hyperlinks** (http/https only).
 
 **Pane intelligence** — **process-aware headers** (`editor: nvim`); **splits
 inherit the focused pane's cwd** (OSC 7); window title capture (OSC 0/2);
-scrollback with a position indicator; visual bell.
+scrollback with a position indicator and **scrollback search** (`Ctrl+Shift+F`,
+case-insensitive, jumps bottom-up with wrap); visual bell; a **live
+`mem · cpu` readout** in the tab bar — gritty's own footprint, always visible,
+so a leak or a spin is user-visible without Task Manager.
 
 **Agent awareness** — gritty knows when a pane is running an AI coding agent
 (`claude`, `codex`, `cursor`, `copilot`, … ~12 recognized) and shows its live
@@ -79,7 +90,7 @@ on-screen UI; no integration or config required.
 
 **Persistence & looks** — **session save/restore** (layout, names, colors, window
 geometry survive restarts); optional `config.toml`; the "gunmetal & amber"
-industrial theme; gamma-correct text; WCAG-AA UI contrast; embedded-fallback font
+industrial theme; gamma-correct text; WCAG-AA UI contrast; system font-fallback chain (symbols/emoji/CJK, lazily loaded) with an embedded last-resort face
 so it never fails to start.
 
 **Resilience** — bounded PTY backpressure, graceful device-loss handling, a real
@@ -121,7 +132,8 @@ cargo build --release   # rust-toolchain.toml auto-selects nightly + rust-src;
 
 gritty pins a **nightly** toolchain (`rust-toolchain.toml`) and uses `-Z build-std`
 (`.cargo/config.toml`) to rebuild `std` for size — that, with `opt-level=z` and
-the hand-rolled parsers, keeps the self-contained `gritty.exe` **under 800 KB**.
+the hand-rolled parsers, keeps the self-contained `gritty.exe` lean (**~1.2 MB**
+after the speed-first build pass; the gate caps it at 1.5 MB).
 `rustup` installs the pinned toolchain, `rust-src`, and the MSVC target
 automatically on first build — no manual setup. Maintainers cut a release with
 `./scripts/release.ps1` (gates, builds, and publishes the exe + checksum).
@@ -135,6 +147,7 @@ automatically on first build — no manual setup. Maintainers cut a release with
 | Split right / down | `Ctrl+Shift+D` / `Ctrl+Shift+E` |
 | Move focus / resize pane | `Ctrl+Shift+Arrows` / `Ctrl+Alt+Arrows` |
 | Rename pane / close pane | `Ctrl+Shift+R` / `Ctrl+Shift+W` |
+| Search scrollback | `Ctrl+Shift+F` (Enter = previous match) |
 | New tab / switch tab | `Ctrl+Shift+T` / `Ctrl+1…9` |
 | Tear tab into new window | `Ctrl+Shift+N` / drag tab off the bar |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |

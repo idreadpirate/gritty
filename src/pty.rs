@@ -8,9 +8,16 @@ use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Bounded output queue per pane (~256 * 8 KB = 2 MB max buffered). A flooding
-/// shell applies backpressure instead of growing memory without limit.
-const QUEUE_DEPTH: usize = 256;
+/// Bounded output queue per pane. Sized against `READ_BUF` so the worst-case
+/// buffered bytes stay ~2 MB (`32 * 64 KB`): a flooding shell hits backpressure
+/// instead of growing memory without limit. Fewer, larger chunks (vs the former
+/// 256 * 8 KB) mean 8x fewer channel sends + Vec allocations + VT-parser calls
+/// per MB of output, the throughput win, at the same memory ceiling.
+const QUEUE_DEPTH: usize = 32;
+
+/// Per-read buffer in the PTY reader thread. 64 KB drains a `cat`-class flood in
+/// far fewer reads than the old 8 KB; pairs with `QUEUE_DEPTH` for a ~2 MB bound.
+const READ_BUF: usize = 64 * 1024;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -242,7 +249,8 @@ impl Pty {
 
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE_DEPTH);
         thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            // Heap-allocated once at thread start (64 KB is large for a stack frame).
+            let mut buf = vec![0u8; READ_BUF];
             // Owns both the RT-24 boundary-straddle carry and the CA-44 one-shot
             // reply flag: it answers only the first startup probe, then stops.
             let mut dsr = DsrScanner::default();

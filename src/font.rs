@@ -27,6 +27,76 @@ pub struct FontAtlas {
     pub cell_h: usize,
     pub ascent: f32,
     cache: HashMap<char, (Metrics, Vec<u8>)>,
+    /// System fallback faces for glyphs the primary monospace font lacks —
+    /// UI badges (★◆), symbols, emoji, CJK. Lazily loaded (see [`Fallback`]):
+    /// a session that never prints such a glyph never reads a font file.
+    fallbacks: Vec<Fallback>,
+}
+
+/// One lazily-loaded fallback face. The file is read+parsed the first time a
+/// glyph missing from every earlier face forces it, then kept for the process
+/// lifetime (parsed faces are px-independent; only rasterization is). A failed
+/// load (file absent on this Windows edition, unparseable) is remembered so
+/// the disk is probed at most once per slot.
+struct Fallback {
+    path: &'static str,
+    /// Font index inside a .ttc collection (0 for plain .ttf).
+    collection_index: u32,
+    state: FallbackState,
+}
+
+enum FallbackState {
+    Unloaded,
+    Failed,
+    Loaded(Font),
+}
+
+impl Fallback {
+    fn new(path: &'static str, collection_index: u32) -> Self {
+        Self {
+            path,
+            collection_index,
+            state: FallbackState::Unloaded,
+        }
+    }
+
+    /// The parsed face, loading it on first use. `None` once a load has failed.
+    fn face(&mut self) -> Option<&Font> {
+        if matches!(self.state, FallbackState::Unloaded) {
+            let settings = FontSettings {
+                collection_index: self.collection_index,
+                ..FontSettings::default()
+            };
+            self.state = std::fs::read(self.path)
+                .ok()
+                .and_then(|bytes| Font::from_bytes(bytes, settings).ok())
+                .map(FallbackState::Loaded)
+                .unwrap_or(FallbackState::Failed);
+        }
+        match &self.state {
+            FallbackState::Loaded(f) => Some(f),
+            _ => None,
+        }
+    }
+}
+
+/// Fallback faces tried in order for a glyph the primary font lacks. Ordered
+/// small/common first so the big CJK collections are only parsed when CJK
+/// text actually appears (msyh.ttc is ~19 MB resident once loaded — a cost
+/// only CJK-printing sessions pay).
+fn fallback_candidates() -> Vec<Fallback> {
+    vec![
+        // Symbols: stars, geometric shapes, arrows, misc technical.
+        Fallback::new(r"C:\Windows\Fonts\seguisym.ttf", 0),
+        // General UI face — broad Latin/Greek/Cyrillic + punctuation coverage.
+        Fallback::new(r"C:\Windows\Fonts\segoeui.ttf", 0),
+        // Emoji (rasterized from the monochrome outlines; no color layers).
+        Fallback::new(r"C:\Windows\Fonts\seguiemj.ttf", 0),
+        // CJK: Simplified Chinese, then Japanese, then Korean.
+        Fallback::new(r"C:\Windows\Fonts\msyh.ttc", 0),
+        Fallback::new(r"C:\Windows\Fonts\msgothic.ttc", 0),
+        Fallback::new(r"C:\Windows\Fonts\malgun.ttf", 0),
+    ]
 }
 
 impl FontAtlas {
@@ -51,6 +121,7 @@ impl FontAtlas {
             cell_h,
             ascent,
             cache: HashMap::new(),
+            fallbacks: fallback_candidates(),
         }
     }
 
@@ -93,10 +164,31 @@ impl FontAtlas {
             // flood). Retain ASCII; evict only the dynamic tail.
             self.cache.retain(|k, _| k.is_ascii());
         }
-        let g = self.font.rasterize(ch, self.px);
+        let g = self.rasterize_with_fallback(ch);
         self.cache.insert(ch, g);
         // Key is now present — indexing cannot panic here.
         &self.cache[&ch]
+    }
+
+    /// Rasterize `ch` from the primary face, or from the first fallback face
+    /// that has it. Glyphs no face covers rasterize from the primary as before
+    /// (an empty bitmap — the caller draws nothing, CA-9). Agents constantly
+    /// print badges, box glyphs, emoji, and CJK that no single monospace font
+    /// carries; before this, every such cell rendered blank.
+    fn rasterize_with_fallback(&mut self, ch: char) -> (Metrics, Vec<u8>) {
+        // ASCII is always in the primary monospace face — skip the lookup.
+        // `lookup_glyph_index == 0` is fontdue's .notdef (glyph absent).
+        if ch.is_ascii() || self.font.lookup_glyph_index(ch) != 0 {
+            return self.font.rasterize(ch, self.px);
+        }
+        for fb in &mut self.fallbacks {
+            if let Some(face) = fb.face() {
+                if face.lookup_glyph_index(ch) != 0 {
+                    return face.rasterize(ch, self.px);
+                }
+            }
+        }
+        self.font.rasterize(ch, self.px)
     }
 }
 
@@ -229,6 +321,59 @@ mod tests {
             let (metrics, _) = atlas.glyph(c);
             assert!(metrics.advance_width >= 0.0);
         }
+    }
+
+    /// Fallback chain: glyphs the primary monospace font lacks (UI badges,
+    /// CJK) must rasterize with real coverage via the system fallback faces
+    /// instead of rendering blank. Runs only when at least one fallback face
+    /// exists on this machine (they ship with every desktop Windows).
+    #[test]
+    fn fallback_covers_badge_and_cjk_glyphs() {
+        let mut atlas = FontAtlas::new(18.0);
+        let any_fallback = atlas.fallbacks.iter_mut().any(|f| f.face().is_some());
+        if !any_fallback {
+            return; // headless/stripped environment — nothing to assert against
+        }
+        // ★ (agent attention badge) and 中 (CJK) are absent from every
+        // monospace primary candidate; both must now produce coverage.
+        for ch in ['★', '中'] {
+            let (m, bitmap) = atlas.glyph(ch);
+            assert!(
+                m.width > 0 && bitmap.iter().any(|&c| c > 0),
+                "{ch} should rasterize via a fallback face, got {}x{}",
+                m.width,
+                m.height
+            );
+        }
+    }
+
+    /// A glyph no face covers must still return a sane empty entry (no panic),
+    /// and the cache must stay bounded with fallback glyphs in it.
+    #[test]
+    fn uncovered_glyph_still_sane_and_cache_stays_bounded() {
+        let mut atlas = FontAtlas::new(18.0);
+        // U+E0001 (deprecated tag char) exists in no shipped font face.
+        let (m, bitmap) = atlas.glyph('\u{E0001}');
+        assert_eq!(bitmap.len(), m.width * m.height);
+        for cp in 0x4E00u32..0x4E00 + (GLYPH_CACHE_CAP as u32 + 500) {
+            if let Some(c) = char::from_u32(cp) {
+                let _ = atlas.glyph(c);
+            }
+        }
+        assert!(atlas.cache.len() <= GLYPH_CACHE_CAP);
+    }
+
+    /// A failed fallback load is probed once, then remembered — no disk
+    /// hammering for a font this Windows edition doesn't ship.
+    #[test]
+    fn failed_fallback_load_is_remembered() {
+        let mut fb = Fallback::new(r"C:\Windows\Fonts\does-not-exist.ttf", 0);
+        assert!(fb.face().is_none());
+        assert!(
+            matches!(fb.state, FallbackState::Failed),
+            "a missing file must latch Failed, not stay Unloaded"
+        );
+        assert!(fb.face().is_none(), "second probe stays None (no re-read)");
     }
 
     /// CA-103: `set_px` must re-derive metrics for a new size and clear the

@@ -2,7 +2,67 @@
 
 All notable changes to gritty.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-13
+
+### Added
+- **Discoverability polish** — palette rows show their keyboard shortcut
+  (dim, right-aligned); the palette gains `search scrollback` and
+  `keybinding help` entries; a dim `F1 help · Ctrl+Shift+P commands` hint
+  sits in the tab bar until either is opened once per session; the rename
+  prompt gains an `Enter = save · Esc = cancel` footer like search's.
+- **Font fallback chain** — glyphs the primary monospace font lacks (agent
+  badges, symbols, emoji, CJK) now fall back to Segoe UI Symbol / Segoe UI /
+  Segoe UI Emoji / YaHei / MS Gothic / Malgun, each face lazily loaded the
+  first time a glyph needs it. Previously every such cell rendered blank.
+- **Scrollback search** (`Ctrl+Shift+F`) — literal, case-insensitive,
+  bottom-up with wrap; hits are highlighted through the selection machinery
+  and scrolled into view. Deliberately not regex: the engine's `RegexSearch`
+  would have added ~700 KB of DFA machinery to the binary.
+- **Tab-strip `★` attention badge** — a background tab whose agent finished
+  or blocked while unwatched shows `★` (stronger than the `•` activity dot),
+  so "which tab needs me" is visible without switching.
+- **`gate.ps1 -Stress`** — the quality gate can now run the 16-pane
+  multi-tab flood against the fresh build and fail on RSS/thread/GDI/USER
+  growth, so the fixed leak class can't regress silently.
+
+### Fixed (stability / correctness)
+- **Multi-pane memory leak + long-session lag** — with several tabs/panes
+  streaming at once, winit's unbounded user-event queue accumulated PTY wakes
+  faster than they were consumed (per-pane coalescing still let N panes enqueue
+  N wakes per consumed event): linear RSS growth (~+21%/2 min at 16 flooding
+  panes) plus, past the 10k Win32 message cap, silently dropped posts. A new
+  app-wide `WakeCoalescer` keeps at most **one** Wake in flight. Proved by A/B
+  stress: same 16-pane flood, before +21.3% RSS (linear, no plateau) → after
+  +1.3% (flat); 10-minute mixed multi-tab run +0.8%, PASS.
+- **Hard freeze under sustained floods** — `drain_pty` raced the reader threads
+  unboundedly, so a flood could pin the UI thread inside one drain and starve
+  input/redraw. Draining is now budgeted (~2 MB/pane/cycle) with a self-wake
+  for the backlog; throughput unchanged (5.6 vs 5.5 MB/s A/B).
+- **In-band queries were never answered** — the engine's replies to CPR
+  (`ESC[6n`), DA1, DECRQM, `CSI 18 t` size reports, and OSC 4/10/11 color
+  probes were dropped; programs querying their terminal (vim background
+  detection, prompt reflow) hung or misrendered. Replies are now written back
+  to the pane's PTY.
+- **Synchronized-update freeze** — a program dying mid-`ESC[?2026h` left its
+  pane frozen on stale content (vte buffers everything until ESU or a timeout
+  gritty never enforced). Expired updates are now force-flushed after vte's
+  150 ms deadline.
+- **UTF-8 BOM rejection** — a BOM (PowerShell 5.1 `Set-Content`, Notepad) made
+  gritty silently discard the whole `session.json` (startup fell back to a
+  fresh single tab) and ignore the first `config.toml` key. Both loaders now
+  strip it.
+
+### Performance (throughput / memory)
+- **Speed-first build** — the binary-size budget was deliberately traded for
+  speed. Release profile `opt-level=z → 3`; `build-std` no longer uses
+  `optimize_for_size` (std is rebuilt for speed); and `target-cpu=x86-64-v3`
+  enables AVX2/FMA/BMI2 so the compiler autovectorizes the software-raster hot
+  loops and the VT parser. Binary grows ~800 KB → ~1.1 MB. **CPU floor: Haswell
+  (2013+)** — the build will not run on older CPUs.
+- **Lower default scrollback** (`5000 → 2000` lines/pane) — scrollback is the
+  dominant per-pane RAM consumer (~7.6 MB → ~3 MB at 80 cols) and the memory that
+  grows as a pane streams. 2000 keeps generous history at ~40% of the cost; raise
+  it with the `scrollback` config key for deeper history.
 
 ### Agent awareness
 - **Per-pane agent detection** — gritty recognizes ~12 AI coding agents

@@ -31,6 +31,7 @@ impl Gritty {
         let sig = self.render_sig(wi, w, h);
         let (any_bell, any_sel, any_scroll) = self.active_grid_flags(wi);
         let rects = self.pane_rects(wi, w, h);
+        let stats = self.stats_text.clone();
 
         // Phase 2 — mutable borrows. The glyph atlas is shared across windows; the
         // surface/backbuffer/state belong to this window. Distinct fields of
@@ -153,6 +154,11 @@ impl Gritty {
                 // the tab geometry the hit-tests depend on.
                 let label = if i == active {
                     format!(" ▸{} ", tab.name)
+                } else if tab.needs_attention() {
+                    // An agent in this background tab finished or blocked —
+                    // stronger than plain output activity, same one-cell slot
+                    // so tab geometry (and the hit-tests) are unchanged.
+                    format!("★{} ", tab.name)
                 } else if tab.activity {
                     format!("•{} ", tab.name)
                 } else {
@@ -246,29 +252,85 @@ impl Gritty {
                 .map(|t| t.color)
                 .unwrap_or(color::accent());
 
-            // Broadcast indicator at the right of the tab bar.
+            // Right side of the tab bar, laid right-to-left and width-guarded
+            // against the tab strip: the live self-usage readout sits at the
+            // far right (always, dim — watch gritty's own mem/cpu without Task
+            // Manager); to its left, the BROADCAST indicator when armed, else
+            // the first-run `F1 help` hint until the user has opened help or
+            // the palette once this session.
+            let mut right_x = stride;
+            if !stats.is_empty() {
+                let sw = (stats.chars().count() + 1) * cw;
+                if right_x > sw && right_x - sw > tx + cw {
+                    right_x -= sw;
+                    let r = Rect {
+                        x: right_x,
+                        y: 0,
+                        w: sw,
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        right_x,
+                        0,
+                        &stats,
+                        UI_DIM,
+                        UI_BAR_BG,
+                        false,
+                        r,
+                    );
+                }
+            }
             if win.broadcast {
                 let label = " BROADCAST ";
                 let lw = label.chars().count() * cw;
-                let r = Rect {
-                    x: stride.saturating_sub(lw),
-                    y: 0,
-                    w: lw,
-                    h: ch,
-                };
-                fill_rect(&mut buffer, stride, r, accent);
-                draw_text(
-                    &mut buffer,
-                    stride,
-                    font,
-                    r.x,
-                    0,
-                    label,
-                    color::bg(),
-                    accent,
-                    true,
-                    r,
-                );
+                if right_x > lw && right_x - lw > tx + cw {
+                    let r = Rect {
+                        x: right_x - lw,
+                        y: 0,
+                        w: lw,
+                        h: ch,
+                    };
+                    fill_rect(&mut buffer, stride, r, accent);
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        r.x,
+                        0,
+                        label,
+                        color::bg(),
+                        accent,
+                        true,
+                        r,
+                    );
+                }
+            } else if !win.discovered {
+                let hint = "F1 help \u{b7} Ctrl+Shift+P commands ";
+                let hw = hint.chars().count() * cw;
+                if right_x > hw && right_x - hw > tx + cw {
+                    let hx = right_x - hw;
+                    let r = Rect {
+                        x: hx,
+                        y: 0,
+                        w: hw,
+                        h: ch,
+                    };
+                    draw_text(
+                        &mut buffer,
+                        stride,
+                        font,
+                        hx,
+                        0,
+                        hint,
+                        UI_DIM,
+                        UI_BAR_BG,
+                        false,
+                        r,
+                    );
+                }
             }
 
             // Tab strip bottom separator — faint 1px line between tabs and content (CA-29).
@@ -429,7 +491,7 @@ impl Gritty {
                     qrect,
                 );
 
-                for (i, (label, _)) in matches.iter().take(shown).enumerate() {
+                for (i, (label, keys, _)) in matches.iter().take(shown).enumerate() {
                     let iy = by + ch + ch / 2 + i * ch;
                     let irow = Rect {
                         x: bx,
@@ -455,6 +517,26 @@ impl Gritty {
                         false,
                         irow,
                     );
+                    // Right-aligned dim shortcut column: every palette use
+                    // teaches the direct keybinding for next time.
+                    if !keys.is_empty() {
+                        let kw = keys.chars().count() * cw;
+                        if kw + (label.chars().count() + 3) * cw < box_w {
+                            let kfg = if i == sel { color::bg() } else { UI_DIM };
+                            draw_text(
+                                &mut buffer,
+                                stride,
+                                font,
+                                bx + box_w.saturating_sub(kw + cw),
+                                iy,
+                                keys,
+                                kfg,
+                                bg,
+                                false,
+                                irow,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -592,6 +674,7 @@ impl Gritty {
                     ("Ctrl+Shift+P", "Command palette"),
                     ("Ctrl+Shift+A", "Agent overview (jump to a pane)"),
                     ("Ctrl+Shift+R", "Rename pane"),
+                    ("Ctrl+Shift+F", "Search scrollback (Enter = prev match)"),
                     ("Ctrl+Shift+C", "Copy selection"),
                     ("Ctrl+Shift+V", "Paste"),
                     (
@@ -692,10 +775,37 @@ impl Gritty {
                 }
             }
 
+            // Scrollback-search overlay (Ctrl+Shift+F): a one-line prompt at the
+            // bottom, like rename. The hit itself is highlighted through the
+            // pane's selection, so no extra grid painting is needed here.
+            if let Some(q) = win.search.clone() {
+                let line = format!(" search: {q}_  (Enter = previous match · Esc = close) ");
+                let r = Rect {
+                    x: 0,
+                    y: height.saturating_sub(ch),
+                    w: stride,
+                    h: ch,
+                };
+                fill_rect(&mut buffer, stride, r, accent);
+                draw_text(
+                    &mut buffer,
+                    stride,
+                    font,
+                    0,
+                    r.y,
+                    &line,
+                    color::bg(),
+                    accent,
+                    true,
+                    r,
+                );
+            }
+
             // Rename overlay.
             if let Some(buf_str) = win.rename.clone() {
                 let what = if win.rename_is_tab { "tab" } else { "pane" };
-                let line = format!(" rename {what}: {buf_str}_ ");
+                let line =
+                    format!(" rename {what}: {buf_str}_  (Enter = save \u{b7} Esc = cancel) ");
                 let r = Rect {
                     x: 0,
                     y: height.saturating_sub(ch),

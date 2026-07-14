@@ -21,7 +21,12 @@
 #   pwsh -File scripts/stress.ps1                       # 100 panes, idle, 60s
 #   pwsh -File scripts/stress.ps1 -Broadcast            # + stream into all panes
 #   pwsh -File scripts/stress.ps1 -Panes 64 -PerTab 16 -Seconds 90 -Broadcast
+#   pwsh -File scripts/stress.ps1 -Throughput -FloodMB 50 -Exe <path>   # speed A/B
 #   pwsh -File scripts/stress.ps1 -DryRun               # generate+validate only
+#
+# -Throughput: one pane, flood a fixed payload, report MB/s rendered + CPU-ms per
+# MB + peak RSS. Run it twice with two different -Exe builds (e.g. an opt=z
+# baseline vs the opt=3 build) to measure a speedup: higher MB/s, lower CPU-ms/MB.
 #
 # The GUI + N shells run on YOUR desktop; this is a desktop tool, not a headless
 # one. -DryRun generates and validates the files without launching anything.
@@ -34,6 +39,11 @@ param(
     [int]$IntervalMs = 1500,
     [string]$Exe     = "target/x86_64-pc-windows-msvc/release/gritty.exe",
     [switch]$Broadcast,
+    [switch]$MultiTab,
+    [int]$Solo = -1,
+    [int]$LoadAll = -1,
+    [switch]$Throughput,
+    [int]$FloodMB    = 50,
     [switch]$DryRun,
     [string]$LogDir  = "$env:TEMP\gritty-stress"
 )
@@ -47,6 +57,14 @@ function Fail($m) { Write-Host "STRESS FAIL: $m" -ForegroundColor Red; exit 1 }
 
 if ($Panes -lt 1)  { Fail "-Panes must be >= 1" }
 if ($PerTab -lt 1) { $PerTab = $Panes }
+
+# -Throughput is a focused speed A/B: one pane, flood a fixed payload, measure how
+# fast (and how cheaply) gritty renders it. Pass two different -Exe builds to
+# compare. It overrides the multi-pane leak layout.
+if ($Throughput) { $Panes = 1; $PerTab = 1 }
+# -Solo N: leak isolation — a single pane running ONLY MultiTab workload N
+# (0=spinner, 1=scrollflood, 2=colorflood, 3=titlestorm). One variable at a time.
+if ($Solo -ge 0) { $Panes = 1; $PerTab = 1 }
 
 # ---------------------------------------------------------------------------
 # JSON generation: a balanced split tree of `n` leaf panes (ids 0..n-1),
@@ -106,10 +124,27 @@ New-Item -ItemType Directory -Force -Path (Split-Path $sessionPath) | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $configPath)  | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-function Backup($p) { if (Test-Path $p) { Copy-Item $p "$p.harnessbak" -Force } }
+# Record the exact pre-run state: the file itself, or an explicit "was absent"
+# marker. Restore replays that record verbatim. The marker gates the only
+# deletion path, so a Restore can never destroy a file whose pre-run existence
+# we did not personally witness (e.g. after a manual mid-run intervention).
+function Backup($p) {
+    if (Test-Path $p) { Copy-Item $p "$p.harnessbak" -Force }
+    else { New-Item -ItemType File -Path "$p.harnessnone" -Force | Out-Null }
+}
 function Restore($p) {
     if (Test-Path "$p.harnessbak") { Move-Item "$p.harnessbak" $p -Force }
-    elseif (Test-Path $p)          { Remove-Item $p -Force }
+    elseif (Test-Path "$p.harnessnone") {
+        Remove-Item "$p.harnessnone" -Force
+        if (Test-Path $p) { Remove-Item $p -Force }
+    }
+    # No record at all: leave the live file untouched.
+}
+# BOM-less UTF-8 writes: PowerShell 5.1's `Set-Content -Encoding UTF8` prepends
+# a BOM. gritty now tolerates that, but the harness should still write clean
+# files under every PowerShell host.
+function WriteNoBom($p, $text) {
+    [System.IO.File]::WriteAllText($p, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 if ($DryRun) {
@@ -123,7 +158,7 @@ if ($DryRun) {
     exit 0
 }
 
-$exePath = if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path (Get-Location) $Exe }
+$exePath = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path (Get-Location) $Exe }))
 if (-not (Test-Path $exePath)) { Fail "gritty exe not found: $exePath  (build it: cargo build --release)" }
 
 # ---------------------------------------------------------------------------
@@ -131,7 +166,22 @@ if (-not (Test-Path $exePath)) { Fail "gritty exe not found: $exePath  (build it
 # the launched process exits and a new detached gritty.exe is the real one, so
 # we find it by name, not by the Start-Process handle.
 # ---------------------------------------------------------------------------
-function Get-GrittyProcs { Get-Process -Name gritty -ErrorAction SilentlyContinue }
+# Only gritty processes launched from OUR exe path. The user may have a real
+# gritty session running from the installed location; sampling it pollutes the
+# leak verdict and — far worse — the cleanup would force-kill their session.
+function Get-GrittyProcs {
+    Get-Process -Name gritty -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $script:exePath }
+}
+
+# GDI/USER object counts per process (GetGuiResources). A GDI leak is the classic
+# "lags badly after an hour" failure on Windows — rendering slows to a crawl as
+# the process nears the 10k GDI-object limit — and it is invisible in RSS,
+# HandleCount (kernel handles only), and thread count, so sample it explicitly.
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class Gui { [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr h, uint flags); }
+"@ -ErrorAction SilentlyContinue
 
 function Sample {
     $ps = Get-GrittyProcs
@@ -142,11 +192,20 @@ function Sample {
     if (-not $thr) { $thr = ($ps | ForEach-Object { $_.Threads.Count } | Measure-Object -Sum).Sum }
     $hnd   = ($ps | Measure-Object HandleCount -Sum).Sum
     $cpu   = ($ps | Measure-Object CPU -Sum).Sum
+    $gdi = 0; $usr = 0
+    foreach ($p in $ps) {
+        try {
+            $gdi += [Gui]::GetGuiResources($p.Handle, 0)   # GR_GDIOBJECTS
+            $usr += [Gui]::GetGuiResources($p.Handle, 1)   # GR_USEROBJECTS
+        } catch {}
+    }
     [pscustomobject]@{
         RssMB   = [math]::Round($rss  / 1mb, 1)
         PrivMB  = [math]::Round($priv / 1mb, 1)
         Threads = [int]$thr
         Handles = [int]$hnd
+        Gdi     = [int]$gdi
+        User    = [int]$usr
         CpuSec  = [math]::Round($cpu, 2)
         Count   = $ps.Count
     }
@@ -154,13 +213,70 @@ function Sample {
 
 Backup $sessionPath
 Backup $configPath
+
+# MultiTab/Solo workload injection — deterministic, focus-independent.
+# The pinned Windows PowerShell loads its per-user profile (the harness spawn
+# uses -NoLogo, not -NoProfile); a temporary profile runs the workload script
+# named by GRITTY_STRESS_CMD, which panes inherit from the harness-launched
+# gritty. Restored (or removed) in the finally block like session/config.
+$profPath = $null
+if ($Throughput) {
+    # Fixed-payload flood, injected at shell spawn via the profile (below) —
+    # no clipboard/SendKeys/foreground dependency, so A/B runs are identical
+    # and unattended-safe. Timing starts at process detection.
+    $lineBytes = 1024
+    $lines = [int]([math]::Floor($FloodMB * 1MB / $lineBytes))
+    $fillN = $lineBytes - 15
+    $floodCmd = '$e=[char]27;$l=("{0}[38;5;208m{1}{0}[0m" -f $e,(''x''*' + $fillN + '));for($i=0;$i-lt ' + $lines + ';$i++){[Console]::Out.WriteLine($l)};[Console]::Out.WriteLine(''__FLOOD_DONE__'')'
+    WriteNoBom (Join-Path $LogDir "wflood.ps1") $floodCmd
+    $profDir  = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell'
+    $profPath = Join-Path $profDir 'Microsoft.PowerShell_profile.ps1'
+    New-Item -ItemType Directory -Force -Path $profDir | Out-Null
+    Backup $profPath
+    WriteNoBom $profPath 'if ($env:GRITTY_STRESS_CMD) { Invoke-Expression $env:GRITTY_STRESS_CMD }'
+    $env:GRITTY_STRESS_CMD = ". '$(Join-Path $LogDir "wflood.ps1")'"
+}
+elseif ($MultiTab -or $Solo -ge 0) {
+    $runFor = $Seconds + 20
+    $workloads = @(
+        # 0: CR spinner - dirty-rect single-row repaint path.
+        ('$e=(Get-Date).AddSeconds(' + $runFor + ');$s=''|'',''/'',''-'','''';$i=0;while((Get-Date)-lt $e){$i++;Write-Host -NoNewline ("`r[{0}] fg-spin {1} " -f $s[$i%4],$i);Start-Sleep -Milliseconds 40}'),
+        # 1: full-rate scroll flood - history/ring churn + max wake rate.
+        ('$e=(Get-Date).AddSeconds(' + $runFor + ');$i=0;while((Get-Date)-lt $e){$i++;[Console]::Out.WriteLine(("scrollflood {0} " -f $i).PadRight(120,''x''))}'),
+        # 2: SGR color flood - styled cells + scroll.
+        ('$e=(Get-Date).AddSeconds(' + $runFor + ');$c=[char]27;$i=0;while((Get-Date)-lt $e){$i++;[Console]::Out.WriteLine(("{0}[38;5;{1}mcolor {2}{0}[0m" -f $c,($i%230+1),$i))}'),
+        # 3: title + OSC churn - OSC 0/2 storm.
+        ('$e=(Get-Date).AddSeconds(' + $runFor + ');$c=[char]27;$i=0;while((Get-Date)-lt $e){$i++;[Console]::Out.Write(("{0}]0;title {1}{2}" -f $c,$i,[char]7));if($i%50-eq0){[Console]::Out.WriteLine("t $i")};Start-Sleep -Milliseconds 5}')
+    )
+    for ($i = 0; $i -lt $workloads.Count; $i++) {
+        WriteNoBom (Join-Path $LogDir "w$i.ps1") $workloads[$i]
+    }
+    $profDir  = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell'
+    $profPath = Join-Path $profDir 'Microsoft.PowerShell_profile.ps1'
+    New-Item -ItemType Directory -Force -Path $profDir | Out-Null
+    Backup $profPath
+    WriteNoBom $profPath 'if ($env:GRITTY_STRESS_CMD) { Invoke-Expression $env:GRITTY_STRESS_CMD }'
+    $sel = if ($Solo -ge 0) { [math]::Min($Solo, 3) }
+           elseif ($LoadAll -ge 0) { [math]::Min($LoadAll, 3) }
+           else { $null }
+    $env:GRITTY_STRESS_CMD = if ($null -ne $sel) { ". '$(Join-Path $LogDir "w$sel.ps1")'" }
+                             else { ". (Join-Path '$LogDir' ('w{0}.ps1' -f (Get-Random -Maximum 4)))" }
+}
 $proc = $null
 $samples = New-Object System.Collections.Generic.List[object]
 try {
-    Set-Content -Path $sessionPath -Value $sessionJson -Encoding UTF8
-    Set-Content -Path $configPath  -Value $configText  -Encoding UTF8
+    WriteNoBom $sessionPath $sessionJson
+    WriteNoBom $configPath  $configText
 
+    $preexisting = Get-Process -Name gritty -ErrorAction SilentlyContinue
+    if ($preexisting | Where-Object { $_.Path -eq $exePath }) {
+        Fail "a gritty from $exePath is already running - close it or pass a different -Exe (cannot isolate measurements)"
+    }
+    if ($preexisting) {
+        Info "note: other gritty instance(s) running from a different path - ignored and left untouched."
+    }
     Info "Launching $exePath  ($Panes panes)..."
+    $script:launchedAt = Get-Date
     Start-Process -FilePath $exePath | Out-Null
 
     # Wait for the detached gritty to appear.
@@ -169,9 +285,51 @@ try {
     $g = Get-GrittyProcs
     if (-not $g) { Fail "gritty did not start within 15s" }
     Info "gritty up (pid(s): $(($g | ForEach-Object Id) -join ', ')). Letting $Panes shells settle..."
-    Start-Sleep -Seconds 5   # let all panes spawn shells before the first sample
+    if (-not $Throughput) { Start-Sleep -Seconds 5 }   # settle; Throughput floods from spawn
 
-    if ($Broadcast) {
+    if ($Throughput) {
+        # Speed A/B: the profile-injected flood started when the pane's shell
+        # spawned. Measure from launch to the CPU plateau (drained); shell boot
+        # (~1 s) is included identically in every run, so A/B stays fair.
+        $cpu0 = 0.0
+        $t0 = $script:launchedAt
+        Info ("Flooding ~{0} MB ({1} lines) into one pane; measuring drain..." -f $FloodMB, $lines)
+
+        $peakRssMB = 0.0; $lastCpu = $cpu0; $idleHits = 0; $busySeen = $false
+        $plateauAt = $null
+        $tpDeadline = $t0.AddSeconds(120)
+        while ((Get-Date) -lt $tpDeadline) {
+            Start-Sleep -Milliseconds 300
+            $s = Sample
+            if (-not $s) { break }
+            if ($s.RssMB -gt $peakRssMB) { $peakRssMB = $s.RssMB }
+            $d = $s.CpuSec - $lastCpu
+            $lastCpu = $s.CpuSec
+            if ($d -gt 0.15) { $busySeen = $true; $idleHits = 0 }
+            elseif ($busySeen) { $idleHits++; if ($idleHits -ge 3) { $plateauAt = Get-Date; break } }
+        }
+        if (-not $plateauAt) { $plateauAt = Get-Date }
+        $cpuRender = [math]::Round($lastCpu - $cpu0, 2)
+        $wall = [math]::Round(($plateauAt - $t0).TotalSeconds, 2)
+        $actualMB = [math]::Round(($lines * ($lineBytes + 2)) / 1MB, 1)   # +2 CRLF
+        $script:tp = [pscustomobject]@{
+            payloadMB  = $actualMB
+            wallS      = $wall
+            cpuRender  = $cpuRender
+            MBps       = if ($wall -gt 0)     { [math]::Round($actualMB / $wall, 1) }        else { 0 }
+            cpuMsPerMB = if ($actualMB -gt 0) { [math]::Round($cpuRender * 1000 / $actualMB, 1) } else { 0 }
+            peakRssMB  = [math]::Round($peakRssMB, 1)
+            drained    = ($idleHits -ge 3)
+        }
+    }
+    elseif ($MultiTab -or $Solo -ge 0) {
+        # Workloads were injected via the temporary PowerShell profile before
+        # launch (see the pre-launch block) — nothing to drive here.
+        if ($Solo -ge 0) { Info "Solo: single pane running workload #$Solo via profile injection." }
+        elseif ($LoadAll -ge 0) { Info "LoadAll: every pane running workload #$LoadAll via profile injection." }
+        else { Info "MultiTab: every pane running a random workload (0-3) via profile injection." }
+    }
+    elseif ($Broadcast) {
         # Drive a self-terminating streaming spinner into EVERY pane at once.
         # CR-rewrites one line (the dirty-rect partial-repaint happy path) plus a
         # periodic newline (scroll). Bounded so orphaned panes self-exit.
@@ -196,7 +354,8 @@ public class Fg { [DllImport("user32.dll")] public static extern bool SetForegro
         }
     }
 
-    # ---- sample loop ----
+    # ---- sample loop ---- (skipped under -Throughput, which measured its own way)
+    if (-not $Throughput) {
     Info ("Sampling every {0} ms for {1}s..." -f $IntervalMs, $Seconds)
     $startTime = Get-Date
     $end = $startTime.AddSeconds($Seconds)
@@ -205,13 +364,14 @@ public class Fg { [DllImport("user32.dll")] public static extern bool SetForegro
         if ($s) {
             $samples.Add($s)
             $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
-            Write-Host ("  t+{0,3}s  rss={1,7} MB  priv={2,7} MB  thr={3,4}  hnd={4,5}  cpu={5,6}s  procs={6}" -f `
-                $elapsed, $s.RssMB, $s.PrivMB, $s.Threads, $s.Handles, $s.CpuSec, $s.Count)
+            Write-Host ("  t+{0,3}s  rss={1,7} MB  priv={2,7} MB  thr={3,4}  hnd={4,5}  gdi={5,5}  usr={6,4}  cpu={7,6}s  procs={8}" -f `
+                $elapsed, $s.RssMB, $s.PrivMB, $s.Threads, $s.Handles, $s.Gdi, $s.User, $s.CpuSec, $s.Count)
         } else {
             Warn "gritty process vanished mid-run"
             break
         }
         Start-Sleep -Milliseconds $IntervalMs
+    }
     }
 }
 finally {
@@ -220,12 +380,29 @@ finally {
     Start-Sleep -Milliseconds 500
     Restore $sessionPath
     Restore $configPath
+    if ($profPath) { Restore $profPath }
+    $env:GRITTY_STRESS_CMD = $null
     Info "Restored your session.json and config.toml."
 }
 
 # ---------------------------------------------------------------------------
 # Verdict.
 # ---------------------------------------------------------------------------
+if ($Throughput) {
+    $t = $script:tp
+    if (-not $t) { Fail "no throughput result captured (window never came up?)" }
+    Write-Host ""
+    Write-Host "==== gritty throughput ====" -ForegroundColor White
+    Write-Host ("exe:        {0}" -f $exePath)
+    Write-Host ("payload:    {0} MB  ({1})" -f $t.payloadMB, $(if ($t.drained) { "drained" } else { "TIMEOUT - raise -FloodMB budget or window" }))
+    Write-Host ("wall:       {0} s" -f $t.wallS)
+    Write-Host ("throughput: {0} MB/s rendered" -f $t.MBps) -ForegroundColor Green
+    Write-Host ("CPU cost:   {0} CPU-s to render  =>  {1} CPU-ms per MB" -f $t.cpuRender, $t.cpuMsPerMB) -ForegroundColor Green
+    Write-Host ("peak RSS:   {0} MB" -f $t.peakRssMB)
+    Write-Host "A/B: run twice with different -Exe; higher MB/s and lower CPU-ms/MB = faster." -ForegroundColor Cyan
+    exit 0
+}
+
 if ($samples.Count -lt 4) { Fail "too few samples ($($samples.Count)) to judge" }
 
 $csv = Join-Path $LogDir ("run_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
@@ -237,8 +414,10 @@ $warm = [int]([math]::Floor($samples.Count / 3))
 if ($warm -lt 1) { $warm = 1 }
 $baseRss  = ($samples[0..($warm-1)] | Measure-Object RssMB   -Average).Average
 $baseThr  = ($samples[0..($warm-1)] | Measure-Object Threads -Maximum).Maximum
+$baseGdi  = ($samples[0..($warm-1)] | Measure-Object Gdi     -Maximum).Maximum
 $endRss   = ($samples[($samples.Count-$warm)..($samples.Count-1)] | Measure-Object RssMB   -Average).Average
 $endThr   = ($samples[($samples.Count-$warm)..($samples.Count-1)] | Measure-Object Threads -Maximum).Maximum
+$endGdi   = ($samples[($samples.Count-$warm)..($samples.Count-1)] | Measure-Object Gdi     -Maximum).Maximum
 $peakRss  = ($samples | Measure-Object RssMB -Maximum).Maximum
 
 # CPU%: total CPU-seconds consumed across the run / wall-clock, x100.
@@ -253,14 +432,17 @@ Write-Host "==== gritty stress summary ====" -ForegroundColor White
 Write-Host ("panes={0}  samples={1}  wall={2}s" -f $Panes, $samples.Count, [int]$wall)
 Write-Host ("RSS:     base={0} MB  end={1} MB  peak={2} MB  growth={3}%" -f $baseRss, $endRss, $peakRss, $rssGrowth)
 Write-Host ("Threads: base(max)={0}  end(max)={1}" -f $baseThr, $endThr)
+Write-Host ("GDI:     base(max)={0}  end(max)={1}" -f $baseGdi, $endGdi)
 Write-Host ("CPU:     ~{0}% of one core over the run" -f $cpuPct)
 
 # Thresholds (heuristic; eyeball the CSV too).
 $leak   = $rssGrowth -gt 25            # resident set climbing after warm-up
 $thrub  = ($endThr - $baseThr) -gt 5   # thread count growing while panes fixed
+$gdileak = ($endGdi - $baseGdi) -gt 50 # GDI objects climbing while panes fixed
 $verdict = $true
 if ($leak)  { Write-Host "  -> possible LEAK: RSS grew $rssGrowth% after warm-up" -ForegroundColor Red; $verdict = $false }
 if ($thrub) { Write-Host "  -> possible THREAD LEAK: +$($endThr-$baseThr) threads" -ForegroundColor Red; $verdict = $false }
+if ($gdileak) { Write-Host "  -> possible GDI LEAK: +$($endGdi-$baseGdi) GDI objects (10k = UI death)" -ForegroundColor Red; $verdict = $false }
 if ($Broadcast -and $cpuPct -gt 90) { Write-Host "  -> HIGH CPU under streaming ($cpuPct%): check dirty-rect" -ForegroundColor Yellow }
 
 if ($verdict) {

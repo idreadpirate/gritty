@@ -8,6 +8,7 @@
 | Move focus | `Ctrl+Shift+←↑↓→` |
 | Resize focused pane | `Ctrl+Alt+←↑↓→`, `Ctrl+Mouse-wheel`, or drag the divider |
 | Rename pane | `Ctrl+Shift+R` |
+| Search scrollback (Enter = previous match, Esc = close) | `Ctrl+Shift+F` |
 | Close pane | `Ctrl+Shift+W` (or type `exit`) |
 | Font zoom in / out / reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
 

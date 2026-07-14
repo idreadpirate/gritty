@@ -84,6 +84,11 @@ impl SavedSession {
     }
 
     pub fn from_json(s: &str) -> Option<Self> {
+        // Tolerate a UTF-8 BOM: Windows tooling (PowerShell 5.1 `Set-Content
+        // -Encoding UTF8`, some editors) prepends U+FEFF, which the parser's
+        // whitespace skipping does not consume — the whole session would be
+        // silently rejected and startup would fall back to a fresh single tab.
+        let s = s.strip_prefix('\u{feff}').unwrap_or(s);
         let v = JsonValue::parse(s)?;
         let obj = v.as_object()?;
         Some(SavedSession {
@@ -1106,6 +1111,16 @@ mod tests {
         assert_eq!(back.windows.len(), 2);
         assert_eq!(back.windows[1].win_x, Some(1930));
         assert_eq!(back.windows[1].win_y, Some(40));
+    }
+
+    /// A UTF-8 BOM (PowerShell 5.1 `Set-Content`, Notepad) must not silently
+    /// reject the whole session — that degrades startup to a fresh single tab.
+    #[test]
+    fn bom_prefixed_session_parses() {
+        let s = SavedSession::from_windows(vec![win_sample("a", 10, 20)]);
+        let bommed = format!("\u{feff}{}", s.to_json());
+        let back = SavedSession::from_json(&bommed).expect("BOM-prefixed JSON must parse");
+        assert_eq!(s, back);
     }
 
     #[test]

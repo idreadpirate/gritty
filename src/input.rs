@@ -55,13 +55,20 @@ fn clamp_sel_visible(sel: usize, len: usize, max: usize) -> usize {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CommitTarget {
     Rename,
+    Search,
     Palette,
     Pane,
 }
 
-pub(crate) fn ime_commit_target(rename_open: bool, palette_open: bool) -> CommitTarget {
+pub(crate) fn ime_commit_target(
+    rename_open: bool,
+    search_open: bool,
+    palette_open: bool,
+) -> CommitTarget {
     if rename_open {
         CommitTarget::Rename
+    } else if search_open {
+        CommitTarget::Search
     } else if palette_open {
         CommitTarget::Palette
     } else {
@@ -174,11 +181,45 @@ impl Gritty {
             return;
         }
 
+        // Scrollback-search prompt swallows all input while open: Enter finds
+        // the previous match (bottom-up), Esc closes and clears the highlight.
+        if self.windows[wi].search.is_some() {
+            match key {
+                Key::Named(NamedKey::Enter) => self.run_search(wi),
+                Key::Named(NamedKey::Escape) => self.close_search(wi),
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(buf) = self.windows[wi].search.as_mut() {
+                        buf.pop();
+                        // The query changed: restart matching from the bottom.
+                        self.windows[wi].search_origin = None;
+                    }
+                    self.request_redraw(wi);
+                }
+                Key::Character(s) => {
+                    if let Some(buf) = self.windows[wi].search.as_mut() {
+                        push_name_input(buf, s);
+                        self.windows[wi].search_origin = None;
+                    }
+                    self.request_redraw(wi);
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(buf) = self.windows[wi].search.as_mut() {
+                        push_name_input(buf, " ");
+                        self.windows[wi].search_origin = None;
+                    }
+                    self.request_redraw(wi);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // CA-21: F1 or Ctrl+Shift+/ opens the help overlay.
         if matches!(key, Key::Named(NamedKey::F1))
             || (ctrl && shift && matches!(key, Key::Character(s) if s == "/"))
         {
             self.windows[wi].show_help = !self.windows[wi].show_help;
+            self.windows[wi].discovered = true; // hint served its purpose
             self.request_redraw(wi);
             return;
         }
@@ -214,6 +255,7 @@ impl Gritty {
                     }
                     "p" => {
                         self.windows[wi].palette = Some(Palette::new());
+                        self.windows[wi].discovered = true; // hint served its purpose
                         self.request_redraw(wi);
                         return;
                     }
@@ -229,6 +271,13 @@ impl Gritty {
                             .unwrap_or_default();
                         self.windows[wi].rename = Some(cur);
                         self.windows[wi].rename_is_tab = false;
+                        self.request_redraw(wi);
+                        return;
+                    }
+                    // Ctrl+Shift+F: search the focused pane's scrollback.
+                    "f" => {
+                        self.windows[wi].search = Some(String::new());
+                        self.windows[wi].search_origin = None;
                         self.request_redraw(wi);
                         return;
                     }
@@ -363,12 +412,21 @@ impl Gritty {
             return;
         }
         let rename_open = self.windows[wi].rename.is_some();
+        let search_open = self.windows[wi].search.is_some();
         let palette_open = self.windows[wi].palette.is_some();
-        match ime_commit_target(rename_open, palette_open) {
+        match ime_commit_target(rename_open, search_open, palette_open) {
             // Rename prompt: append to its single-line buffer.
             CommitTarget::Rename => {
                 if let Some(buf) = self.windows[wi].rename.as_mut() {
                     push_name_input(buf, text);
+                }
+            }
+            // Search prompt: append to the query; the resume point resets so
+            // the edited query matches from the bottom again.
+            CommitTarget::Search => {
+                if let Some(buf) = self.windows[wi].search.as_mut() {
+                    push_name_input(buf, text);
+                    self.windows[wi].search_origin = None;
                 }
             }
             // Command palette: append to the query and reset the selection.
@@ -558,6 +616,17 @@ impl Gritty {
             Cmd::SaveSession => self.persist_session(),
             Cmd::LoadSession => self.restore_session(event_loop),
             Cmd::ToggleAgents => self.toggle_agents(self.focused),
+            Cmd::SearchScrollback => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.search = Some(String::new());
+                    win.search_origin = None;
+                }
+            }
+            Cmd::ShowHelp => {
+                if let Some(win) = self.windows.get_mut(wi) {
+                    win.show_help = true;
+                }
+            }
         }
         let f = self.focused;
         self.request_redraw(f);
@@ -692,14 +761,17 @@ mod tests {
     // reached any of these.)
 
     #[test]
-    fn ime_commit_prefers_rename_then_palette_then_pane() {
-        // Rename prompt open (even if palette also open) → the rename buffer wins.
-        assert_eq!(ime_commit_target(true, false), CommitTarget::Rename);
-        assert_eq!(ime_commit_target(true, true), CommitTarget::Rename);
-        // No rename but palette open → the palette query.
-        assert_eq!(ime_commit_target(false, true), CommitTarget::Palette);
-        // Neither overlay → the focused pane.
-        assert_eq!(ime_commit_target(false, false), CommitTarget::Pane);
+    fn ime_commit_prefers_rename_then_search_then_palette_then_pane() {
+        // Rename prompt open (even if others also open) → the rename buffer wins.
+        assert_eq!(ime_commit_target(true, false, false), CommitTarget::Rename);
+        assert_eq!(ime_commit_target(true, true, true), CommitTarget::Rename);
+        // No rename but search open → the search query.
+        assert_eq!(ime_commit_target(false, true, false), CommitTarget::Search);
+        assert_eq!(ime_commit_target(false, true, true), CommitTarget::Search);
+        // Only the palette open → the palette query.
+        assert_eq!(ime_commit_target(false, false, true), CommitTarget::Palette);
+        // No overlay → the focused pane.
+        assert_eq!(ime_commit_target(false, false, false), CommitTarget::Pane);
     }
 
     #[test]

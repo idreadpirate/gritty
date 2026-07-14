@@ -3,6 +3,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
     SplitRight,
+    SearchScrollback,
+    ShowHelp,
     SplitDown,
     ClosePane,
     RenamePane,
@@ -20,29 +22,45 @@ pub enum Cmd {
     ToggleAgents,
 }
 
-pub const COMMANDS: &[(&str, Cmd)] = &[
-    ("split right", Cmd::SplitRight),
-    ("split down", Cmd::SplitDown),
-    ("close pane", Cmd::ClosePane),
-    ("rename pane", Cmd::RenamePane),
-    ("rename tab", Cmd::RenameTab),
-    ("new tab", Cmd::NewTab),
-    ("next tab", Cmd::NextTab),
-    ("previous tab", Cmd::PrevTab),
-    ("toggle broadcast input", Cmd::ToggleBroadcast),
+/// `(label, shortcut, command)`. The shortcut column is rendered dim and
+/// right-aligned in the palette, so every palette use teaches the direct
+/// keybinding — the palette is the discovery surface, the keys are the fast
+/// path. Empty string = no direct binding (palette-only action).
+pub const COMMANDS: &[(&str, &str, Cmd)] = &[
+    ("split right", "Ctrl+Shift+D", Cmd::SplitRight),
+    ("split down", "Ctrl+Shift+E", Cmd::SplitDown),
+    ("close pane", "Ctrl+Shift+W", Cmd::ClosePane),
+    ("rename pane", "Ctrl+Shift+R", Cmd::RenamePane),
+    ("rename tab", "", Cmd::RenameTab),
+    ("new tab", "Ctrl+Shift+T", Cmd::NewTab),
+    ("next tab", "Ctrl+Tab", Cmd::NextTab),
+    ("previous tab", "Ctrl+Shift+Tab", Cmd::PrevTab),
+    ("search scrollback", "Ctrl+Shift+F", Cmd::SearchScrollback),
+    ("keybinding help", "F1", Cmd::ShowHelp),
+    ("toggle broadcast input", "", Cmd::ToggleBroadcast),
     (
         "paste clipboard to all panes in the tab",
+        "Ctrl+Shift+B",
         Cmd::BroadcastPasteAll,
     ),
     (
         "press Enter in all panes in the tab",
+        "Ctrl+Shift+Enter",
         Cmd::BroadcastEnterAll,
     ),
-    ("agent overview (jump to a pane)", Cmd::ToggleAgents),
-    ("toggle seamless mode", Cmd::ToggleSeamless),
-    ("move tab to new window", Cmd::MoveTabToNewWindow),
-    ("save session", Cmd::SaveSession),
-    ("load session", Cmd::LoadSession),
+    (
+        "agent overview (jump to a pane)",
+        "Ctrl+Shift+A",
+        Cmd::ToggleAgents,
+    ),
+    ("toggle seamless mode", "", Cmd::ToggleSeamless),
+    (
+        "move tab to new window",
+        "Ctrl+Shift+N",
+        Cmd::MoveTabToNewWindow,
+    ),
+    ("save session", "", Cmd::SaveSession),
+    ("load session", "", Cmd::LoadSession),
 ];
 
 pub struct Palette {
@@ -58,20 +76,20 @@ impl Palette {
         }
     }
 
-    /// Commands matching the query, best score first.
-    pub fn matches(&self) -> Vec<(&'static str, Cmd)> {
-        let mut scored: Vec<(i32, &'static str, Cmd)> = COMMANDS
+    /// Commands matching the query, best score first: `(label, shortcut, cmd)`.
+    pub fn matches(&self) -> Vec<(&'static str, &'static str, Cmd)> {
+        let mut scored: Vec<(i32, &'static str, &'static str, Cmd)> = COMMANDS
             .iter()
-            .filter_map(|(label, cmd)| {
-                crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *cmd))
+            .filter_map(|(label, keys, cmd)| {
+                crate::fuzzy::score(&self.query, label).map(|s| (s, *label, *keys, *cmd))
             })
             .collect();
         scored.sort_by_key(|t| core::cmp::Reverse(t.0));
-        scored.into_iter().map(|(_, l, c)| (l, c)).collect()
+        scored.into_iter().map(|(_, l, k, c)| (l, k, c)).collect()
     }
 
     pub fn selected(&self) -> Option<Cmd> {
-        self.matches().get(self.sel).map(|(_, c)| *c)
+        self.matches().get(self.sel).map(|(_, _, c)| *c)
     }
 
     pub fn clamp_selection(&mut self) {
@@ -93,8 +111,8 @@ mod tests {
         let mut p = Palette::new();
         p.query = "broad".into();
         let m = p.matches();
-        assert!(m.iter().any(|(_, c)| *c == Cmd::ToggleBroadcast));
-        assert!(!m.iter().any(|(_, c)| *c == Cmd::NewTab));
+        assert!(m.iter().any(|(_, _, c)| *c == Cmd::ToggleBroadcast));
+        assert!(!m.iter().any(|(_, _, c)| *c == Cmd::NewTab));
     }
 
     #[test]
@@ -109,7 +127,7 @@ mod tests {
         // empty query: selection 0 is the first command in declaration order.
         assert!(p.selected() == Some(Cmd::SplitRight));
         p.sel = 2;
-        assert!(p.selected() == p.matches().get(2).map(|(_, c)| *c));
+        assert!(p.selected() == p.matches().get(2).map(|(_, _, c)| *c));
     }
 
     #[test]
