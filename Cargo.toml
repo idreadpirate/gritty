@@ -1,8 +1,12 @@
 [package]
 name = "gritty"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A lightweight native Windows terminal"
+description = "Lightweight native Windows terminal multiplexer with AI-agent awareness"
+license = "MIT"
+repository = "https://github.com/idreadpirate/gritty"
+keywords = ["terminal", "multiplexer", "windows", "conpty", "agent"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 winit = "0.30"

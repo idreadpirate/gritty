@@ -2,7 +2,7 @@
 
 All notable changes to gritty.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-13
 
 ### Added
 - **Discoverability polish** — palette rows show their keyboard shortcut
