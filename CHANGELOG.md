@@ -2,7 +2,7 @@
 
 All notable changes to gritty.
 
-## [Unreleased]
+## [0.2.1] - 2026-07-14
 
 ### Added
 - **Self memory guard (RT-138)** — after a field incident (2026-07-14) where a
