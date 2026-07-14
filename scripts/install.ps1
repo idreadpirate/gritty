@@ -1,4 +1,4 @@
-# install.ps1 — one-line installer for gritty.
+# install.ps1 - one-line installer for gritty.
 #
 #   irm https://raw.githubusercontent.com/idreadpirate/gritty/master/scripts/install.ps1 | iex
 #
@@ -12,7 +12,9 @@
 #   $env:GRITTY_NO_SHORTCUT = '1'    # skip creating shortcuts
 
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocol]::Tls12
+# TLS 1.2 for Windows PowerShell 5.1 (older defaults can't reach GitHub).
+# pwsh 7 negotiates this on its own; keep the assignment tolerant either way.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 $Repo       = 'idreadpirate/gritty'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\gritty'
@@ -66,7 +68,7 @@ if ($shaAsset) {
     Remove-Item $shaTmp -Force -ErrorAction SilentlyContinue
     if ($expected -ne $actual) {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        Die "Checksum mismatch — refusing to install.`n  expected $expected`n  actual   $actual"
+        Die "Checksum mismatch - refusing to install.`n  expected $expected`n  actual   $actual"
     }
     Info "sha256 ok"
 }
@@ -74,8 +76,18 @@ if ($shaAsset) {
 # --- 4. Install -------------------------------------------------------------
 Step "Installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-# Replacing a running gritty.exe fails with a sharing violation; tell the user.
+# Overwriting a RUNNING gritty.exe fails with a sharing violation, but
+# Windows allows renaming one - move it aside so upgrading while gritty is
+# open just works; the stale .old is swept on the next install.
 try {
+    # Sweep stale asides from previous upgrades (in-use ones survive until a
+    # later run when their process has exited).
+    Get-ChildItem "$ExePath.old*" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path $ExePath) {
+        # Unique name: an older aside may still be mapped by a live process.
+        Move-Item -Force $ExePath ("$ExePath.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    }
     Move-Item -Force $tmp $ExePath
 } catch {
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
@@ -94,7 +106,7 @@ if ($env:GRITTY_NO_SHORTCUT -ne '1') {
         $lnk.TargetPath       = $ExePath
         $lnk.WorkingDirectory = $InstallDir
         $lnk.IconLocation     = "$ExePath,0"
-        $lnk.Description       = 'gritty — native Windows terminal multiplexer'
+        $lnk.Description       = 'gritty - native Windows terminal multiplexer'
         $lnk.Save()
     }
     Info "Start Menu + Desktop"
