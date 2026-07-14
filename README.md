@@ -20,6 +20,9 @@ with **no GPU, no Electron, no runtime, no WSL.**
 > gritty is the Windows-native terminal multiplexer that lets you run an **army
 > of AI agents** — and still play video games with **all** of your GPU memory.
 > CPU-rendered on purpose: your GPU belongs to you, not your terminal. 🎮
+>
+> It's MIT — no license can require this, so it's just a request:
+> **build good things with it.**
 
 ---
 
