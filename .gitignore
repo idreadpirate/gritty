@@ -8,3 +8,4 @@
 /.agentbus
 /target-gate
 assets/grittyLogoNew.png
+.out.log
